@@ -1,0 +1,49 @@
+{
+  "name": "siren",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Siren - 对方体系中的独立语音能力层（ASR / TTS / 异步语音 / 实时通话 / MCP）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@siren/audio": "workspace:*",
+    "@siren/contracts": "workspace:*",
+    "@siren/core-bridge": "workspace:*",
+    "@siren/provider-elevenlabs": "workspace:*",
+    "@siren/provider-mock": "workspace:*",
+    "@siren/provider-volc-asr": "workspace:*",
+    "@siren/provider-volc-tts": "workspace:*",
+    "@siren/storage": "workspace:*",
+    "@siren/telemetry": "workspace:*",
+    "@siren/voice-core": "workspace:*",
+    "fastify": "^5.2.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  },
+  "scripts": {
+    "dev": "tsx watch apps/server/src/main.ts",
+    "start": "node apps/server/dist/index.js",
+    "build": "pnpm -r build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fillers": "tsx scripts/generate-fillers.ts",
+    "cleanup:tmp": "tsx scripts/cleanup-tmp.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "esbuild": "^0.24.2",
+    "eslint": "^9.18.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.20.0",
+    "vitest": "^3.0.0"
+  }
+}

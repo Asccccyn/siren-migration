@@ -1,0 +1,35 @@
+{
+  "name": "@siren/server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --external:better-sqlite3 --external:@aws-sdk/* --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/index.js --sourcemap"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.712.0",
+    "@aws-sdk/s3-request-presigner": "^3.712.0",
+    "@fastify/cors": "^10.0.1",
+    "@fastify/multipart": "^9.0.1",
+    "@fastify/static": "^8.0.3",
+    "@fastify/websocket": "^11.0.1",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@siren/audio": "workspace:*",
+    "@siren/contracts": "workspace:*",
+    "@siren/core-bridge": "workspace:*",
+    "@siren/provider-elevenlabs": "workspace:*",
+    "@siren/provider-mock": "workspace:*",
+    "@siren/provider-volc-asr": "workspace:*",
+    "@siren/provider-volc-tts": "workspace:*",
+    "@siren/storage": "workspace:*",
+    "@siren/telemetry": "workspace:*",
+    "@siren/voice-core": "workspace:*",
+    "better-sqlite3": "^12.2.0",
+    "fastify": "^5.2.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  }
+}

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Siren Async Voice Test</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; background: #10141c; color: #e6e9f0; }
+  a { color: #7ab0ff; }
+  .card { background: #1a2130; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  button { background: #2b5fd9; color: white; border: 0; border-radius: 8px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  button.stop { background: #d94b4b; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input, select, textarea { background: #10141c; color: #e6e9f0; border: 1px solid #39445c; border-radius: 8px; padding: 8px; font-size: 14px; }
+  textarea { width: 100%; min-height: 80px; box-sizing: border-box; }
+  pre { background: #0b0e14; border-radius: 8px; padding: 12px; overflow: auto; font-size: 13px; max-height: 240px; }
+  .muted { color: #8b93a7; font-size: 13px; }
+  audio { width: 100%; margin-top: 8px; }
+  .rec { color: #ff8080; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>🎙 Async Voice Test <span class="muted">· <a href="./index.html">返回</a></span></h1>
+
+  <div class="card">
+    <h2>录音 → Batch ASR → Transcript</h2>
+    <div class="row">
+      <button id="startRec">开始录音</button>
+      <button id="stopRec" class="stop" disabled>停止并转写</button>
+      <span id="recTime" class="muted"></span>
+    </div>
+    <div class="row">
+      <input id="asrConv" placeholder="conversation_id（可选）" />
+      <label class="muted"><input type="checkbox" id="asrStore" checked /> 存为 user 语音资产</label>
+    </div>
+    <pre id="asrOut">尚未转写。</pre>
+  </div>
+
+  <div class="card">
+    <h2>文字 → Batch TTS → 播放</h2>
+    <div class="row">
+      <textarea id="ttsText">你，我在。今天慢一点说，不着急。</textarea>
+    </div>
+    <div class="row">
+      <select id="emotion">
+        <option>warm</option><option>neutral</option><option>happy</option><option>sad</option>
+        <option>angry</option><option>teasing</option><option>sleepy</option><option>excited</option><option>surprised</option>
+      </select>
+      <label class="muted">语速 <input id="speed" type="range" min="0.5" max="2" step="0.05" value="1" /> <span id="speedVal">1.0</span></label>
+      <button id="speakBtn">合成并播放</button>
+    </div>
+    <div id="ttsMeta" class="muted"></div>
+    <audio id="player" controls></audio>
+  </div>
+
+  <script src="./async-voice-test.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "@siren/voice-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@siren/audio": "workspace:*",
+    "@siren/contracts": "workspace:*",
+    "@siren/core-bridge": "workspace:*",
+    "@siren/provider-elevenlabs": "workspace:*",
+    "@siren/provider-mock": "workspace:*",
+    "@siren/provider-volc-asr": "workspace:*",
+    "@siren/provider-volc-tts": "workspace:*",
+    "@siren/storage": "workspace:*",
+    "@siren/telemetry": "workspace:*",
+    "zod": "^3.25.0"
+  }
+}

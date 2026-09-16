@@ -1,0 +1,12 @@
+{
+  "name": "@siren/playground",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/AsyncVoiceTest.ts --bundle --format=iife --target=es2020 --outfile=public/async-voice-test.js && esbuild src/RealtimeCallTest.ts --bundle --format=iife --target=es2020 --outfile=public/realtime-call-test.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}

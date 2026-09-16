@@ -1,0 +1,20 @@
+# 环境变量（真实密钥，绝不入库）
+.env
+.env.*
+!.env.example
+
+# 运行数据（规范要求 data/ 必须忽略）
+data/
+
+# 依赖与构建产物
+node_modules/
+dist/
+apps/playground/public/*.js
+apps/playground/public/*.js.map
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db

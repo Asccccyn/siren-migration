@@ -1,0 +1,15 @@
+{
+  "name": "@siren/provider-mock",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@siren/audio": "workspace:*",
+    "@siren/contracts": "workspace:*"
+  }
+}
