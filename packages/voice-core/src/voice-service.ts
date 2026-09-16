@@ -27,6 +27,7 @@ import type { Logger } from '@siren/telemetry';
 import type { SirenConfig } from './config.ts';
 import { parseEmotion, resolveStyle } from './emotion.ts';
 import type { VoiceProfileRegistry } from './voice-profile.ts';
+import { buildAssetMeta, buildObjectKey, contentTypeFor, metaObjectKey, normalizeContainer } from './asset-keys.ts';
 
 export interface VoiceServiceDeps {
   config: SirenConfig;
@@ -132,30 +133,23 @@ export class VoiceService {
     const assetId = randomUUID();
     const messageId = params.messageId ?? assetId;
     const conversationId = params.conversationId ?? null;
-    const objectKey = this.buildObjectKey(conversationId, messageId, synthesized.format);
+    const objectKey = buildObjectKey(conversationId, messageId, synthesized.format);
     await this.deps.store.put(objectKey, synthesized.audio, contentTypeFor(synthesized.format));
     await this.deps.store.put(
-      `${objectKey.slice(0, objectKey.lastIndexOf('/'))}/meta.json`,
-      Buffer.from(
-        JSON.stringify(
-          {
-            id: assetId,
-            conversation_id: conversationId,
-            message_id: messageId,
-            direction: params.direction ?? 'assistant',
-            voice_profile: profile.id,
-            text: params.text,
-            tts_script: params.ttsScript ?? null,
-            emotion,
-            duration_ms: synthesized.durationMs,
-            format: synthesized.format,
-            sample_rate: synthesized.sampleRate,
-            created_at: new Date().toISOString()
-          },
-          null,
-          2
-        )
-      ),
+      metaObjectKey(objectKey),
+      buildAssetMeta({
+        id: assetId,
+        conversationId,
+        messageId,
+        direction: params.direction ?? 'assistant',
+        voiceProfileId: profile.id,
+        text: params.text,
+        ttsScript: params.ttsScript,
+        emotion,
+        durationMs: synthesized.durationMs,
+        format: synthesized.format,
+        sampleRate: synthesized.sampleRate
+      }),
       'application/json'
     );
 
@@ -226,7 +220,7 @@ export class VoiceService {
     const assetId = randomUUID();
     const messageId = input.messageId ?? assetId;
     const conversationId = input.conversationId ?? null;
-    const objectKey = this.buildObjectKey(conversationId, messageId, normalizeContainer(input.format));
+    const objectKey = buildObjectKey(conversationId, messageId, normalizeContainer(input.format));
     await this.deps.store.put(objectKey, input.audio, contentTypeFor(normalizeContainer(input.format)));
     const record: VoiceAssetRecord = {
       id: assetId,
@@ -282,15 +276,6 @@ export class VoiceService {
     return { ...profile, voiceId: this.deps.profiles.resolveVoiceId(profile) };
   }
 
-  private buildObjectKey(conversationId: string | null, messageId: string, format: string): string {
-    const now = new Date();
-    const year = String(now.getFullYear());
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const conversation = sanitizeKeyPart(conversationId ?? 'anonymous');
-    const message = sanitizeKeyPart(messageId);
-    const ext = format === 'pcm' ? 'pcm' : format === 'wav' ? 'wav' : 'mp3';
-    return `voice/${year}/${month}/${conversation}/${message}/audio.${ext}`;
-  }
 
   private async withAudioUrl(record: VoiceAssetRecord): Promise<VoiceAssetWithUrl> {
     const audioUrl = await this.deps.store.signedUrl(record.objectKey, this.deps.config.signedUrlTtlS);
@@ -298,22 +283,3 @@ export class VoiceService {
   }
 }
 
-function sanitizeKeyPart(input: string): string {
-  const cleaned = input.replace(/[^A-Za-z0-9\-_]/g, '-').slice(0, 64);
-  return cleaned || 'x';
-}
-
-function contentTypeFor(format: string): string {
-  if (format === 'wav') return 'audio/wav';
-  if (format === 'pcm') return 'audio/pcm';
-  return 'audio/mpeg';
-}
-
-function normalizeContainer(format: string): string {
-  const cleaned = format.toLowerCase().split(';')[0].trim();
-  if (cleaned === 'webm' || cleaned === 'opus') return 'webm';
-  if (cleaned === 'm4a' || cleaned === 'mp4') return 'm4a';
-  if (cleaned === 'wav') return 'wav';
-  if (cleaned === 'mp3') return 'mp3';
-  return cleaned || 'bin';
-}

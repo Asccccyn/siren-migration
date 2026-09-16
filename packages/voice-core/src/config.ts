@@ -122,6 +122,19 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     logLevel: (env.SIREN_LOG_LEVEL as SirenConfig['logLevel']) ?? 'info',
     logTranscripts: bool(env, 'LOG_TRANSCRIPTS', false),
 
+    ...resolvePaths(env, cwd, dataDir),
+    ...resolveProviderSections(env),
+    ...resolveCoreSection(env),
+    ...resolveRealtimeTunables(env),
+
+    allowMockInProduction: bool(env, 'SIREN_ALLOW_MOCK_IN_PRODUCTION', false),
+    signingSecret
+  };
+}
+
+/** 文件系统路径段 */
+function resolvePaths(env: EnvSource, cwd: string, dataDir: string) {
+  return {
     dataDir,
     databasePath: resolve(cwd, env.DATABASE_PATH ?? './data/siren.db'),
     tmpDir: resolve(dataDir, 'tmp'),
@@ -129,7 +142,13 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     logsDir: resolve(dataDir, 'logs'),
     voicesDir: resolve(cwd, './config/voices'),
     playgroundDir: resolve(cwd, './apps/playground/public'),
+    localObjectDir: resolve(cwd, env.LOCAL_OBJECT_DIR ?? './data/objects')
+  };
+}
 
+/** Provider / 存储配置段 */
+function resolveProviderSections(env: EnvSource) {
+  return {
     providers: {
       asr: env.ASR_PROVIDER ?? 'volc',
       asyncTts: env.ASYNC_TTS_PROVIDER ?? 'volc',
@@ -159,15 +178,24 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
       accessKeyId: env.R2_ACCESS_KEY_ID ?? '',
       secretAccessKey: env.R2_SECRET_ACCESS_KEY ?? '',
       bucket: env.R2_BUCKET ?? 'siren-voice'
-    },
-    localObjectDir: resolve(cwd, env.LOCAL_OBJECT_DIR ?? './data/objects'),
+    }
+  };
+}
 
-    coreBridge: (env.SIREN_CORE_BRIDGE as SirenConfig['coreBridge']) ?? 'mock',
+/** Core Bridge 配置段 */
+function resolveCoreSection(env: EnvSource) {
+  return {
+    coreBridge: (env.SIREN_CORE_BRIDGE as 'mock' | 'http') ?? 'mock',
     coreBaseUrl: env.CORE_BASE_URL ?? '',
     coreApiToken: env.CORE_API_TOKEN ?? '',
     coreTimeoutMs: num(env, 'CORE_TIMEOUT_MS', 60000),
-    mockCoreReply: env.MOCK_CORE_REPLY ?? '嗯，我在听。你说，我慢慢回。',
+    mockCoreReply: env.MOCK_CORE_REPLY ?? '嗯，我在听。你说，我慢慢回。'
+  };
+}
 
+/** 实时链路可调参数段（规范第 47 节第 14 条：全部配置化） */
+function resolveRealtimeTunables(env: EnvSource) {
+  return {
     fillerEnabled: bool(env, 'FILLER_ENABLED', false),
     partialGraceMs: num(env, 'PARTIAL_GRACE_MS', 450),
     callTokenTtlS: num(env, 'CALL_TOKEN_TTL_S', 120),
@@ -184,10 +212,7 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     ws: {
       heartbeatIntervalMs: 30000,
       maxBufferedBytes: 8 * 1024 * 1024
-    },
-
-    allowMockInProduction: bool(env, 'SIREN_ALLOW_MOCK_IN_PRODUCTION', false),
-    signingSecret
+    }
   };
 }
 
