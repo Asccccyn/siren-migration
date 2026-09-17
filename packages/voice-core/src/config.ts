@@ -66,6 +66,8 @@ export interface SirenConfig {
   fillerEnabled: boolean;
   partialGraceMs: number;
   callTokenTtlS: number;
+  /** 客户端 playback_drained ACK 超时（P0-4，0 = 不等待） */
+  playbackDrainTimeoutMs: number;
   signedUrlTtlS: number;
   maxUploadBytes: number;
   wsMaxPayloadBytes: number;
@@ -199,6 +201,7 @@ function resolveRealtimeTunables(env: EnvSource) {
     fillerEnabled: bool(env, 'FILLER_ENABLED', false),
     partialGraceMs: num(env, 'PARTIAL_GRACE_MS', 450),
     callTokenTtlS: num(env, 'CALL_TOKEN_TTL_S', 120),
+    playbackDrainTimeoutMs: num(env, 'PLAYBACK_DRAIN_TIMEOUT_MS', 4000),
     signedUrlTtlS: num(env, 'SIGNED_URL_TTL_S', 3600),
     maxUploadBytes: num(env, 'MAX_UPLOAD_MB', 25) * 1024 * 1024,
     wsMaxPayloadBytes: num(env, 'WS_MAX_PAYLOAD_MB', 2) * 1024 * 1024,

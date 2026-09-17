@@ -1,17 +1,25 @@
 /**
- * Realtime Call Test（规范第 16/17/21/43/44 节）。
+ * Realtime Call Test（规范第 16/17/21/43/44 节 / v1.1 协议 v2）。
  * 本文件只做接线与协议处理；DSP 与调度逻辑在独立模块：
- * - vad.ts            RMS + 自适应噪声基线
- * - pcm-player.ts     下行连续时间轴播放（jitter buffer）
- * - uplink-encoder.ts 上行重采样 16k + PCM16 分帧
+ * - vad.ts               RMS + 自适应噪声基线
+ * - pcm-player.ts        下行连续时间轴播放（jitter buffer + stream 感知 drain）
+ * - stream-router.ts     下行流路由（stream_id / sequence / 旧流丢弃）
+ * - utterance-uplink.ts  上行编排（pre-roll flush + 本地 barge-in）
+ * - uplink-encoder.ts    上行重采样 16k + PCM16 分帧
  */
 export {};
 
 import { VadMachine, type VadParams } from './vad.ts';
 import { JitteredPcmPlayer } from './pcm-player.ts';
+import { StreamRouter } from './stream-router.ts';
+import { UtteranceUplink } from './utterance-uplink.ts';
+import { AudioPreRollBuffer } from './pre-roll-buffer.ts';
 import { Float32Resampler, Pcm16Framer } from './uplink-encoder.ts';
 import { ui, setBadge, logEvent, renderMetrics } from './ui.ts';
 import { setupCapture as setupCaptureModule, type CapturePipeline } from './capture-worklet.ts';
+
+const PRE_ROLL_MS = 400; // P0-1：16kHz 下 6400 samples
+const PROTOCOL_VERSION = 2;
 
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem('siren_token') ?? '';
@@ -22,12 +30,12 @@ function authHeaders(): Record<string, string> {
 let ws: WebSocket | null = null;
 let capture: CapturePipeline | null = null;
 let player: JitteredPcmPlayer | null = null;
+let router: StreamRouter | null = null;
+let uplink: UtteranceUplink | null = null;
 let resampler: Float32Resampler | null = null;
-let framer: Pcm16Framer | null = null;
-let vad: VadMachine | null = null;
+let serverState = 'idle';
+let serverProtocol = 0;
 let muted = false;
-let sendingActive = false;
-let pcmRate = 24000;
 
 function vadParams(): VadParams {
   return {
@@ -48,6 +56,12 @@ function sendJson(message: unknown): void {
   }
 }
 
+function sendFrame(frame: ArrayBuffer): void {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(frame);
+  }
+}
+
 /** conversation_id 唯一来源：输入框；为空时生成一次并回填，同一网页会话内保持同一 conversation */
 function ensureConversationId(): string {
   const existing = (ui.conversationId.value || '').trim();
@@ -58,40 +72,6 @@ function ensureConversationId(): string {
       : `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   ui.conversationId.value = generated;
   return generated;
-}
-
-function startUtterance(): void {
-  sendingActive = true;
-  sendJson({ t: 'start' });
-  logEvent('VAD: 说话开始 → start');
-}
-
-function endUtterance(): void {
-  sendingActive = false;
-  sendJson({ t: 'end' });
-  logEvent('VAD: 静音断句 → end');
-}
-
-// 采集样本 -> 重采样 -> VAD 判定 -> PCM16 帧上行
-function handleCapturedSamples(samples: Float32Array): void {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !resampler || !framer) return;
-  const targetSamples = resampler.push(samples);
-
-  if (ui.modeSelect.value === 'vad' && !muted && vad) {
-    const outcome = vad.process(targetSamples);
-    ui.noiseFloor.textContent = `noise floor: ${vad.noiseFloorValue.toFixed(5)} / thr: ${vad.threshold.toFixed(5)} / rms: ${vad.lastRmsValue.toFixed(5)}`;
-    if (outcome.event === 'start' && !sendingActive) startUtterance();
-    if (outcome.event === 'end') {
-      if (outcome.spokenMs < vadParams().minSpeechMs) {
-        logEvent(`VAD: 语音过短(${Math.round(outcome.spokenMs)}ms)，仍发送 end 由服务端裁决`);
-      }
-      if (sendingActive) endUtterance();
-    }
-  }
-  if (muted || (ui.modeSelect.value === 'vad' && !sendingActive)) return;
-  for (const frame of framer.push(targetSamples)) {
-    ws.send(frame);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +114,18 @@ async function connectSocket(wsUrl: string, token: string): Promise<void> {
   ws.onopen = () => {
     setBadge('idle');
     logEvent('WebSocket 已连接');
-    sendJson({ t: 'ready' });
+    sendJson({
+      t: 'ready',
+      protocol: PROTOCOL_VERSION,
+      capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+    });
     void setupCapture();
   };
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
       handleServerMessage(JSON.parse(event.data) as Record<string, unknown>);
-    } else if (player) {
-      player.feed(event.data as ArrayBuffer, pcmRate);
+    } else {
+      router?.handleBinary(event.data as ArrayBuffer);
     }
   };
   ws.onclose = (event) => {
@@ -157,16 +141,72 @@ async function connectSocket(wsUrl: string, token: string): Promise<void> {
 
 async function setupCapture(): Promise<void> {
   capture = await setupCaptureModule((samples) => handleCapturedSamples(samples));
-  player = new JitteredPcmPlayer(capture.context, jitterBufferMs);
+  player = new JitteredPcmPlayer(
+    capture.context,
+    jitterBufferMs,
+    (streamId) => router?.notifyStreamIdle(streamId)
+  );
+  router = new StreamRouter({
+    onChunk: (buffer, header) => player?.feed(buffer, header.rate, header.stream_id),
+    onStreamStart: (streamId) => {
+      player?.stopAll(); // 新流开始：清旧流播放队列
+      player?.resetTimeline();
+      logEvent(`输出流开始 ${streamId}`);
+    },
+    onStreamEnd: (streamId) => {
+      player?.markStreamEnd(streamId);
+      logEvent(`PCM 结束 ${streamId}`);
+    },
+    onDrained: (streamId) => {
+      // P0-4：该流所有 AudioBufferSourceNode 真正播完后才 ACK
+      sendJson({ t: 'playback_drained', stream_id: streamId });
+      logEvent(`播放完毕 drained ${streamId}`);
+    },
+    onDropped: (reason, details) => logEvent(`丢弃 chunk：${reason} ${JSON.stringify(details)}`)
+  });
+  uplink = new UtteranceUplink({
+    vad: new VadMachine(vadParams),
+    preRoll: new AudioPreRollBuffer((16000 * PRE_ROLL_MS) / 1000),
+    framer: new Pcm16Framer(320), // 20ms @16k
+    sendJson: (message) => sendJson(message),
+    sendFrame: (frame) => sendFrame(frame),
+    isAiActive: () => serverState === 'thinking' || serverState === 'speaking',
+    onLocalBargeIn: () => player?.stopAll(),
+    log: (message) => logEvent(message)
+  });
+  uplink.setMode(ui.modeSelect.value === 'ptt' ? 'ptt' : 'vad');
+  if (muted) uplink.setMuted(true);
   resampler = new Float32Resampler(capture.sampleRate, 16000);
-  framer = new Pcm16Framer(320); // 20ms @16k
-  vad = new VadMachine(vadParams);
-  logEvent(`采集就绪 rate=${capture.sampleRate}`);
+  logEvent(`采集就绪 rate=${capture.sampleRate} pre-roll=${PRE_ROLL_MS}ms`);
+}
+
+// 采集样本 -> 重采样 16k -> uplink（pre-roll / VAD / barge-in / 分帧上行）
+function handleCapturedSamples(samples: Float32Array): void {
+  if (!resampler || !uplink) return;
+  const targetSamples = resampler.push(samples);
+  if (targetSamples.length === 0) return;
+  if (ui.modeSelect.value === 'vad') {
+    ui.noiseFloor.textContent = uplink.vadStatus;
+  }
+  uplink.handleSamples(targetSamples);
 }
 
 function handleServerMessage(message: Record<string, unknown>): void {
+  // 下行流相关帧先交给 router（pcm / pcm_end / interrupted）
+  if (router?.handleJson(message)) {
+    if (message.t === 'interrupted') {
+      const streamId = typeof message.stream_id === 'string' ? message.stream_id : null;
+      player?.cancelStream(streamId);
+      logEvent(`已被打断（interrupted ${streamId ?? ''}）`);
+    }
+    return;
+  }
   const type = message.t as string;
   switch (type) {
+    case 'ready':
+      serverProtocol = Number(message.protocol ?? 0);
+      logEvent(`协议协商 v${serverProtocol}`);
+      break;
     case 'partial':
       ui.partial.textContent = String(message.text ?? '');
       break;
@@ -176,21 +216,12 @@ function handleServerMessage(message: Record<string, unknown>): void {
       logEvent('ASR final');
       break;
     case 'state':
-      setBadge(String(message.state ?? ''));
+      serverState = String(message.state ?? '');
+      setBadge(serverState);
+      uplink?.onServerState(serverState);
       break;
     case 'reply':
       ui.reply.textContent = String(message.text ?? '');
-      break;
-    case 'pcm':
-      pcmRate = Number(message.rate ?? 24000);
-      player?.resetTimeline(); // 新一轮 PCM 时间轴
-      break;
-    case 'pcm_end':
-      logEvent('PCM 结束');
-      break;
-    case 'interrupted':
-      player?.stopAll();
-      logEvent('已被打断（interrupted）');
       break;
     case 'metrics':
       renderMetrics(message.metrics as Record<string, unknown>);
@@ -205,10 +236,10 @@ function handleServerMessage(message: Record<string, unknown>): void {
   }
 }
 
-
 ui.muteBtn.addEventListener('click', () => {
   muted = !muted;
   ui.muteBtn.textContent = muted ? '🎙 Unmute' : '🔇 Mute';
+  uplink?.setMuted(muted);
   logEvent(muted ? '已静音（停止上行）' : '取消静音');
 });
 
@@ -220,57 +251,42 @@ ui.hangupBtn.addEventListener('click', () => {
 ui.modeSelect.addEventListener('change', () => {
   const ptt = ui.modeSelect.value === 'ptt';
   ui.pttBtn.style.display = ptt ? '' : 'none';
-  if (!ptt && sendingActive) {
-    sendingActive = false;
-    sendJson({ t: 'end' });
-  }
+  uplink?.setMode(ptt ? 'ptt' : 'vad');
 });
 
-const startPtt = (): void => {
-  if (!sendingActive) {
-    sendingActive = true;
-    sendJson({ t: 'start' });
-    logEvent('PTT: start');
-  }
-};
-const endPtt = (): void => {
-  if (sendingActive) {
-    sendingActive = false;
-    sendJson({ t: 'end' });
-    logEvent('PTT: end');
-  }
-};
-ui.pttBtn.addEventListener('mousedown', startPtt);
-ui.pttBtn.addEventListener('mouseup', endPtt);
-ui.pttBtn.addEventListener('mouseleave', endPtt);
+ui.pttBtn.addEventListener('mousedown', () => uplink?.startPtt());
+ui.pttBtn.addEventListener('mouseup', () => uplink?.endPtt());
+ui.pttBtn.addEventListener('mouseleave', () => uplink?.endPtt());
 ui.pttBtn.addEventListener('touchstart', (event) => {
   event.preventDefault();
-  startPtt();
+  uplink?.startPtt();
 });
 ui.pttBtn.addEventListener('touchend', (event) => {
   event.preventDefault();
-  endPtt();
+  uplink?.endPtt();
 });
 
-// Barge-in：说话时点击状态徽章强制打断
+// Barge-in：说话时点击状态徽章强制打断（手动兜底；VAD 本地打断见 utterance-uplink）
 ui.stateBadge.addEventListener('click', () => {
-  if (ui.stateBadge.textContent === 'speaking' || ui.stateBadge.textContent === 'thinking') {
-    sendJson({ t: 'abort' });
+  if (serverState === 'speaking' || serverState === 'thinking') {
     player?.stopAll();
+    sendJson({ t: 'abort' });
     logEvent('手动 barge-in → abort');
   }
 });
 
 function teardown(): void {
-  sendingActive = false;
-  vad?.reset();
+  uplink?.reset();
+  router?.reset();
   player?.stopAll();
   player = null;
+  router = null;
+  uplink = null;
   resampler = null;
-  framer = null;
   capture?.worklet.disconnect();
   void capture?.context.close().catch(() => undefined);
   capture = null;
+  serverState = 'idle';
   ui.muteBtn.disabled = true;
   ui.hangupBtn.disabled = true;
 }

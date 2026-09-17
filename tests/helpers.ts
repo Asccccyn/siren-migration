@@ -8,7 +8,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { MockAsrProvider } from '@siren/provider-mock';
 import { MockTtsProvider } from '@siren/provider-mock';
-import { MockCoreBridge } from '@siren/core-bridge';
+import { MockCoreBridge, type CoreBridge } from '@siren/core-bridge';
 import type { TtsProvider } from '@siren/contracts';
 import {
   CallSessionsRepository,
@@ -155,8 +155,10 @@ export interface SessionHarness {
 export function buildSessionHarness(deps: {
   asr?: MockAsrProvider;
   tts?: TtsProvider;
-  core?: MockCoreBridge;
+  core?: CoreBridge;
   config?: SirenConfig;
+  callId?: string;
+  conversationId?: string | null;
   turnsRepo?: CallTurnsRepository;
   sessionsRepo?: CallSessionsRepository;
   bufferedAmount?: () => number;
@@ -174,8 +176,8 @@ export function buildSessionHarness(deps: {
   const session = new CallSession({
     config: deps.config ?? testConfig(),
     logger: silentLogger,
-    callId: 'call-test-1',
-    conversationId: 'conv-test',
+    callId: deps.callId ?? 'call-test-1',
+    conversationId: deps.conversationId ?? 'conv-test',
     profile: TEST_PROFILE,
     asr,
     tts,

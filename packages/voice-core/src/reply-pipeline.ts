@@ -5,9 +5,11 @@
  * - 深度 1 的句子预取（上一句播放期间预热下一句 TTS）
  * - 流式 TTS 失败 -> 批量 PCM 兜底
  * - 全程检查 turn.aborted，保证 barge-in 真正取消
- * - 采样率全链路保留（P0-7）：每个 TTS chunk 携带真实 sampleRate，
- *   协议 pcm 头的 rate 必须与随后二进制帧一致，rate 变化时重发头
+ * - Stream Identity（P0-3）：每轮回复独立 output_stream_id；每个二进制帧前发
+ *   {t:'pcm', stream_id, sequence, rate, bytes} JSON 头，binary 与流的对应不靠猜
+ * - 采样率全链路保留（P0-7）：rate 取每个 chunk 的真实值
  */
+import { randomUUID } from 'node:crypto';
 import type { CoreBridge } from '@siren/core-bridge';
 import type {
   PcmChunk,
@@ -35,10 +37,18 @@ export class TurnAbortedError extends Error {
   }
 }
 
+/** 分配一次 TTS 输出流的标识（P0-3：out_ 前缀 + 随机） */
+export function newOutputStreamId(): string {
+  return `out_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+}
+
 /** 一轮通话的运行时状态（CallSession 创建，流水线读写音频相关字段） */
 export interface ActiveTurn {
   index: number;
   turnId: string;
+  outputStreamId: string;
+  /** 下行二进制帧序号（在每个 pcm 头中递增） */
+  nextSequence: number;
   userText: string;
   asr: PrebufferedAsrSession;
   metrics: LatencyTracker;
@@ -50,8 +60,6 @@ export interface ActiveTurn {
   /** 已真正完成下发音频的句子 */
   playedText: string;
   pcmStarted: boolean;
-  /** 当前 PCM 流已宣告的采样率（pcm 头 rate 必须与二进制帧一致） */
-  pcmRate: number | null;
   written: boolean;
 }
 
@@ -201,29 +209,27 @@ export class ReplyPipeline {
       emotionToFillerCategory(style.emotion)
     );
     if (!frames || frames.length === 0) return;
-    this.startPcmStream(turn, REALTIME_OUTPUT_SAMPLE_RATE);
-    for (const frame of frames) {
-      this.port.sendRaw(frame);
-    }
     turn.metrics.setFillerPlayed();
     this.log.info('filler_played', { turn_index: turn.index });
+    for (const frame of frames) {
+      this.sendAudioChunk(turn, { audio: frame, sampleRate: REALTIME_OUTPUT_SAMPLE_RATE });
+    }
   }
 
-  /** 宣告 PCM 流开始（或采样率变化时重发头）；rate 必须取真实值（P0-7） */
-  private startPcmStream(turn: ActiveTurn, rate: number): void {
-    turn.pcmStarted = true;
-    turn.pcmRate = rate;
-    this.port.sendJson({ t: 'pcm', rate });
-  }
-
+  /** 每个二进制帧前发 JSON 头：stream_id + sequence + 真实 rate + bytes（P0-3/P0-7） */
   private sendAudioChunk(turn: ActiveTurn, chunk: PcmChunk): void {
     if (turn.aborted) throw new TurnAbortedError();
     const first = !turn.pcmStarted;
-    if (first || turn.pcmRate !== chunk.sampleRate) {
-      this.startPcmStream(turn, chunk.sampleRate);
-    }
+    turn.pcmStarted = true;
     if (first) this.port.onFirstAudio();
     turn.metrics.mark('audio_play_request');
+    this.port.sendJson({
+      t: 'pcm',
+      stream_id: turn.outputStreamId,
+      sequence: turn.nextSequence++,
+      rate: chunk.sampleRate,
+      bytes: chunk.audio.length
+    });
     this.port.sendRaw(chunk.audio);
   }
 }

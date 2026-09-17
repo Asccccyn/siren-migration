@@ -14,16 +14,22 @@ import type {
   ClientWsMessage,
   ServerWsMessage,
   TtsProvider,
-  VoiceProfile
+  VoiceProfile,
+  WsAudioContract
 } from '@siren/contracts';
-import { WS_CLOSE_CODES } from '@siren/contracts';
+import {
+  REALTIME_INPUT_SAMPLE_RATE,
+  REALTIME_OUTPUT_SAMPLE_RATE,
+  WS_PROTOCOL_VERSION,
+  WS_CLOSE_CODES
+} from '@siren/contracts';
 import type { CoreBridge } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import { LatencyTracker, errorFields, type Logger } from '@siren/telemetry';
 import type { SirenConfig } from './config.ts';
 import { CallStateMachine } from './call-state-machine.ts';
 import { adoptTranscript, createAsrSession } from './utterance-intake.ts';
-import { ReplyPipeline, type ActiveTurn } from './reply-pipeline.ts';
+import { ReplyPipeline, newOutputStreamId, type ActiveTurn } from './reply-pipeline.ts';
 import { CallTurnRecorder, type TurnOutcome } from './call-recorder.ts';
 import { resolveStyle } from './emotion.ts';
 import type { FillerManager } from './filler-manager.ts';
@@ -56,6 +62,8 @@ export class CallSession {
   private closing = false;
   private closed = false;
   private lastPartialText = '';
+  /** 等待客户端 playback_drained ACK 的输出流（P0-4） */
+  private pendingDrain: { streamId: string; timer: NodeJS.Timeout; sentAt: number } | null = null;
 
   constructor(private readonly deps: CallSessionDeps) {
     this.log = deps.logger.child({ call_id: deps.callId, conversation_id: deps.conversationId });
@@ -110,7 +118,7 @@ export class CallSession {
     if (this.closed || this.closing) return;
     switch (message.t) {
       case 'ready':
-        this.sendJson({ t: 'state', state: this.state });
+        this.handleReady(message.protocol, message.capabilities);
         break;
       case 'start':
         this.handleStart();
@@ -120,6 +128,9 @@ export class CallSession {
         break;
       case 'abort':
         this.handleAbort();
+        break;
+      case 'playback_drained':
+        this.handlePlaybackDrained(message.stream_id);
         break;
       case 'ping':
         this.sendJson({ t: 'pong' });
@@ -144,6 +155,7 @@ export class CallSession {
     this.closing = true;
     try {
       this.abortTurn(`destroy:${reason}`);
+      this.clearPendingDrain('destroy');
       this.stateMachine.forceEnded();
       this.deps.sessionsRepo?.markEnded(this.deps.callId, Date.now(), 'ended');
       this.log.info('call_ended', { reason });
@@ -161,6 +173,24 @@ export class CallSession {
   // 用户开始说话
   // -------------------------------------------------------------------------
 
+  /** P1-7：ready 能力协商。只回版本与音频约定，不做复杂 negotiation */
+  private handleReady(clientProtocol: number | undefined, capabilities: unknown): void {
+    const audio: WsAudioContract = {
+      input_rate: REALTIME_INPUT_SAMPLE_RATE,
+      output_rate: REALTIME_OUTPUT_SAMPLE_RATE,
+      format: 'pcm16'
+    };
+    this.sendJson({ t: 'ready', protocol: WS_PROTOCOL_VERSION, audio });
+    if (clientProtocol !== undefined && clientProtocol !== WS_PROTOCOL_VERSION) {
+      this.log.warn('ws_protocol_version_mismatch', {
+        client_protocol: clientProtocol,
+        server_protocol: WS_PROTOCOL_VERSION,
+        client_capabilities: capabilities
+      });
+    }
+    this.sendJson({ t: 'state', state: this.state });
+  }
+
   private handleStart(): void {
     if (!this.stateMachine.is('idle', 'listening')) {
       this.sendJson({ t: 'error', code: 'invalid_state', message: `cannot start in state=${this.state}` });
@@ -177,6 +207,8 @@ export class CallSession {
     this.turn = {
       index: this.turnIndex,
       turnId: randomUUID(),
+      outputStreamId: newOutputStreamId(),
+      nextSequence: 0,
       userText: '',
       asr: createAsrSession(
         { asr: this.deps.asr, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
@@ -194,7 +226,6 @@ export class CallSession {
       fullText: '',
       playedText: '',
       pcmStarted: false,
-      pcmRate: null,
       written: false
     };
     // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）
@@ -287,7 +318,8 @@ export class CallSession {
       this.sendJson({ t: 'reply', text: turn.fullText, emotion: style.emotion });
     }
     if (turn.pcmStarted) {
-      this.sendJson({ t: 'pcm_end' });
+      this.sendJson({ t: 'pcm_end', stream_id: turn.outputStreamId });
+      this.armPendingDrain(turn.outputStreamId);
     }
     this.writeTurn(turn, 'completed');
     turn.metrics.markEnd();
@@ -324,7 +356,9 @@ export class CallSession {
         this.stateMachine.transition('interrupting');
       }
       this.abortTurn('user_abort');
-      this.sendJson({ t: 'interrupted' });
+      // 旧输出流永久失效（P0-3）：客户端凭 stream_id 丢弃迟到 chunk，且不再要求 drained
+      this.clearPendingDrain('interrupted');
+      this.sendJson({ t: 'interrupted', stream_id: turn.outputStreamId });
       // 保留已真正播出的内容（规范第 20 节第 6 条）
       if (turn.fullText) {
         this.sendJson({ t: 'reply', text: turn.fullText });
@@ -372,6 +406,45 @@ export class CallSession {
   // -------------------------------------------------------------------------
   // 输出
   // -------------------------------------------------------------------------
+
+  /**
+   * P0-4：pcm_end 只代表服务端发完，不等于用户听完。
+   * 等待客户端 playback_drained ACK，超时只告警清理，绝不悬挂 session。
+   */
+  private armPendingDrain(streamId: string): void {
+    this.clearPendingDrain('rearm');
+    const timeoutMs = this.deps.config.playbackDrainTimeoutMs;
+    if (timeoutMs <= 0) return; // 显式关闭（0 = 不等待 ACK）
+    const timer = setTimeout(() => {
+      if (this.pendingDrain?.streamId === streamId) {
+        this.log.warn('playback_drain_timeout', {
+          stream_id: streamId,
+          waited_ms: timeoutMs
+        });
+        this.pendingDrain = null;
+      }
+    }, timeoutMs);
+    timer.unref?.();
+    this.pendingDrain = { streamId, timer, sentAt: Date.now() };
+  }
+
+  private handlePlaybackDrained(streamId: string): void {
+    if (!this.pendingDrain || this.pendingDrain.streamId !== streamId) return;
+    const drained = this.pendingDrain;
+    clearTimeout(drained.timer);
+    this.pendingDrain = null;
+    this.log.info('playback_drained', {
+      stream_id: streamId,
+      playback_ms: Date.now() - drained.sentAt
+    });
+  }
+
+  private clearPendingDrain(reason: string): void {
+    if (!this.pendingDrain) return;
+    clearTimeout(this.pendingDrain.timer);
+    this.pendingDrain = null;
+    this.log.debug('playback_drain_cleared', { reason });
+  }
 
   private enterSpeaking(): void {
     if (this.stateMachine.is('thinking')) {
