@@ -106,8 +106,9 @@ export class VoiceService {
   }
 
   /**
-   * 对方 -> 用户：Batch TTS -> R2 -> voice_assets（规范第 11 节）。
-   * message_id 幂等：重复调用返回既有资产。
+   * 对方 -> 用户：Batch TTS -> 对象存储 -> voice_assets（规范第 11 节）。
+   * message_id 幂等（P1-3）：object key 含 asset_id（不可变），并发请求各写各的
+   * 物理 key；DB 唯一索引决定 winner，落败者只清理自己的对象，不会误删 winner。
    */
   async speak(params: SpeakParams): Promise<VoiceAssetWithUrl> {
     if (params.messageId) {
@@ -133,7 +134,7 @@ export class VoiceService {
     const assetId = randomUUID();
     const messageId = params.messageId ?? assetId;
     const conversationId = params.conversationId ?? null;
-    const objectKey = buildObjectKey(conversationId, messageId, synthesized.format);
+    const objectKey = buildObjectKey(conversationId, messageId, synthesized.format, assetId);
     await this.deps.store.put(objectKey, synthesized.audio, contentTypeFor(synthesized.format));
     await this.deps.store.put(
       metaObjectKey(objectKey),
@@ -176,8 +177,10 @@ export class VoiceService {
     const { inserted, existing } = this.deps.assetsRepo.insert(record);
     let finalRecord: VoiceAssetRecord = record;
     if (!inserted && existing) {
-      // 并发同 message_id：以先落库者为准（幂等）
+      // 并发同 message_id：以先落库者为准（幂等）。
+      // key 含 asset_id：这里删的是自己的对象，winner 的对象不受影响（P1-3）
       await this.deps.store.delete(objectKey).catch(() => undefined);
+      await this.deps.store.delete(metaObjectKey(objectKey)).catch(() => undefined);
       finalRecord = existing;
     }
     this.deps.logger.info('voice_asset_created', {
@@ -220,7 +223,8 @@ export class VoiceService {
     const assetId = randomUUID();
     const messageId = input.messageId ?? assetId;
     const conversationId = input.conversationId ?? null;
-    const objectKey = buildObjectKey(conversationId, messageId, normalizeContainer(input.format));
+    // P1-3：key 含 asset_id，并发同 message_id 不会互相覆盖/误删
+    const objectKey = buildObjectKey(conversationId, messageId, normalizeContainer(input.format), assetId);
     await this.deps.store.put(objectKey, input.audio, contentTypeFor(normalizeContainer(input.format)));
     const record: VoiceAssetRecord = {
       id: assetId,
@@ -245,6 +249,8 @@ export class VoiceService {
     const { inserted, existing } = this.deps.assetsRepo.insert(record);
     let finalRecord: VoiceAssetRecord = record;
     if (!inserted && existing) {
+      // 并发落败：清理自己的对象（key 含 asset_id，不影响 winner）
+      await this.deps.store.delete(objectKey).catch(() => undefined);
       finalRecord = existing;
     }
     this.deps.logger.info('user_voice_stored', {

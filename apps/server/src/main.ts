@@ -22,11 +22,14 @@ async function bootstrap(): Promise<void> {
     console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', event: 'tmp_cleaned', removed: cleaned.removed }));
   }
 
-  const problems = assertProductionReadiness(config);
-  if (problems.length > 0) {
-    if (config.env === 'production' && !config.allowMockInProduction) {
-      throw new Error(`生产配置校验失败：\n- ${problems.join('\n- ')}`);
-    }
+  const readiness = assertProductionReadiness(config);
+  // P1-4 fail closed：安全项（鉴权/签名/存储完整性）无条件阻断；
+  // SIREN_ALLOW_MOCK_IN_PRODUCTION 只放宽 mock provider 一组
+  if (readiness.security.length > 0) {
+    throw new Error(`生产安全配置校验失败（SIREN_ALLOW_MOCK_IN_PRODUCTION 不能豁免这些项）：\n- ${readiness.security.join('\n- ')}`);
+  }
+  if (readiness.mock.length > 0 && !config.allowMockInProduction) {
+    throw new Error(`生产配置校验失败：\n- ${readiness.mock.join('\n- ')}`);
   }
 
   const siren = await buildApp({ config });
@@ -41,7 +44,7 @@ async function bootstrap(): Promise<void> {
     mcp: `http://${config.host}:${config.port}/mcp`,
     warnings: siren.providers.warnings.length
   });
-  for (const problem of problems) {
+  for (const problem of [...readiness.security, ...readiness.mock]) {
     siren.logger.warn('config_warning', { message: problem });
   }
 

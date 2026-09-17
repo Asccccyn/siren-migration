@@ -1,6 +1,7 @@
 /**
- * 结构化 JSON 日志（规范第 38 节）。
- * - 敏感字段一律脱敏：token / secret / key / authorization / cookie / password
+ * 结构化 JSON 日志（规范第 38 节 / v1.1 P1-5）。
+ * - 敏感字段精确匹配 credential 词段（token/secret/key/...）脱敏；
+ *   延迟指标（llm_first_token_ms 等）不再被 /token/i 误伤
  * - 文本内容默认不落日志（LOG_TRANSCRIPTS=false）
  */
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -10,7 +11,53 @@ export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
-const SENSITIVE_KEY_RE = /(token|secret|key|authorization|cookie|password|bearer)/i;
+/** credential 词段：key 归一化（小写、-/_ 统一）后按词段命中即脱敏 */
+const SENSITIVE_SEGMENTS = new Set([
+  'token',
+  'tokens',
+  'secret',
+  'secrets',
+  'key',
+  'keys',
+  'apikey',
+  'password',
+  'passwd',
+  'authorization',
+  'auth',
+  'bearer',
+  'cookie',
+  'session',
+  'credential',
+  'credentials',
+  'accesskey'
+]);
+
+/** 明确放行的指标/计数字段（含 token 字样但不是 credential，P1-5） */
+const METRIC_ALLOWLIST = new Set([
+  'llm_first_token_ms',
+  'token_count',
+  'input_tokens',
+  'output_tokens',
+  'total_tokens',
+  'prompt_tokens',
+  'completion_tokens',
+  'max_tokens',
+  'first_token_ms',
+  'last_token_ms'
+]);
+
+function isSensitiveKey(rawKey: string): boolean {
+  // camelCase 边界展开（refreshToken -> refresh_token），统一小写下划线分词
+  const key = rawKey
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[-\s.]+/g, '_');
+  if (METRIC_ALLOWLIST.has(key)) return false;
+  if (SENSITIVE_SEGMENTS.has(key)) return true;
+  const segments = key.split('_').filter(Boolean);
+  // apikey / accesskey 等复合词段
+  return segments.some((segment) => SENSITIVE_SEGMENTS.has(segment));
+}
 
 export interface LoggerOptions {
   level?: LogLevel;
@@ -38,7 +85,7 @@ function redact(fields: Record<string, unknown>, logTranscripts: boolean): Recor
       out[key] = logTranscripts && typeof value === 'string' ? value : `[len:${typeof value === 'string' ? value.length : '?'}]`;
       continue;
     }
-    if (SENSITIVE_KEY_RE.test(key)) {
+    if (isSensitiveKey(key)) {
       out[key] = '[redacted]';
       continue;
     }

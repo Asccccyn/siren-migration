@@ -1,21 +1,27 @@
 /**
- * 语音资产的 object key 与内容类型约定（规范第 30 节）。
- * voice/{YYYY}/{MM}/{conversation_id}/{message_id}/audio.{ext} + meta.json
+ * 语音资产的 object key 与内容类型约定（规范第 30 节 / v1.1 P1-3）。
+ * voice/{YYYY}/{MM}/{conversation_id}/{message_id}/{asset_id}/audio.{ext} + meta.json
+ *
+ * key 包含 asset_id（P1-3 immutable object key）：并发同 message_id 的两个请求
+ * 写不同的物理 key，DB 唯一索引决定 winner；落败者只清理自己的 key，
+ * 永远不会误删 winner 的音频对象。
  */
 
-/** 生成规范第 30 节的分形 object key */
+/** 生成规范第 30 节的分形 object key（asset 维度不可变） */
 export function buildObjectKey(
   conversationId: string | null,
   messageId: string,
-  format: string
+  format: string,
+  assetId: string
 ): string {
   const now = new Date();
   const year = String(now.getFullYear());
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const conversation = sanitizeKeyPart(conversationId ?? 'anonymous');
   const message = sanitizeKeyPart(messageId);
+  const asset = sanitizeKeyPart(assetId);
   const ext = format === 'pcm' ? 'pcm' : format === 'wav' ? 'wav' : 'mp3';
-  return `voice/${year}/${month}/${conversation}/${message}/audio.${ext}`;
+  return `voice/${year}/${month}/${conversation}/${message}/${asset}/audio.${ext}`;
 }
 
 /** key 段只允许安全字符，长度封顶（配合 isValidObjectKey 双重防护） */

@@ -1,12 +1,17 @@
 /**
  * ElevenLabs TTS（可选替换 Provider）。
- * - 批量：output_format=mp3_44100_128 -> 完整 MP3
- * - 流式：output_format=pcm_24000 -> PCM16 24kHz mono chunk 流
+ * - 批量：显式 format 映射（P1-2）——mp3 -> mp3_44100_128；
+ *   wav/pcm -> pcm_{rate}（ElevenLabs 不提供 wav 输出，如实返回 pcm + 正确 MIME，
+ *   不支持的采样率直接抛 unsupported_format，不伪装）
+ * - 流式：官方 /v1/text-to-speech/{id}/stream 增量读取响应体（P0-9 附录说明：
+ *   这是 provider 端流式端点 + 增量 transport 读取，非本地切片）
+ * - AbortSignal：透传到 fetch，barge-in 时真正取消上游请求
  * 情绪映射为 voice_settings 参数（规范第 9 节）。
  */
 import {
   ProviderError,
   REALTIME_OUTPUT_SAMPLE_RATE,
+  type AudioFormat,
   type PcmChunk,
   type StreamTtsProvider,
   type TtsAudioResult,
@@ -14,7 +19,7 @@ import {
   type TtsRequest,
   type SirenEmotion
 } from '@siren/contracts';
-import { chunkPcm16, estimateMp3DurationMs, samplesForDuration } from '@siren/audio';
+import { estimateMp3DurationMs, samplesForDuration } from '@siren/audio';
 
 export interface ElevenLabsConfig {
   apiKey: string;
@@ -22,6 +27,9 @@ export interface ElevenLabsConfig {
   baseUrl: string;
   timeoutMs: number;
 }
+
+/** ElevenLabs pcm 输出支持的采样率 */
+const PCM_RATES = new Set([8000, 16000, 22050, 24000, 32000, 44100, 48000]);
 
 interface VoiceSettings {
   stability: number;
@@ -42,6 +50,27 @@ const EMOTION_SETTINGS: Record<SirenEmotion, Partial<VoiceSettings>> = {
   surprised: { stability: 0.4, style: 0.6 }
 };
 
+/** 请求格式 -> ElevenLabs output_format 的显式映射；返回实际交付格式与采样率 */
+function mapFormat(format: AudioFormat, sampleRateHint: number): {
+  outputFormat: string;
+  actualFormat: AudioFormat;
+  actualSampleRate: number;
+} {
+  if (format === 'mp3') {
+    return { outputFormat: 'mp3_44100_128', actualFormat: 'mp3', actualSampleRate: 44100 };
+  }
+  // wav / pcm：ElevenLabs 只有 pcm 输出；wav 请求如实降为 pcm（MIME/格式一致）
+  const rate = sampleRateHint || REALTIME_OUTPUT_SAMPLE_RATE;
+  if (!PCM_RATES.has(rate)) {
+    throw new ProviderError(
+      'unsupported_format',
+      'elevenlabs',
+      `pcm sample rate ${rate} not supported by elevenlabs (supported: ${[...PCM_RATES].join(', ')})`
+    );
+  }
+  return { outputFormat: `pcm_${rate}`, actualFormat: 'pcm', actualSampleRate: rate };
+}
+
 export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
   constructor(private readonly config: ElevenLabsConfig) {}
 
@@ -50,29 +79,82 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
     if (!voiceId) {
       throw new ProviderError('provider_unavailable', 'elevenlabs', 'voice id missing (set ELEVENLABS_VOICE_ID or profile voiceId)');
     }
-    const audio = await this.rawRequest(voiceId, request, 'mp3_44100_128');
+    const mapped = mapFormat(request.format, request.sampleRate ?? 0);
+    const audio = await this.rawRequest(voiceId, request, mapped.outputFormat);
     return {
       audio,
-      format: request.format === 'wav' ? 'wav' : request.format,
-      sampleRate: request.sampleRate ?? 44100,
-      durationMs: estimateMp3DurationMs(audio.length, 128)
+      // 如实上报：请求 wav 但拿回 pcm 时格式就是 pcm，MIME/扩展名按此为准
+      format: mapped.actualFormat,
+      sampleRate: mapped.actualSampleRate,
+      durationMs:
+        mapped.actualFormat === 'mp3'
+          ? estimateMp3DurationMs(audio.length, 128)
+          : Math.round((audio.length / 2 / mapped.actualSampleRate) * 1000)
     };
   }
 
-  async *synthesizeStream(request: TtsRequest): AsyncGenerator<PcmChunk> {
+  /** 官方流式端点 + 响应体增量读取：音频边生成边到达（pcm_24000） */
+  async *synthesizeStream(request: TtsRequest, signal?: AbortSignal): AsyncGenerator<PcmChunk> {
     const voiceId = request.profile.voiceId;
     if (!voiceId) {
       throw new ProviderError('provider_unavailable', 'elevenlabs', 'voice id missing');
     }
-    const sampleRate = request.sampleRate ?? REALTIME_OUTPUT_SAMPLE_RATE;
-    const audio = await this.rawRequest(voiceId, request, 'pcm_24000');
-    const chunkSamples = samplesForDuration(sampleRate, 20);
-    for (const frame of chunkPcm16(audio, chunkSamples)) {
-      yield { audio: frame, sampleRate };
+    const mapped = mapFormat(request.format === 'mp3' ? 'pcm' : request.format, request.sampleRate ?? REALTIME_OUTPUT_SAMPLE_RATE);
+    const sampleRate = mapped.actualSampleRate;
+    const response = await this.fetchStream(voiceId, request, mapped.outputFormat, signal);
+    if (!response.ok) {
+      const message = await response.text().catch(() => '');
+      throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
+    }
+    if (!response.body) {
+      throw new ProviderError('tts_failed', 'elevenlabs', 'tts stream body missing');
+    }
+    const reader = response.body.getReader();
+    const framer = new PcmAccumulator(sampleRate);
+    try {
+      while (true) {
+        if (signal?.aborted) throw new ProviderError('tts_failed', 'elevenlabs', 'tts aborted');
+        const { done, value } = await reader.read();
+        if (done) break;
+        for (const frame of framer.push(Buffer.from(value))) {
+          yield { audio: frame, sampleRate };
+        }
+      }
+      for (const frame of framer.flush()) {
+        yield { audio: frame, sampleRate };
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
     }
   }
 
+  private async fetchStream(
+    voiceId: string,
+    request: TtsRequest,
+    outputFormat: string,
+    signal?: AbortSignal
+  ): Promise<Response> {
+    const timeoutSignal = AbortSignal.timeout(this.config.timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    return this.post(voiceId, request, outputFormat, '/stream', combined);
+  }
+
   private async rawRequest(voiceId: string, request: TtsRequest, outputFormat: string): Promise<Buffer> {
+    const response = await this.post(voiceId, request, outputFormat, '', AbortSignal.timeout(this.config.timeoutMs));
+    if (!response.ok) {
+      const message = await response.text().catch(() => '');
+      throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
+    }
+    return Buffer.from(await response.arrayBuffer());
+  }
+
+  private post(
+    voiceId: string,
+    request: TtsRequest,
+    outputFormat: string,
+    suffix: string,
+    signal: AbortSignal
+  ): Promise<Response> {
     const settings: VoiceSettings = {
       stability: 0.5,
       similarity_boost: 0.75,
@@ -84,28 +166,48 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
       // ElevenLabs 无原生语速参数，通过 stability 间接微调
       settings.stability = clamp(1.1 - request.style.speed * 0.5, 0.05, 1.0);
     }
-    const response = await fetch(
-      `${this.config.baseUrl.replace(/\/$/, '')}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=${outputFormat}`,
+    return fetch(
+      `${this.config.baseUrl.replace(/\/$/, '')}/v1/text-to-speech/${encodeURIComponent(voiceId)}${suffix}?output_format=${outputFormat}`,
       {
         method: 'POST',
         headers: {
           'xi-api-key': this.config.apiKey,
           'content-type': 'application/json',
-          accept: 'audio/mpeg'
+          accept: outputFormat.startsWith('pcm') ? 'audio/pcm' : 'audio/mpeg'
         },
         body: JSON.stringify({
           text: request.ttsScript ?? request.text,
           model_id: this.config.modelId,
           voice_settings: settings
         }),
-        signal: AbortSignal.timeout(this.config.timeoutMs)
+        signal
       }
     );
-    if (!response.ok) {
-      const message = await response.text().catch(() => '');
-      throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
+  }
+}
+
+/** 字节流按 20ms 帧切分（跨 read 保留残余） */
+class PcmAccumulator {
+  private pending: Buffer = Buffer.alloc(0);
+
+  constructor(private readonly sampleRate: number) {}
+
+  push(chunk: Buffer): Buffer[] {
+    this.pending = Buffer.concat([this.pending, chunk]);
+    const frameBytes = samplesForDuration(this.sampleRate, 20) * 2;
+    const frames: Buffer[] = [];
+    while (this.pending.length >= frameBytes) {
+      frames.push(this.pending.subarray(0, frameBytes));
+      this.pending = this.pending.subarray(frameBytes);
     }
-    return Buffer.from(await response.arrayBuffer());
+    return frames;
+  }
+
+  flush(): Buffer[] {
+    if (this.pending.length === 0) return [];
+    const rest = [this.pending];
+    this.pending = Buffer.alloc(0);
+    return rest;
   }
 }
 

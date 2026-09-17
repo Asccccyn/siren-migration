@@ -45,7 +45,8 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
   const { config, logger, voice, pipeline } = deps;
 
   app.post('/v1/voice/transcribe', async (request, reply) => {
-    let audioFile: { toBuffer: () => Promise<Buffer> } | null = null;
+    let audioFile: { toBuffer: () => Promise<Buffer>; mimetype?: string } | null = null;
+    let partMimeType = 'application/octet-stream';
     const fields: Record<string, string> = {};
     try {
       for await (const part of request.parts()) {
@@ -56,6 +57,9 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
             return;
           }
           audioFile = part;
+          if (typeof part.mimetype === 'string' && part.mimetype) {
+            partMimeType = part.mimetype;
+          }
         } else if (part.fieldname) {
           fields[part.fieldname] = String(part.value ?? '');
         }
@@ -84,9 +88,11 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
       }
       tmpPath = await saveBufferToTmp(config.tmpDir, buffer, '.upload');
       const stored = await readFile(tmpPath);
+      // P1-6：格式推断必须用上传文件 part 自己的 mimetype，
+      // 不能用整个请求的 Content-Type（multipart/form-data 恒为 webm 兜底）
       const output = await pipeline.handleUserVoice({
         audio: stored,
-        format: fields.format ?? guessAudioFormat(request.headers['content-type'] ?? ''),
+        format: fields.format ?? guessAudioFormat(partMimeType),
         language: fields.language || undefined,
         conversationId: fields.conversation_id || undefined,
         messageId: fields.message_id || undefined,

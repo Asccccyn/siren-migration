@@ -54,6 +54,36 @@ describe('REST 校验与鉴权', () => {
     }
   });
 
+  it('P1-6：transcribe 用文件 part 的 mimetype 推断格式（m4a 不再误判为 webm）', async () => {
+    const siren = await buildTestApp();
+    await siren.app.listen({ host: '127.0.0.1', port: 0 });
+    const address = siren.app.server!.address() as { port: number };
+    try {
+      const form = new FormData();
+      form.append(
+        'audio',
+        new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'audio/mp4' }),
+        'voice.m4a'
+      );
+      form.append('store', 'true');
+      form.append('message_id', 'msg-m4a-1');
+
+      const response = await fetch(`http://127.0.0.1:${address.port}/v1/voice/transcribe`, {
+        method: 'POST',
+        body: form
+      });
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as { voice_message_id?: string };
+      expect(payload.voice_message_id).toBeTruthy();
+
+      const message = await fetch(`http://127.0.0.1:${address.port}/v1/voice/messages/${payload.voice_message_id}`);
+      // part mimetype=audio/mp4 -> m4a（旧实现会把 multipart 主 content-type 误判成 webm）
+      expect(await message.json()).toMatchObject({ audio_format: 'm4a' });
+    } finally {
+      await siren.dispose();
+    }
+  });
+
   it('配置 SIREN_INTERNAL_TOKEN 后未带 token 的写操作 401，带 token 放行', async () => {
     const siren = await buildTestApp({ SIREN_INTERNAL_TOKEN: 'secret-1' });
     try {

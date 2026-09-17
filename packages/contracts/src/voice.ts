@@ -153,7 +153,8 @@ export type ProviderErrorCode =
   | 'tts_failed'
   | 'provider_unavailable'
   | 'invalid_audio'
-  | 'provider_timeout';
+  | 'provider_timeout'
+  | 'unsupported_format';
 
 export class ProviderError extends Error {
   readonly code: ProviderErrorCode;

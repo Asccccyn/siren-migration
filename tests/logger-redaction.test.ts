@@ -61,4 +61,50 @@ describe('Logger 脱敏（规范第 38 节）', () => {
     logger.error('e', { err: new Error('boom') });
     expect(lines[0].err).toEqual({ name: 'Error', message: 'boom' });
   });
+
+  it('P1-5：延迟/计数指标含 token 字样不再被误脱敏', () => {
+    const { lines, logger } = capture();
+    logger.info('turn_completed', {
+      llm_first_token_ms: 123,
+      token_count: 88,
+      input_tokens: 10,
+      output_tokens: 78,
+      total_tokens: 88,
+      max_tokens: 4096,
+      asr_latency_ms: 45,
+      total_first_audio_ms: 900
+    });
+    const entry = lines[0];
+    expect(entry.llm_first_token_ms).toBe(123);
+    expect(entry.token_count).toBe(88);
+    expect(entry.input_tokens).toBe(10);
+    expect(entry.output_tokens).toBe(78);
+    expect(entry.total_tokens).toBe(88);
+    expect(entry.max_tokens).toBe(4096);
+    expect(entry.asr_latency_ms).toBe(45);
+    expect(entry.total_first_audio_ms).toBe(900);
+  });
+
+  it('P1-5：真实 credential 字段仍然全部脱敏（含 camelCase 与供应商前缀）', () => {
+    const { lines, logger } = capture();
+    logger.info('config', {
+      volc_access_token: 'x',
+      refreshToken: 'x',
+      apiKey: 'x',
+      X_Api_Key: 'x',
+      bearer: 'x',
+      secret_access_key: 'x',
+      session_token: 'x',
+      llm_first_token_ms: 1
+    });
+    const entry = lines[0];
+    expect(entry.volc_access_token).toBe('[redacted]');
+    expect(entry.refreshToken).toBe('[redacted]');
+    expect(entry.apiKey).toBe('[redacted]');
+    expect(entry.X_Api_Key).toBe('[redacted]');
+    expect(entry.bearer).toBe('[redacted]');
+    expect(entry.secret_access_key).toBe('[redacted]');
+    expect(entry.session_token).toBe('[redacted]');
+    expect(entry.llm_first_token_ms).toBe(1);
+  });
 });

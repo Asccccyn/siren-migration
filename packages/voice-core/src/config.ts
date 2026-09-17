@@ -89,6 +89,8 @@ export interface SirenConfig {
   allowMockInProduction: boolean;
   /** 本地对象存储 / 资源签名的 HMAC 密钥 */
   signingSecret: string;
+  /** SIREN_SIGNING_SECRET 是否显式配置（生产 fail-closed 检查用，P1-4） */
+  signingSecretExplicit: boolean;
 }
 
 function num(env: EnvSource, key: string, fallback: number): number {
@@ -111,6 +113,7 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
 
   const dataDir = resolve(cwd, env.DATA_ROOT ?? './data');
   const internalToken = env.SIREN_INTERNAL_TOKEN?.trim() || null;
+  const signingSecretExplicit = Boolean(env.SIREN_SIGNING_SECRET?.trim());
   const signingSecret =
     env.SIREN_SIGNING_SECRET?.trim() ||
     createHash('sha256')
@@ -133,7 +136,8 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     ...resolveRealtimeTunables(env),
 
     allowMockInProduction: bool(env, 'SIREN_ALLOW_MOCK_IN_PRODUCTION', false),
-    signingSecret
+    signingSecret,
+    signingSecretExplicit
   };
 }
 
@@ -237,19 +241,47 @@ function parseCorsOrigins(raw: string | undefined, envName: SirenConfig['env']):
   return ['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'];
 }
 
-/** 校验：生产环境不允许 Mock 默认链路（规范第 47 节第 21 条） */
-export function assertProductionReadiness(config: SirenConfig): string[] {
-  const problems: string[] = [];
-  if (config.env !== 'production' || config.allowMockInProduction) return problems;
+export interface ProductionReadiness {
+  /**
+   * 安全项（P1-4 fail closed）：生产环境一律阻断启动，
+   * SIREN_ALLOW_MOCK_IN_PRODUCTION 只放宽 mock provider，不得跳过这些检查。
+   */
+  security: string[];
+  /** mock 链路项：SIREN_ALLOW_MOCK_IN_PRODUCTION=true 时允许放行（仅限调试） */
+  mock: string[];
+}
+
+/**
+ * 生产配置校验（P1-4：security 与 mock readiness 拆开，fail closed）。
+ * - security：SIREN_INTERNAL_TOKEN / SIREN_SIGNING_SECRET 必须显式配置；
+ *   R2 要么不配（整组缺失仅提示），要么配齐（account/key/secret/bucket 缺一即阻断）
+ * - mock：Mock Core / Provider 禁入生产（allowMock 豁免的只有这一组）
+ */
+export function assertProductionReadiness(config: SirenConfig): ProductionReadiness {
+  const security: string[] = [];
+  const mock: string[] = [];
+  if (config.env !== 'production') return { security, mock };
+
+  if (!config.internalToken) {
+    security.push('SIREN_INTERNAL_TOKEN 未配置：内部 API 与 MCP 将不鉴权，生产禁止');
+  }
+  if (!config.signingSecretExplicit) {
+    security.push('SIREN_SIGNING_SECRET 未显式配置：资源签名密钥将由内部 token 派生，生产禁止');
+  }
+  const r2 = config.r2;
+  const r2ConfiguredAny = Boolean(r2.accountId || r2.accessKeyId || r2.secretAccessKey);
+  if (r2ConfiguredAny && !(r2.accountId && r2.accessKeyId && r2.secretAccessKey)) {
+    security.push('R2 配置不完整：account id / access key / secret key 必须配齐，不允许半配置');
+  }
+
+  if (config.allowMockInProduction) return { security, mock };
+
   if (config.coreBridge === 'mock') {
-    problems.push('SIREN_CORE_BRIDGE=mock 不允许出现在生产环境（设置 SIREN_CORE_BRIDGE=http + CORE_BASE_URL）');
+    mock.push('SIREN_CORE_BRIDGE=mock 不允许出现在生产环境（设置 SIREN_CORE_BRIDGE=http + CORE_BASE_URL）');
   }
-  if (config.providers.asr === 'mock') problems.push('ASR_PROVIDER=mock 不允许出现在生产环境');
+  if (config.providers.asr === 'mock') mock.push('ASR_PROVIDER=mock 不允许出现在生产环境');
   if (config.providers.asyncTts === 'mock' || config.providers.realtimeTts === 'mock') {
-    problems.push('TTS provider=mock 不允许出现在生产环境');
+    mock.push('TTS provider=mock 不允许出现在生产环境');
   }
-  if (config.env === 'production' && !config.r2.accountId) {
-    problems.push('生产环境未配置 R2（R2_ACCOUNT_ID 等），将回退到本地对象存储');
-  }
-  return problems;
+  return { security, mock };
 }

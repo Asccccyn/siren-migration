@@ -51,10 +51,43 @@ describe('Provider 注册与生产守卫（规范第 47 节）', () => {
     expect(() => buildProviders(configAllowed, silentLogger)).not.toThrow();
   });
 
-  it('assertProductionReadiness 汇总风险项', () => {
+  it('assertProductionReadiness 汇总风险项（P1-4：security 与 mock 拆开）', () => {
     const config = loadConfig({ NODE_ENV: 'production', SIREN_CORE_BRIDGE: 'mock' });
-    const problems = assertProductionReadiness(config);
-    expect(problems.some((p) => p.includes('mock'))).toBe(true);
+    const readiness = assertProductionReadiness(config);
+    expect(readiness.mock.some((p) => p.includes('mock'))).toBe(true);
+    // 安全项（token/签名/R2 完整性）独立于 mock 检查，allowMock 不能豁免
+    expect(readiness.security.some((p) => p.includes('SIREN_INTERNAL_TOKEN'))).toBe(true);
+    expect(readiness.security.some((p) => p.includes('SIREN_SIGNING_SECRET'))).toBe(true);
+
+    // 配齐安全项 + R2 半配置 -> security 报 R2 不完整
+    const partial = loadConfig({
+      NODE_ENV: 'production',
+      SIREN_INTERNAL_TOKEN: 't',
+      SIREN_SIGNING_SECRET: 's',
+      R2_ACCOUNT_ID: 'only-account'
+    });
+    expect(assertProductionReadiness(partial).security.some((p) => p.includes('R2'))).toBe(true);
+
+    // 全部配齐 -> 无 security 风险
+    const complete = loadConfig({
+      NODE_ENV: 'production',
+      SIREN_INTERNAL_TOKEN: 't',
+      SIREN_SIGNING_SECRET: 's',
+      R2_ACCOUNT_ID: 'a',
+      R2_ACCESS_KEY_ID: 'k',
+      R2_SECRET_ACCESS_KEY: 'v'
+    });
+    expect(assertProductionReadiness(complete).security.length).toBe(0);
+
+    // allowMock 只清空 mock 组，security 保留
+    const allowed = loadConfig({
+      NODE_ENV: 'production',
+      SIREN_CORE_BRIDGE: 'mock',
+      SIREN_ALLOW_MOCK_IN_PRODUCTION: 'true'
+    });
+    const allowedReadiness = assertProductionReadiness(allowed);
+    expect(allowedReadiness.mock.length).toBe(0);
+    expect(allowedReadiness.security.length).toBeGreaterThan(0);
   });
 
   it('Provider 可替换：bundle 对象满足接口（duck typing 检查）', () => {
