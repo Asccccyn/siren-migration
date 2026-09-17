@@ -9,20 +9,14 @@
  */
 import { randomUUID } from 'node:crypto';
 import type {
-  AsrProvider,
   CallState,
   ClientWsMessage,
+  RealtimeVoiceProvider,
   ServerWsMessage,
-  TtsProvider,
   VoiceProfile,
   WsAudioContract
 } from '@siren/contracts';
-import {
-  REALTIME_INPUT_SAMPLE_RATE,
-  REALTIME_OUTPUT_SAMPLE_RATE,
-  WS_PROTOCOL_VERSION,
-  WS_CLOSE_CODES
-} from '@siren/contracts';
+import { WS_PROTOCOL_VERSION, WS_CLOSE_CODES } from '@siren/contracts';
 import type { CoreBridge } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import { LatencyTracker, errorFields, type Logger } from '@siren/telemetry';
@@ -40,8 +34,8 @@ export interface CallSessionDeps {
   callId: string;
   conversationId: string | null;
   profile: VoiceProfile;
-  asr: AsrProvider;
-  tts: TtsProvider;
+  /** P1-1：Realtime Provider 边界（cascade 组合 ASR + TTS 与采样率契约） */
+  voice: RealtimeVoiceProvider;
   core: CoreBridge;
   fillers: FillerManager;
   turnsRepo?: CallTurnsRepository;
@@ -78,7 +72,7 @@ export class CallSession {
         callId: deps.callId,
         conversationId: deps.conversationId,
         profile: deps.profile,
-        tts: deps.tts,
+        tts: deps.voice.tts,
         core: deps.core,
         fillers: deps.fillers
       },
@@ -175,9 +169,10 @@ export class CallSession {
 
   /** P1-7：ready 能力协商。只回版本与音频约定，不做复杂 negotiation */
   private handleReady(clientProtocol: number | undefined, capabilities: unknown): void {
+    // 采样率契约来自 Realtime Provider 边界（P0-7/P1-1），不再假设固定值
     const audio: WsAudioContract = {
-      input_rate: REALTIME_INPUT_SAMPLE_RATE,
-      output_rate: REALTIME_OUTPUT_SAMPLE_RATE,
+      input_rate: this.deps.voice.inputSampleRate,
+      output_rate: this.deps.voice.outputSampleRate,
       format: 'pcm16'
     };
     this.sendJson({ t: 'ready', protocol: WS_PROTOCOL_VERSION, audio });
@@ -211,7 +206,7 @@ export class CallSession {
       nextSequence: 0,
       userText: '',
       asr: createAsrSession(
-        { asr: this.deps.asr, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
+        { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
         (text) => {
           this.lastPartialText = text;
           this.sendJson({ t: 'partial', text });

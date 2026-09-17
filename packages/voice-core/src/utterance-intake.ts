@@ -4,12 +4,13 @@
  * - adoptTranscript：final 优先；PARTIAL_GRACE_MS 内未返回采用最新 partial；
  *   真正失败返回 kind:'error'，禁止把失败当成空文本。
  */
-import type { AsrProvider, VoiceProfile } from '@siren/contracts';
+import type { StreamAsrProvider, VoiceProfile } from '@siren/contracts';
 import type { PrebufferedAsrSession } from './asr-prebuffer.ts';
 import { PrebufferedAsrSession as Prebuffered } from './asr-prebuffer.ts';
 
 export interface AsrIntakeDeps {
-  asr: AsrProvider;
+  /** 只需流式能力（RealtimeVoiceProvider 即可满足） */
+  asr: StreamAsrProvider;
   profile: VoiceProfile;
   prebufferMaxBytes: number;
 }

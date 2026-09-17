@@ -25,3 +25,5 @@ export type { VoiceServiceDeps, SpeakParams, SynthesizeParams } from './voice-se
 export { AsyncVoicePipeline } from './async-voice.ts';
 export { CallCenter } from './call-center.ts';
 export type { CallCenterDeps, CreateCallResult } from './call-center.ts';
+export { CascadeRealtimeProvider } from './realtime-provider.ts';
+export type { CascadeRealtimeProviderDeps } from './realtime-provider.ts';

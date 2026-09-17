@@ -21,6 +21,7 @@ import { createLogger, type Logger } from '@siren/telemetry';
 import {
   CallCenter,
   CallSession,
+  CascadeRealtimeProvider,
   FillerManager,
   VoiceProfileRegistry,
   VoiceService,
@@ -179,8 +180,7 @@ export function buildSessionHarness(deps: {
     callId: deps.callId ?? 'call-test-1',
     conversationId: deps.conversationId ?? 'conv-test',
     profile: TEST_PROFILE,
-    asr,
-    tts,
+    voice: new CascadeRealtimeProvider({ name: 'cascade(test)', asr, tts }),
     core,
     fillers: new FillerManager('Z:\\nonexistent-fillers', false, silentLogger),
     turnsRepo,

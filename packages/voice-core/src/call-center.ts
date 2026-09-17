@@ -5,7 +5,7 @@
  * - 会话注册表保证 close 后不残留任务、同 call_id 不允许双连接
  */
 import { randomUUID } from 'node:crypto';
-import type { AsrProvider, TtsProvider } from '@siren/contracts';
+import type { AsrProvider, RealtimeVoiceProvider, TtsProvider } from '@siren/contracts';
 import type { CoreBridge } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
@@ -13,6 +13,7 @@ import { CallSession } from './call-session.ts';
 import { CallTokenStore, type VerifiedCallToken } from './call-token.ts';
 import type { SirenConfig } from './config.ts';
 import type { FillerManager } from './filler-manager.ts';
+import { CascadeRealtimeProvider } from './realtime-provider.ts';
 import type { VoiceProfileRegistry } from './voice-profile.ts';
 
 export interface CallCenterDeps {
@@ -43,9 +44,16 @@ export interface CreateCallResult {
 export class CallCenter {
   private readonly tokens: CallTokenStore;
   private readonly sessions = new Map<string, CallSession>();
+  /** P1-1：会话装配的唯一 Realtime Provider 出口（当前为 cascade 组合） */
+  readonly voice: RealtimeVoiceProvider;
 
   constructor(private readonly deps: CallCenterDeps) {
     this.tokens = new CallTokenStore(deps.config.callTokenTtlS);
+    this.voice = new CascadeRealtimeProvider({
+      name: `cascade(${deps.asrName ?? 'asr'}+${deps.ttsName ?? 'tts'})`,
+      asr: deps.realtimeAsr,
+      tts: deps.realtimeTts
+    });
   }
 
   get activeCount(): number {
@@ -113,8 +121,7 @@ export class CallCenter {
       callId: params.callId,
       conversationId: params.reservation.conversationId,
       profile,
-      asr: this.deps.realtimeAsr,
-      tts: this.deps.realtimeTts,
+      voice: this.voice,
       core: this.deps.core,
       fillers: this.deps.fillers,
       turnsRepo: this.deps.turnsRepo,
