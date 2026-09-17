@@ -1,7 +1,9 @@
-# Siren v1.0
+# Siren v1.1（Realtime Hardening）
 
 > Siren 是对方的耳朵和嘴巴，不是第二个对方。
 > 独立语音能力层：ASR / TTS / 异步语音消息 / 实时通话 / MCP。
+> v1.1：实时通话链路强化（pre-roll 首音保护 / 本地 barge-in / 下行流标识 /
+> playback_drained / 共享 conversation / 火山 v3 双向流式协议 / 幂等与 fail-closed）。
 
 ## 快速开始
 
@@ -38,7 +40,7 @@ pnpm start
 | `pnpm dev` | tsx 热重载启动服务 |
 | `pnpm build` | 构建 server（esbuild bundle）与 playground 页面 |
 | `pnpm start` | 运行构建产物 `apps/server/dist/index.js` |
-| `pnpm test` | Vitest 全量测试（17 个文件 / 89 个用例） |
+| `pnpm test` | Vitest 全量测试（27 个文件 / 150 个用例，含协议/并发/背压专项） |
 | `pnpm typecheck` | TypeScript 严格类型检查 |
 | `pnpm lint` | ESLint |
 | `pnpm fillers` | 预生成 filler 音频（`--mock` 用 Mock 音色） |
@@ -55,14 +57,18 @@ ASYNC_TTS_PROVIDER=volc
 REALTIME_TTS_PROVIDER=volc
 VOLC_APP_ID=你的AppID
 VOLC_ACCESS_TOKEN=你的AccessToken
-VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration      # 流式识别资源
+VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration      # 大模型流式识别资源（Seed ASR 用 volc.seedasr.sauc.duration）
 VOLC_TTS_CLUSTER=volcano_icl
+VOLC_TTS_RESOURCE_ID=volc.service_type.10029        # 双向流式 TTS 资源
 VOLC_VOICE_ID=你的音色ID                             # 也可配在 config/voices/*.json
 ```
 
+- 流式识别 = 大模型 sauc v3 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`（双向流式实时出字；`VOLC_ASR_WS_URL` 可换 `bigmodel_async` / `bigmodel_nostream`）。
+- 实时合成 = v3 双向流式 `wss://openspeech.bytedance.com/api/v3/tts/bidirection`（文本流式输入、音频流式输出、连接复用多 session）。
 - 批量识别默认走 one-shot `volc.bigasr.auc.duration`（`VOLC_ASR_BATCH_RESOURCE_ID` 可覆盖）。
-- 协议端点可用 `VOLC_ASR_WS_URL` / `VOLC_ASR_BATCH_URL` / `VOLC_TTS_URL` 覆盖；协议编解码集中在各 provider 的 `protocol.ts` / `batch.ts`。
+- 端点可用 `VOLC_ASR_WS_URL` / `VOLC_ASR_BATCH_URL` / `VOLC_TTS_URL` / `VOLC_TTS_WS_URL` 覆盖；协议编解码集中在各 provider 的 `protocol.ts` / `bidirectional-protocol.ts` / `batch.ts`。
 - 音色配置的唯一来源是 `config/voices/main.json`（`voiceId` 留空回退环境变量），业务代码没有写死的 Voice ID。
+- 真实验收（可选）：`VOLC_REAL_INTEGRATION=1` + 凭据运行 `tests/volc-real-integration.test.ts`。
 
 ## 配置 Cloudflare R2
 
@@ -103,7 +109,7 @@ POST {CORE_BASE_URL}/v1/chat/stream
 
 1. **发语音消息**：浏览器 MediaRecorder（WebM/Opus）→ `POST /v1/voice/transcribe`（multipart，`store=true` 可存为 user 资产）→ 拿 transcript 走 Core 文字链路。
 2. **收语音消息**：Agent 调 MCP `voice_speak`（或 REST）→ 返回 `audio_url`（签名 URL）+ `duration_ms` → 前端渲染语音气泡（transcript 折叠显示）。
-3. **实时通话**：`POST /v1/calls` → 用返回的 `ws_url + token` 建 WebSocket；上行 PCM16/16k，下行 PCM16/24k；协议细节见 `docs/REALTIME_PROTOCOL.md`（含 VAD 参数、jitter buffer、barge-in）。
+3. **实时通话**：`POST /v1/calls`（`conversation_id` 必填：电话与网页文字共享同一 conversation）→ 用返回的 `ws_url + token` 建 WebSocket；上行 PCM16/16k，下行 PCM16/24k（每 chunk 真实 rate 在 `pcm` 头中）；协议 v2 细节见 `docs/REALTIME_PROTOCOL.md`（pre-roll、本地 barge-in、stream_id/sequence、playback_drained、ready 协商、VAD 参数、jitter buffer）。
 4. 配置 `SIREN_INTERNAL_TOKEN` 后，`/v1/*`（除签名资源）与 `/mcp` 需要 `Authorization: Bearer <token>`。
 
 ## Playground
@@ -120,14 +126,28 @@ pnpm test
 
 覆盖：Provider 抽象与生产守卫、VoiceService、MCP 输入校验（真实 MCP 协议）、REST 校验与鉴权、sentence splitter、call 状态机、cancel/abort（音频停止增长断言）、R2/本地对象存储（签名、过期、路径穿越）、SQLite 仓储（message_id 幂等）、WebSocket 协议 e2e（真实端口）、prebuffer、临时文件清理、TTS 流式失败降级、ASR 失败报错、过期 call token。
 
+v1.1 新增专项：pre-roll ring、上行编排（首音保护/无重复块/本地 barge-in 顺序）、
+下行流路由（旧流丢弃/sequence 重复/gap/被打断流不复活/drain）、conversation 连续性
+（电话-文字共享、跨 call、隔离、重复 end、打断语义）、call token 上下文冻结
+（4002 重放/吊销后 4001）、背压完整 teardown（无 zombie session）、abort 幂等、
+采样率全链路（16k/24k/48k）、火山 v3 ASR 协议编解码与假服务器全流程、火山双向流式
+TTS 事件流（连接复用/并发 session/abort/SessionFailed）、ElevenLabs 格式映射与
+流式、message_id 并发幂等（winner 对象不丢）、生产 fail-closed 矩阵、日志脱敏
+指标白名单、multipart part mimetype 推断。
+
 ## 目录结构
 
 见 `docs/ARCHITECTURE.md`（模块职责、状态机、barge-in 语义、数据模型、安全模型）。
 其他文档：`docs/MCP.md`、`docs/REALTIME_PROTOCOL.md`、`docs/PROVIDERS.md`。
 
-## 已知限制（v1）
+## 已知限制（v1.1）
 
-- 火山流式 TTS 采用“句子级批量 + 深度 1 预取”实现（接口不变，可无缝切换 v3 双向流式协议）。
+- 火山 Provider 已按 2026-09 官方协议实现（v3 sauc bigmodel / v3 tts bidirection），
+  Mock 全绿但**未用真实火山凭据验证**——真实验收前只能视为
+  `implementation complete / real-provider verification pending`。
 - Call token 为进程内存存储（单进程 v1 设计；多实例部署时换 Redis）。
 - 实时 PCM 不落存储（只存 transcript 与指标），完整通话录音留给后续 Recording 模块。
 - Mock 的 MP3 以 WAV 容器承载（开发环境占位；生产必须配置真实 Provider）。
+- 重连恢复（Reconnect/Resume Lease）、后台 Agent 并行、speech-to-speech 模型接入
+  （Qwen Realtime / OpenAI / Gemini）为 v1.5 方向；本轮只留了 `RealtimeVoiceProvider`
+  边界与协议能力位，未实现。
