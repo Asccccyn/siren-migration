@@ -1,7 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import { MockCoreBridge } from '@siren/core-bridge';
+import type { PcmChunk, TtsProvider, TtsRequest, TtsAudioResult } from '@siren/contracts';
 import { buildSessionHarness, waitFor } from './helpers.ts';
+
+/** 输出固定采样率 PCM 的假 TTS（验证 P0-7 采样率全链路保留） */
+function fixedRateTts(rate: number): TtsProvider {
+  const inner = new MockTtsProvider();
+  const wrap = (chunks: AsyncGenerator<PcmChunk>): AsyncGenerator<PcmChunk> =>
+    (async function* () {
+      for await (const chunk of chunks) {
+        yield { audio: chunk.audio, sampleRate: rate };
+      }
+    })();
+  return {
+    synthesize: (request: TtsRequest) =>
+      inner.synthesize(request).then(
+        (result: TtsAudioResult): TtsAudioResult => ({ ...result, sampleRate: rate })
+      ),
+    synthesizeStream: (request: TtsRequest) => wrap(inner.synthesizeStream(request))
+  };
+}
 
 describe('CallSession（协议 / 打断 / 降级）', () => {
   it('完整一轮：start -> partial -> asr -> thinking -> speaking -> pcm -> pcm_end -> listening', async () => {
@@ -131,5 +150,80 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     harness.session.handleMessage({ t: 'end' }); // idle 状态直接 end
     const errorFrame = harness.texts().find((m) => m.t === 'error');
     expect(errorFrame).toMatchObject({ code: 'invalid_state' });
+  });
+
+  it('P0-2：正常说完一句回复 speaking -> listening，不经过 interrupting', async () => {
+    const harness = buildSessionHarness({});
+    const { session } = harness;
+    session.handleMessage({ t: 'start' });
+    session.handleBinary(Buffer.alloc(3200, 1));
+    session.handleMessage({ t: 'end' });
+    await waitFor(() =>
+      harness.texts().some((m) => m.t === 'state' && m.state === 'listening' && harness.texts().some((x) => x.t === 'pcm_end'))
+    );
+    const states = harness.texts().filter((m) => m.t === 'state').map((m) => m.state);
+    expect(states).not.toContain('interrupting');
+    expect(states[states.length - 1]).toBe('listening');
+  });
+
+  it('P0-6：backpressure 超限触发完整 teardown（无 zombie session）', async () => {
+    const destroyed: string[] = [];
+    let overflow = false;
+    const harness = buildSessionHarness({
+      bufferedAmount: () => (overflow ? 999_999_999 : 0),
+      onDestroyed: (session) => destroyed.push(session.callId)
+    });
+    const { session } = harness;
+    session.handleMessage({ t: 'start' });
+    session.handleBinary(Buffer.alloc(3200, 1));
+    session.handleMessage({ t: 'end' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'pcm'));
+
+    // 模拟 socket 缓冲超阈值，再发一帧触发背压保护
+    overflow = true;
+    const bytesAtOverflow = harness.binaryBytes();
+    session.handleMessage({ t: 'ping' }); // 确认会话仍活着
+    await waitFor(() => destroyed.includes('call-test-1'));
+
+    expect(session.destroyed).toBe(true);
+    expect(session.state).toBe('ended');
+    expect(harness.closeCalls.some((c) => c.code === 4005)).toBe(true);
+    // 背压后不再下发任何帧
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(harness.binaryBytes()).toBe(bytesAtOverflow);
+    expect(harness.texts().filter((m) => m.t === 'metrics').length).toBe(0);
+  });
+
+  it('P0-2：连续 abort 两次幂等，状态稳定回 listening', async () => {
+    const harness = buildSessionHarness({
+      core: new MockCoreBridge({ reply: '第一句话说完。第二句话也说完了。第三句继续。第四句未完。', intervalMs: 5, charsPerDelta: 3 })
+    });
+    const { session } = harness;
+    session.handleMessage({ t: 'start' });
+    session.handleBinary(Buffer.alloc(3200, 1));
+    session.handleMessage({ t: 'end' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'pcm'));
+
+    session.handleMessage({ t: 'abort' });
+    session.handleMessage({ t: 'abort' }); // 第二次应幂等
+    await waitFor(() => harness.texts().filter((m) => m.t === 'interrupted').length >= 1);
+    await waitFor(() => session.state === 'listening');
+    const interruptedCount = harness.texts().filter((m) => m.t === 'interrupted').length;
+    expect(interruptedCount).toBe(1);
+  });
+
+  it('P0-7：provider 输出 16k / 48k 时，pcm 头 rate 与二进制帧一致', async () => {
+    for (const rate of [16000, 24000, 48000]) {
+      const harness = buildSessionHarness({ tts: fixedRateTts(rate) });
+      harness.session.handleMessage({ t: 'start' });
+      harness.session.handleBinary(Buffer.alloc(3200, 1));
+      harness.session.handleMessage({ t: 'end' });
+      await waitFor(() => harness.texts().some((m) => m.t === 'pcm_end'));
+      const pcmHeaders = harness.texts().filter((m) => m.t === 'pcm');
+      expect(pcmHeaders.length).toBeGreaterThan(0);
+      for (const header of pcmHeaders) {
+        expect(header.rate).toBe(rate);
+      }
+    }
   });
 });

@@ -5,7 +5,7 @@
  * - WebSocket 消息/二进制帧 -> 状态机驱动
  * - ASR 建连 prebuffer（不丢句首）与 final/partial 采纳
  * - Barge-in：abort 真正取消 LLM / TTS / PCM 队列，保留已播出内容
- * - 协议帧组装与背压保护
+ * - 协议帧组装与背压保护（背压超限走幂等 finalize，禁止 zombie session，P0-6）
  */
 import { randomUUID } from 'node:crypto';
 import type {
@@ -16,6 +16,7 @@ import type {
   TtsProvider,
   VoiceProfile
 } from '@siren/contracts';
+import { WS_CLOSE_CODES } from '@siren/contracts';
 import type { CoreBridge } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import { LatencyTracker, errorFields, type Logger } from '@siren/telemetry';
@@ -52,7 +53,8 @@ export class CallSession {
   private readonly pipeline: ReplyPipeline;
   private turnIndex = 0;
   private turn: ActiveTurn | null = null;
-  private destroyed = false;
+  private closing = false;
+  private closed = false;
   private lastPartialText = '';
 
   constructor(private readonly deps: CallSessionDeps) {
@@ -87,8 +89,17 @@ export class CallSession {
     return this.deps.callId;
   }
 
+  /** 冻结绑定的会话上下文（来自 call token reservation，客户端不可改写） */
+  get conversationId(): string | null {
+    return this.deps.conversationId;
+  }
+
   get state(): CallState {
     return this.stateMachine.state;
+  }
+
+  get destroyed(): boolean {
+    return this.closed;
   }
 
   // -------------------------------------------------------------------------
@@ -96,7 +107,7 @@ export class CallSession {
   // -------------------------------------------------------------------------
 
   handleMessage(message: ClientWsMessage): void {
-    if (this.destroyed) return;
+    if (this.closed || this.closing) return;
     switch (message.t) {
       case 'ready':
         this.sendJson({ t: 'state', state: this.state });
@@ -117,21 +128,33 @@ export class CallSession {
   }
 
   handleBinary(pcm: Buffer): void {
-    if (this.destroyed || pcm.length === 0) return;
+    if (this.closed || this.closing || pcm.length === 0) return;
     const turn = this.turn;
     if (!turn || !this.stateMachine.is('listening')) return;
     turn.asr.feed(pcm);
   }
 
-  /** 连接关闭 / 服务停止：取消一切并落终态（规范第 47 节第 9/25/29 条） */
-  destroy(reason = 'closed'): void {
-    if (this.destroyed) return;
-    this.destroyed = true;
-    this.abortTurn('destroy');
-    this.stateMachine.forceEnded();
-    this.deps.sessionsRepo?.markEnded(this.deps.callId, Date.now(), 'ended');
-    this.log.info('call_ended', { reason });
-    this.deps.onDestroyed?.(this);
+  /**
+   * 连接关闭 / 服务停止 / 背压超限：统一走幂等 finalize（P0-6）。
+   * 在 cleanup 完成前不置 terminal flag，保证 abort / 落库 / token 吊销 /
+   * 注册表移除一定发生；重复调用直接返回。
+   */
+  destroy(reason = 'closed', closeInfo?: { code: number; reason: string }): void {
+    if (this.closed || this.closing) return;
+    this.closing = true;
+    try {
+      this.abortTurn(`destroy:${reason}`);
+      this.stateMachine.forceEnded();
+      this.deps.sessionsRepo?.markEnded(this.deps.callId, Date.now(), 'ended');
+      this.log.info('call_ended', { reason });
+      this.deps.onDestroyed?.(this);
+      if (closeInfo) {
+        this.deps.close(closeInfo.code, closeInfo.reason);
+      }
+    } finally {
+      this.closing = false;
+      this.closed = true;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -171,6 +194,7 @@ export class CallSession {
       fullText: '',
       playedText: '',
       pcmStarted: false,
+      pcmRate: null,
       written: false
     };
     // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）
@@ -215,14 +239,14 @@ export class CallSession {
       lastPartialText: this.lastPartialText
     });
     if (outcome.kind === 'error') {
-      if (turn.aborted || this.turn !== turn) return null; // 已被 abort 接管
+      if (turn.aborted || this.turn !== turn || this.closed) return null; // 已被 abort 接管
       this.sendJson({ t: 'error', code: 'asr_failed', message: 'speech recognition failed' });
       this.log.warn('turn_failed', { ...errorFields(outcome.error), stage: 'asr', turn_index: turn.index });
       this.writeTurn(turn, 'asr_failed');
       this.backToListening();
       return null;
     }
-    if (turn.aborted || this.turn !== turn) return null;
+    if (turn.aborted || this.turn !== turn || this.closed) return null;
     return outcome.text;
   }
 
@@ -237,7 +261,7 @@ export class CallSession {
 
     const result = await this.pipeline.run(turn);
 
-    if (result.status === 'aborted') {
+    if (result.status === 'aborted' || this.closed) {
       // 打断路径：interrupted / reply 已由 handleAbort 同步下发
       return;
     }
@@ -318,7 +342,7 @@ export class CallSession {
     }
   }
 
-  /** 取消 LLM / TTS / PCM：必须真正取消，不是静音（规范第 20 节） */
+  /** 取消 LLM / TTS / PCM：必须真正取消，不是静音（规范第 20 节）。幂等。 */
   private abortTurn(reason: string): void {
     const turn = this.turn;
     if (!turn) return;
@@ -330,16 +354,17 @@ export class CallSession {
     this.log.debug('turn_abort', { reason, turn_index: turn.index });
   }
 
+  /**
+   * 回到 listening。正常说完一句是 speaking -> listening 直达；
+   * `interrupting` 只用于真实打断（P0-2 状态机修正），不再伪造中转。
+   */
   private backToListening(): void {
     this.turn = null;
     this.lastPartialText = '';
-    if (this.stateMachine.is('speaking')) {
-      this.stateMachine.transition('interrupting');
-    }
     if (!this.stateMachine.is('listening')) {
       this.stateMachine.transition('listening');
     }
-    if (!this.destroyed) {
+    if (!this.closed) {
       this.sendJson({ t: 'state', state: 'listening' });
     }
   }
@@ -356,18 +381,22 @@ export class CallSession {
   }
 
   private sendRaw(frame: Buffer): void {
-    if (this.destroyed) return;
+    if (this.closed || this.closing) return;
     if (this.deps.bufferedAmount() > this.deps.config.ws.maxBufferedBytes) {
       this.log.error('ws_backpressure_overflow', { buffered: this.deps.bufferedAmount() });
-      this.deps.close(4005, 'backpressure overflow');
-      this.destroyed = true;
+      // P0-6：背压超限也必须完整 teardown（abort / 落库 / 吊销 token / 移除注册），
+      // 而不是只关 socket 留下 zombie session
+      this.destroy('backpressure_overflow', {
+        code: WS_CLOSE_CODES.BACKPRESSURE_OVERFLOW,
+        reason: 'backpressure overflow'
+      });
       return;
     }
     this.deps.send('binary', frame);
   }
 
   private sendJson(message: ServerWsMessage): void {
-    if (this.destroyed) return;
+    if (this.closed) return;
     this.deps.send(JSON.stringify(message));
   }
 

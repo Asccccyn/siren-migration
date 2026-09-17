@@ -42,7 +42,6 @@ describe('实时通话 WebSocket e2e', () => {
       socket.send(Buffer.alloc(3200, 1)); // 100ms PCM16
       socket.send(Buffer.alloc(3200, 1));
       socket.send(JSON.stringify({ t: 'end' }));
-
       await waitFor(() => frames.texts.some((m) => m.t === 'pcm_end'), 10000);
       await waitFor(() =>
         frames.texts.some((m) => m.t === 'state' && m.state === 'listening' && frames.texts.some((x) => x.t === 'pcm_end'))
@@ -69,7 +68,7 @@ describe('实时通话 WebSocket e2e', () => {
     await siren.app.listen({ host: '127.0.0.1', port: 0 });
     const address = siren.app.server!.address() as { port: number };
     try {
-      const createRes = await siren.app.inject({ method: 'POST', url: '/v1/calls', payload: {} });
+      const createRes = await siren.app.inject({ method: 'POST', url: '/v1/calls', payload: { conversation_id: 'conv-token' } });
       const { call_id: callId, token } = createRes.json() as { call_id: string; token: string };
       await new Promise((resolve) => setTimeout(resolve, 20)); // 让 ttl=0 过期
 
@@ -96,7 +95,7 @@ describe('实时通话 WebSocket e2e', () => {
     await siren.app.listen({ host: '127.0.0.1', port: 0 });
     const address = siren.app.server!.address() as { port: number };
     try {
-      const createRes = await siren.app.inject({ method: 'POST', url: '/v1/calls', payload: {} });
+      const createRes = await siren.app.inject({ method: 'POST', url: '/v1/calls', payload: { conversation_id: 'conv-token' } });
       const { call_id: callId, token } = createRes.json() as { call_id: string; token: string };
       const socket = new WebSocket(`ws://127.0.0.1:${address.port}/ws/call/${callId}?token=${token}`);
       const frames = collect(socket);
@@ -117,6 +116,62 @@ describe('实时通话 WebSocket e2e', () => {
       );
       socket.close(1000);
       await waitFor(() => siren.callCenter.activeCount === 0);
+    } finally {
+      await siren.dispose();
+    }
+  });
+
+  it('P0-5：token 冻结上下文，握手 query 无法改写 conversation / profile', async () => {
+    const siren = await buildTestApp();
+    await siren.app.listen({ host: '127.0.0.1', port: 0 });
+    const address = siren.app.server!.address() as { port: number };
+    try {
+      const createRes = await siren.app.inject({
+        method: 'POST',
+        url: '/v1/calls',
+        payload: { conversation_id: 'conv-frozen', voice_profile: 'main' }
+      });
+      const created = createRes.json() as { call_id: string; token: string; conversation_id: string; voice_profile: string };
+      expect(created.conversation_id).toBe('conv-frozen');
+      expect(createRes.statusCode).toBe(201);
+
+      // 客户端尝试用 query 改写 conversation / profile —— 必须被忽略
+      const url = `ws://127.0.0.1:${address.port}/ws/call/${created.call_id}` +
+        `?token=${created.token}&conversation_id=conv-hijack&voice_profile=other`;
+      const socket = new WebSocket(url);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', resolve);
+        socket.once('error', reject);
+      });
+      const session = siren.callCenter.getSession(created.call_id);
+      expect(session?.conversationId).toBe('conv-frozen');
+
+      // 同一 callId 第二次连接按设计拒绝（4002）
+      const second = new Promise<{ code: number }>((resolve) => {
+        const dup = new WebSocket(`ws://127.0.0.1:${address.port}/ws/call/${created.call_id}?token=${created.token}`);
+        dup.on('close', (code) => resolve({ code }));
+      });
+      expect((await second).code).toBe(4002);
+
+      socket.close(1000);
+      // 挂断后 token 吊销，重放被拒（4001）
+      await waitFor(() => siren.callCenter.activeCount === 0);
+      const replay = new Promise<{ code: number }>((resolve) => {
+        const dup = new WebSocket(`ws://127.0.0.1:${address.port}/ws/call/${created.call_id}?token=${created.token}`);
+        dup.on('close', (code) => resolve({ code }));
+      });
+      expect((await replay).code).toBe(4001);
+    } finally {
+      await siren.dispose();
+    }
+  });
+
+  it('P0-4.5：缺少 conversation_id 的建呼被拒绝（400）', async () => {
+    const siren = await buildTestApp();
+    try {
+      const res = await siren.app.inject({ method: 'POST', url: '/v1/calls', payload: {} });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toBe('invalid_body');
     } finally {
       await siren.dispose();
     }

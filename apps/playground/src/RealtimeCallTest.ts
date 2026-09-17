@@ -48,6 +48,18 @@ function sendJson(message: unknown): void {
   }
 }
 
+/** conversation_id 唯一来源：输入框；为空时生成一次并回填，同一网页会话内保持同一 conversation */
+function ensureConversationId(): string {
+  const existing = (ui.conversationId.value || '').trim();
+  if (existing) return existing;
+  const generated =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `conv-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  ui.conversationId.value = generated;
+  return generated;
+}
+
 function startUtterance(): void {
   sendingActive = true;
   sendJson({ t: 'start' });
@@ -94,7 +106,8 @@ ui.callBtn.addEventListener('click', async () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
-        conversation_id: (ui.conversationId.value || '').trim() || undefined
+        // 电话必须绑定网页当前 conversation（P0-4.5）；未填则本地生成并回填输入框
+        conversation_id: ensureConversationId()
       })
     });
     if (!response.ok) throw new Error(`创建通话失败 HTTP ${response.status}`);

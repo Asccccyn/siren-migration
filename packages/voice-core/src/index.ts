@@ -6,6 +6,7 @@ export { VoiceProfileRegistry, validateProfile } from './voice-profile.ts';
 export { buildProviders, buildMemoryProviders } from './provider-registry.ts';
 export type { ProviderBundle } from './provider-registry.ts';
 export { CallTokenStore } from './call-token.ts';
+export type { CallTokenPayload, VerifiedCallToken, VerifyTokenResult } from './call-token.ts';
 export { SentenceSplitter, streamSentences } from './sentence-splitter.ts';
 export { FillerManager } from './filler-manager.ts';
 export { AsyncQueue, EagerIterable } from './async-queue.ts';

@@ -9,6 +9,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { MockAsrProvider } from '@siren/provider-mock';
 import { MockTtsProvider } from '@siren/provider-mock';
 import { MockCoreBridge } from '@siren/core-bridge';
+import type { TtsProvider } from '@siren/contracts';
 import {
   CallSessionsRepository,
   CallTurnsRepository,
@@ -145,6 +146,7 @@ export async function waitFor(
 export interface SessionHarness {
   session: CallSession;
   frames: (string | Buffer)[];
+  closeCalls: { code: number; reason: string }[];
   texts: () => Record<string, unknown>[];
   binaries: () => Buffer[];
   binaryBytes: () => number;
@@ -152,13 +154,16 @@ export interface SessionHarness {
 
 export function buildSessionHarness(deps: {
   asr?: MockAsrProvider;
-  tts?: MockTtsProvider;
+  tts?: TtsProvider;
   core?: MockCoreBridge;
   config?: SirenConfig;
   turnsRepo?: CallTurnsRepository;
   sessionsRepo?: CallSessionsRepository;
+  bufferedAmount?: () => number;
+  onDestroyed?: (session: CallSession) => void;
 }): SessionHarness {
   const frames: (string | Buffer)[] = [];
+  const closeCalls: { code: number; reason: string }[] = [];
   const asr = deps.asr ?? new MockAsrProvider({ partials: ['你', '你好'], final: '你好。', finalDelayMs: 5 });
   const tts = deps.tts ?? new MockTtsProvider();
   const core =
@@ -181,12 +186,14 @@ export function buildSessionHarness(deps: {
     send: (data, binary) => {
       frames.push(binary ?? data);
     },
-    bufferedAmount: () => 0,
-    close: () => undefined
+    bufferedAmount: deps.bufferedAmount ?? (() => 0),
+    close: (code, reason) => closeCalls.push({ code, reason }),
+    onDestroyed: deps.onDestroyed
   });
   return {
     session,
     frames,
+    closeCalls,
     texts: () =>
       frames
         .filter((f): f is string => typeof f === 'string')

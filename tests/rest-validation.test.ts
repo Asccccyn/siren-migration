@@ -60,7 +60,7 @@ describe('REST 校验与鉴权', () => {
       const denied = await siren.app.inject({
         method: 'POST',
         url: '/v1/calls',
-        payload: {},
+        payload: { conversation_id: 'conv-auth' },
         headers: {}
       });
       expect(denied.statusCode).toBe(401);
@@ -71,7 +71,7 @@ describe('REST 校验与鉴权', () => {
       const allowed = await siren.app.inject({
         method: 'POST',
         url: '/v1/calls',
-        payload: {},
+        payload: { conversation_id: 'conv-auth' },
         headers: { authorization: 'Bearer secret-1' }
       });
       expect(allowed.statusCode).toBe(201);
