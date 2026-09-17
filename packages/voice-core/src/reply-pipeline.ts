@@ -42,6 +42,10 @@ export function newOutputStreamId(): string {
   return `out_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
 }
 
+function signalAborted(turn: ActiveTurn): boolean {
+  return turn.ttsAbort.signal.aborted;
+}
+
 /** 一轮通话的运行时状态（CallSession 创建，流水线读写音频相关字段） */
 export interface ActiveTurn {
   index: number;
@@ -55,6 +59,8 @@ export interface ActiveTurn {
   startedAt: number;
   /** 用户显式 abort */
   aborted: boolean;
+  /** TTS 生成取消信号：barge-in 时立即终止 provider 上游（P0-2/P0-9） */
+  ttsAbort: AbortController;
   /** LLM 已输出的完整文本 */
   fullText: string;
   /** 已真正完成下发音频的句子 */
@@ -181,14 +187,16 @@ export class ReplyPipeline {
       language: this.deps.profile.language
     };
     try {
-      for await (const chunk of this.deps.tts.synthesizeStream(request)) {
+      for await (const chunk of this.deps.tts.synthesizeStream(request, turn.ttsAbort.signal)) {
         if (turn.aborted) throw new TurnAbortedError();
         turn.metrics.mark('tts_first_chunk');
         yield { audio: chunk.audio, sampleRate: chunk.sampleRate };
       }
       return;
     } catch (error) {
-      if (error instanceof TurnAbortedError || turn.aborted) throw error;
+      // provider 被 abort 时上游抛错：翻译成本轮取消信号
+      if (turn.aborted || signalAborted(turn)) throw new TurnAbortedError();
+      if (error instanceof TurnAbortedError) throw error;
       if (!(error instanceof ProviderError)) throw error;
     }
     // 降级：Batch TTS（按 provider 返回的真实采样率）

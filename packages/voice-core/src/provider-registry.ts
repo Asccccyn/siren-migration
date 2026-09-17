@@ -14,7 +14,7 @@ import type { CoreBridge } from '@siren/core-bridge';
 import { ElevenLabsTtsProvider } from '@siren/provider-elevenlabs';
 import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import { VolcBatchAsrProvider, VolcStreamAsrProvider } from '@siren/provider-volc-asr';
-import { VolcBatchTtsProvider, VolcStreamTtsProvider } from '@siren/provider-volc-tts';
+import { VolcBatchTtsProvider, VolcBidirectionalTtsProvider } from '@siren/provider-volc-tts';
 import type { ObjectStore } from '@siren/storage';
 import { LocalObjectStore, MemoryObjectStore, R2ObjectStore } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
@@ -55,7 +55,11 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
   }
 
   // --- TTS ---
-  const buildTts = (configured: string): { tts: TtsProvider; name: string } => {
+  // forRealtime=true 返回完整 TtsProvider（真流式）；false 返回纯 BatchTtsProvider
+  const buildTts = (
+    configured: string,
+    forRealtime: boolean
+  ): { tts: TtsProvider | BatchTtsProvider; name: string } => {
     if (configured === 'mock') {
       assertMockAllowed(isProd, 'TTS provider');
       return { tts: new MockTtsProvider(), name: 'mock' };
@@ -89,20 +93,34 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
         endpointUrl: config.volc.ttsUrl,
         timeoutMs: config.volc.httpTimeoutMs
       });
-      // 火山流式 = 句子级批量 + 预取流水线（见 docs/PROVIDERS.md）
-      const streaming = new VolcStreamTtsProvider(batch, logger);
-      const pipelined: TtsProvider = {
-        synthesize: (request) => batch.synthesize(request),
-        synthesizeStream: (request) => streaming.synthesizeStream(request)
-      };
-      return { tts: pipelined, name: 'volc' };
+      if (forRealtime) {
+        // 实时链路：火山 v3 双向流式 WebSocket（真 provider-level streaming，P0-9）
+        const bidirectional = new VolcBidirectionalTtsProvider(
+          {
+            appId: config.volc.appId,
+            accessToken: config.volc.accessToken,
+            resourceId: config.volc.ttsResourceId,
+            wsUrl: config.volc.ttsWsUrl,
+            connectTimeoutMs: config.volc.httpTimeoutMs,
+            sessionTimeoutMs: 20000
+          },
+          logger
+        );
+        const realtime: TtsProvider = {
+          synthesize: (request) => batch.synthesize(request),
+          synthesizeStream: (request, signal) => bidirectional.synthesizeStream(request, signal)
+        };
+        return { tts: realtime, name: 'volc' };
+      }
+      // 异步链路：纯批量（BatchTtsProvider，异步语音只用 synthesize）
+      return { tts: batch, name: 'volc' };
     }
     throw new Error(`不支持的 TTS provider: ${configured}`);
   };
 
-  const asyncTtsBundle = buildTts(config.providers.asyncTts);
-  const realtimeTtsBundle = buildTts(config.providers.realtimeTts);
-  const realtimeTts: TtsProvider = realtimeTtsBundle.tts;
+  const asyncTtsBundle = buildTts(config.providers.asyncTts, false);
+  const realtimeTtsBundle = buildTts(config.providers.realtimeTts, true);
+  const realtimeTts: TtsProvider = realtimeTtsBundle.tts as TtsProvider;
 
   // --- Core Bridge ---
   let core: CoreBridge;
@@ -183,7 +201,7 @@ function compositeVolcAsr(config: SirenConfig): AsrProvider {
   const stream = new VolcStreamAsrProvider({
     appId: config.volc.appId,
     accessToken: config.volc.accessToken,
-    cluster: config.volc.asrCluster,
+    resourceId: config.volc.asrCluster,
     wsUrl: config.volc.asrWsUrl,
     sampleRate: 16000,
     connectTimeoutMs: 5000

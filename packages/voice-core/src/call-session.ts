@@ -223,6 +223,7 @@ export class CallSession {
       metrics: new LatencyTracker(),
       startedAt: Date.now(),
       aborted: false,
+      ttsAbort: new AbortController(),
       fullText: '',
       playedText: '',
       pcmStarted: false,
@@ -382,6 +383,8 @@ export class CallSession {
     if (!turn) return;
     turn.aborted = true;
     turn.asr.abort();
+    // 立即终止 TTS provider 上游流（P0-2/P0-9：不是只停止消费）
+    if (!turn.ttsAbort.signal.aborted) turn.ttsAbort.abort();
     // 先截取已播出文本，保证随后落库/下发的都是真正播出的内容（规范第 20 节第 6 条）
     turn.fullText = turn.playedText;
     void this.deps.core.cancel(turn.turnId).catch(() => undefined);

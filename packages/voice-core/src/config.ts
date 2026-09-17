@@ -39,6 +39,9 @@ export interface SirenConfig {
     asrBatchUrl: string;
     ttsCluster: string;
     ttsUrl: string;
+    /** 双向流式 TTS（v3 bidirection） */
+    ttsWsUrl: string;
+    ttsResourceId: string;
     voiceId: string;
     httpTimeoutMs: number;
   };
@@ -161,10 +164,14 @@ function resolveProviderSections(env: EnvSource) {
       accessToken: env.VOLC_ACCESS_TOKEN ?? '',
       asrCluster: env.VOLC_ASR_RESOURCE_ID ?? 'volc.bigasr.sauc.duration',
       asrBatchResourceId: env.VOLC_ASR_BATCH_RESOURCE_ID ?? 'volc.bigasr.auc.duration',
-      asrWsUrl: env.VOLC_ASR_WS_URL ?? 'wss://openspeech.bytedance.com/api/v2/asr',
+      // 大模型流式 ASR v3（P0-8）：bigmodel=双向流式（实时出字）；可用 bigmodel_async / bigmodel_nostream 覆盖
+      asrWsUrl: env.VOLC_ASR_WS_URL ?? 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel',
       asrBatchUrl: env.VOLC_ASR_BATCH_URL ?? 'https://openspeech.bytedance.com/api/v1/auc',
       ttsCluster: env.VOLC_TTS_CLUSTER ?? 'volcano_icl',
       ttsUrl: env.VOLC_TTS_URL ?? 'https://openspeech.bytedance.com/api/v1/tts',
+      // 双向流式 TTS v3（P0-9）
+      ttsWsUrl: env.VOLC_TTS_WS_URL ?? 'wss://openspeech.bytedance.com/api/v3/tts/bidirection',
+      ttsResourceId: env.VOLC_TTS_RESOURCE_ID ?? 'volc.service_type.10029',
       voiceId: env.VOLC_VOICE_ID ?? '',
       httpTimeoutMs: num(env, 'VOLC_HTTP_TIMEOUT_MS', 15000)
     },

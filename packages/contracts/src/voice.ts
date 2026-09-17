@@ -87,8 +87,12 @@ export interface BatchTtsProvider {
 }
 
 export interface StreamTtsProvider {
-  /** 一句文字 -> PCM chunk 流 */
-  synthesizeStream(request: TtsRequest): AsyncIterable<PcmChunk>;
+  /**
+   * 一句文字 -> PCM chunk 流。
+   * signal：实时通话 barge-in 时立即取消——真 streaming provider 必须真正终止
+   * 上游 HTTP/WebSocket，而不是只停止消费（P0-2/P0-9）。
+   */
+  synthesizeStream(request: TtsRequest, signal?: AbortSignal): AsyncIterable<PcmChunk>;
 }
 
 export interface TtsProvider extends BatchTtsProvider, StreamTtsProvider {}

@@ -1,12 +1,38 @@
 /**
- * 火山引擎流式 ASR（wss，v2 协议）。
- * 每次讲话创建新会话（规范第 22 节），句首由调用方 prebuffer 保证不丢。
+ * 火山引擎大模型流式 ASR v3（sauc/bigmodel，2026-09 按官方文档重写）。
+ *
+ * 与 v2 的差异：
+ * - 鉴权改 HTTP header（X-Api-App-Key / X-Api-Access-Key / X-Api-Resource-Id / X-Api-Connect-Id），
+ *   不再把 token 放进 URL query
+ * - 二进制帧 4B header + gzip payload；末帧 = audio only + last packet flag
+ * - 服务端 full response 带 sequence（负值=末包）；error 帧带 code + message
+ *
+ * 每次 talk 创建新 session（Siren 的 PrebufferedAsrSession 负责句首保护）。
+ * 音频按 100ms 聚批上行（官方建议 100-200ms/包）。
  */
 import { randomUUID } from 'node:crypto';
-import { ProviderError, type AsrStream, type AsrStreamHandlers, type StreamAsrOptions, type StreamAsrProvider, type TranscriptResult } from '@siren/contracts';
+import {
+  ProviderError,
+  type AsrStream,
+  type AsrStreamHandlers,
+  type StreamAsrOptions,
+  type StreamAsrProvider,
+  type TranscriptResult
+} from '@siren/contracts';
 import type { Logger } from '@siren/telemetry';
 import WebSocket from 'ws';
-import { decodeFrame, encodeFrame, buildFullRequestHeader, VOLC_ASR_SUCCESS_CODE, type VolcAsrStreamConfig } from './protocol.ts';
+import {
+  buildFullRequest,
+  decodeServerFrame,
+  encodeAudioFrame,
+  encodeLastAudioFrame,
+  type VolcAsrStreamConfig
+} from './protocol.ts';
+
+/** 100ms @16k PCM16 = 3200 字节 */
+const FEED_BATCH_BYTES = 3200;
+/** end() 后等待 final 的兜底超时 */
+const FINAL_TIMEOUT_MS = 5000;
 
 interface PendingFinal {
   resolve: (result: TranscriptResult) => void;
@@ -22,29 +48,40 @@ export class VolcStreamAsrProvider implements StreamAsrProvider {
 
   async createStream(options: StreamAsrOptions, handlers: AsrStreamHandlers): Promise<AsrStream> {
     const requestId = randomUUID();
-    const headerJson = buildFullRequestHeader(this.config, requestId);
-    const socket = await this.connect(requestId);
-    const session = new VolcAsrSession(socket, headerJson, requestId, handlers, this.logger);
+    const connectId = randomUUID();
+    const socket = await this.connect(connectId);
+    const session = new VolcAsrSession(socket, this.config, requestId, options, handlers, this.logger);
     socket.on('message', (data) => {
       try {
-        session.handleServerFrame(decodeFrame(Buffer.from(data as Buffer)));
+        session.handleServerFrame(decodeServerFrame(Buffer.from(data as Buffer)));
       } catch (error) {
         session.handleError(error);
       }
     });
     socket.once('error', (error) => session.handleError(error));
     socket.once('close', () => session.handleClose());
+    // 首帧 full client request（options 的 language / profile uid 进入请求；
+    // language 仅多语种端点携带，由协议层判断）
+    socket.send(
+      buildFullRequest(this.config, requestId, {
+        language: options.language,
+        uid: options.profile ? `siren:${options.profile.id}` : 'siren'
+      })
+    );
     return session;
   }
 
-  private async connect(requestId: string): Promise<WebSocket> {
-    const url = new URL(this.config.wsUrl);
-    url.searchParams.set('appid', this.config.appId);
-    url.searchParams.set('cluster', this.config.cluster);
-    url.searchParams.set('token', this.config.accessToken);
-    url.searchParams.set('reqid', requestId);
+  private async connect(connectId: string): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
-      const socket = new WebSocket(url, { handshakeTimeout: this.config.connectTimeoutMs });
+      const socket = new WebSocket(this.config.wsUrl, {
+        handshakeTimeout: this.config.connectTimeoutMs,
+        headers: {
+          'X-Api-App-Key': this.config.appId,
+          'X-Api-Access-Key': this.config.accessToken,
+          'X-Api-Resource-Id': this.config.resourceId,
+          'X-Api-Connect-Id': connectId
+        }
+      });
       socket.once('open', () => resolve(socket));
       socket.once('error', (error) =>
         reject(new ProviderError('provider_unavailable', 'volc-asr', 'asr websocket connect failed', error))
@@ -54,26 +91,30 @@ export class VolcStreamAsrProvider implements StreamAsrProvider {
 }
 
 class VolcAsrSession implements AsrStream {
-  private sequence = 1;
   private ended = false;
   private aborted = false;
   private pendingFinal: PendingFinal | null = null;
   private lastPartialText = '';
   private lastFinalText = '';
-  private closeHandled = false;
+  private feedBatch: Buffer[] = [];
+  private feedBatchBytes = 0;
 
   constructor(
     private readonly socket: WebSocket,
-    private readonly headerJson: Buffer,
+    private readonly config: VolcAsrStreamConfig,
     private readonly requestId: string,
+    private readonly options: StreamAsrOptions,
     private readonly handlers: AsrStreamHandlers,
     private readonly logger?: Logger
   ) {}
 
   feed(pcm: Buffer): void {
     if (this.ended || this.aborted || pcm.length === 0) return;
-    this.sequence++;
-    this.socket.send(encodeFrame(this.headerJson, pcm, this.sequence), { binary: true });
+    this.feedBatch.push(pcm);
+    this.feedBatchBytes += pcm.length;
+    if (this.feedBatchBytes >= FEED_BATCH_BYTES) {
+      this.flushFeed();
+    }
   }
 
   end(): Promise<TranscriptResult> {
@@ -81,16 +122,20 @@ class VolcAsrSession implements AsrStream {
       return Promise.resolve(this.buildResult());
     }
     this.ended = true;
-    this.sequence++;
-    // 末帧：负 sequence 表示最后一包
-    this.socket.send(encodeFrame(this.headerJson, Buffer.alloc(0), -this.sequence), { binary: true });
+    this.flushFeed();
+    // 末包：audio only + last packet flag
+    try {
+      this.socket.send(encodeLastAudioFrame());
+    } catch (error) {
+      return Promise.reject(new ProviderError('asr_failed', 'volc-asr', 'asr last frame send failed', error));
+    }
     return new Promise<TranscriptResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         // 超时降级：采用最新稳定结果（规范第 23 节策略的兜底）
         this.pendingFinal = null;
         this.cleanup();
         resolve(this.buildResult());
-      }, 5000);
+      }, FINAL_TIMEOUT_MS);
       this.pendingFinal = { resolve, reject, timer };
     });
   }
@@ -106,41 +151,64 @@ class VolcAsrSession implements AsrStream {
     this.cleanup();
   }
 
-  handleServerFrame(response: { code: number; message?: string; sequence?: number; result?: { text?: string; utterances?: { text?: string; definite?: boolean }[] } }): void {
-    if (response.code !== VOLC_ASR_SUCCESS_CODE) {
+  handleServerFrame(
+    frame:
+      | { kind: 'result'; sequence: number; payload: { result?: { text?: string; utterances?: { text?: string; definite?: boolean }[] } }; isLast: boolean }
+      | { kind: 'error'; code: number; message: string }
+  ): void {
+    if (this.aborted) return;
+    if (frame.kind === 'error') {
       const error = new ProviderError(
         'asr_failed',
         'volc-asr',
-        `asr error code=${response.code} ${response.message ?? ''}`
+        `asr error code=${frame.code} ${frame.message}`
       );
       this.handlers.onError?.(error);
       this.failPending(error);
       this.cleanup();
       return;
     }
-    const utterances = response.result?.utterances ?? [];
-    const finalUtterance = utterances.find((u) => u.definite);
-    if (finalUtterance?.text) {
-      this.lastFinalText += finalUtterance.text;
-    } else if (response.result?.text) {
-      this.lastPartialText = response.result.text;
-      this.handlers.onPartial?.(this.lastPartialText);
+    const utterances = frame.payload.result?.utterances ?? [];
+    // partial 可重复更新（覆盖式）；final（definite=true）只提交一次且不重复拼接
+    for (const utterance of utterances) {
+      if (utterance.definite && utterance.text) {
+        if (!this.lastFinalText.endsWith(utterance.text)) {
+          this.lastFinalText += utterance.text;
+        }
+      }
     }
-    if (this.ended && ((response.sequence ?? 0) < 0 || finalUtterance !== undefined)) {
+    const interim = frame.payload.result?.text ?? '';
+    if (interim && !this.lastFinalText.endsWith(interim)) {
+      this.lastPartialText = interim;
+      this.handlers.onPartial?.(interim);
+    }
+    if (this.ended && frame.isLast) {
       this.settlePending();
     }
   }
 
   handleError(error: unknown): void {
+    if (this.aborted) return;
     this.handlers.onError?.(error);
     this.failPending(new ProviderError('asr_failed', 'volc-asr', 'asr websocket error', error));
     this.cleanup();
   }
 
   handleClose(): void {
-    if (this.closeHandled) return;
-    this.closeHandled = true;
+    if (this.aborted) return;
     this.settlePending();
+  }
+
+  private flushFeed(): void {
+    if (this.feedBatchBytes === 0) return;
+    const merged = Buffer.concat(this.feedBatch);
+    this.feedBatch = [];
+    this.feedBatchBytes = 0;
+    try {
+      this.socket.send(encodeAudioFrame(merged), { binary: true });
+    } catch (error) {
+      this.handleError(error);
+    }
   }
 
   private settlePending(): void {
@@ -162,12 +230,15 @@ class VolcAsrSession implements AsrStream {
 
   private buildResult(): TranscriptResult {
     const text = (this.lastFinalText || this.lastPartialText).trim();
-    return { text, language: 'zh-CN', durationMs: 0 };
+    return { text, language: this.options.language ?? 'zh-CN', durationMs: 0 };
   }
 
   private cleanup(): void {
     try {
-      if (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING) {
+      if (
+        this.socket.readyState === WebSocket.OPEN ||
+        this.socket.readyState === WebSocket.CONNECTING
+      ) {
         this.socket.close(1000, 'siren-done');
       }
     } catch {

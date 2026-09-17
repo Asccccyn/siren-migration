@@ -56,7 +56,7 @@ export class MockTtsProvider implements BatchTtsProvider, StreamTtsProvider {
     return { audio: buildWav(pcm, sampleRate), format: 'wav', sampleRate, durationMs: pcmDurationMs(pcm.length, sampleRate) };
   }
 
-  async *synthesizeStream(request: TtsRequest): AsyncGenerator<PcmChunk> {
+  async *synthesizeStream(request: TtsRequest, signal?: AbortSignal): AsyncGenerator<PcmChunk> {
     this.calls.streamCount++;
     const sampleRate = request.sampleRate ?? REALTIME_OUTPUT_SAMPLE_RATE;
     const text = request.ttsScript ?? request.text;
@@ -65,6 +65,10 @@ export class MockTtsProvider implements BatchTtsProvider, StreamTtsProvider {
     const frames = chunkPcm16(pcm, samplesForDuration(sampleRate, 20));
     let sent = 0;
     for (const frame of frames) {
+      if (signal?.aborted) {
+        // 模拟真 streaming provider 的取消：立即停止产出
+        throw new ProviderError('tts_failed', 'mock-tts', 'mock stream tts aborted');
+      }
       if (this.faults.failStream && sent >= (this.faults.failStreamAfterChunks ?? 0)) {
         throw new ProviderError('tts_failed', 'mock-tts', 'mock stream tts failure');
       }
