@@ -119,10 +119,11 @@ export class ReplyPipeline {
             await sentenceQueue.waitForDrain(1);
           }
           if (turn.aborted) break;
-          sentenceQueue.push({
-            sentence,
-            eager: new EagerIterable(() => this.synthSentenceToPcm(turn, sentence, style))
-          });
+          const eager = new EagerIterable(() => this.synthSentenceToPcm(turn, sentence, style));
+          // 真实预取（审计修复）：句子进入队列即开始 TTS，
+          // 上一句播放期间下一句已在合成，而不是等消费者迭代才启动
+          eager.start();
+          sentenceQueue.push({ sentence, eager });
         }
       } catch (error) {
         if (!turn.aborted) sentenceQueue.fail(error);

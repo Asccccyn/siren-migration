@@ -56,8 +56,10 @@ export class CallSession {
   private closing = false;
   private closed = false;
   private lastPartialText = '';
+  /** 客户端 ready 时上报的 playback_drain 能力（协议 v2） */
+  private clientDrainCapable = false;
   /** 等待客户端 playback_drained ACK 的输出流（P0-4） */
-  private pendingDrain: { streamId: string; timer: NodeJS.Timeout; sentAt: number } | null = null;
+  private pendingDrain: { streamId: string; timer: NodeJS.Timeout; sentAt: number; settle: (drained: boolean) => void } | null = null;
 
   constructor(private readonly deps: CallSessionDeps) {
     this.log = deps.logger.child({ call_id: deps.callId, conversation_id: deps.conversationId });
@@ -169,6 +171,9 @@ export class CallSession {
 
   /** P1-7：ready 能力协商。只回版本与音频约定，不做复杂 negotiation */
   private handleReady(clientProtocol: number | undefined, capabilities: unknown): void {
+    // 记录 playback_drain 能力：决定 pcm_end 后是否等待真正播完再回 listening
+    const caps = (capabilities ?? {}) as { playback_drain?: boolean };
+    this.clientDrainCapable = caps.playback_drain === true;
     // 采样率契约来自 Realtime Provider 边界（P0-7/P1-1），不再假设固定值
     const audio: WsAudioContract = {
       input_rate: this.deps.voice.inputSampleRate,
@@ -315,7 +320,6 @@ export class CallSession {
     }
     if (turn.pcmStarted) {
       this.sendJson({ t: 'pcm_end', stream_id: turn.outputStreamId });
-      this.armPendingDrain(turn.outputStreamId);
     }
     this.writeTurn(turn, 'completed');
     turn.metrics.markEnd();
@@ -326,6 +330,17 @@ export class CallSession {
       user_len: turn.userText.length,
       assistant_len: turn.fullText.length
     });
+    // 审计修复：pcm_end 只代表服务端发完，客户端 jitter buffer 里可能还有
+    // 300-500ms 尾音。支持 playback_drain 的客户端（协议 v2）必须等真正
+    // 播完（或超时兜底）才回 listening——尾音期间 state 保持 speaking，
+    // 本地 barge-in 判定（isAiActive）依然成立，抢话不再有窗口。
+    if (turn.pcmStarted && this.clientDrainCapable && this.deps.config.playbackDrainTimeoutMs > 0) {
+      const drained = await this.armPendingDrain(turn.outputStreamId);
+      if (this.closed || this.turn !== turn || turn.aborted) return; // drain 期间被打断/销毁：interrupted 流程已接管
+      if (!drained) {
+        this.log.debug('playback_drain_fallback_listening', { stream_id: turn.outputStreamId });
+      }
+    }
     this.backToListening();
   }
 
@@ -407,41 +422,48 @@ export class CallSession {
 
   /**
    * P0-4：pcm_end 只代表服务端发完，不等于用户听完。
-   * 等待客户端 playback_drained ACK，超时只告警清理，绝不悬挂 session。
+   * 等待客户端 playback_drained ACK，返回是否在超时内收到；
+   * 被 interrupted / destroy / 新流覆盖时立即以 false 结束等待。
+   * 超时只告警清理，绝不悬挂 session。
    */
-  private armPendingDrain(streamId: string): void {
+  private armPendingDrain(streamId: string): Promise<boolean> {
     this.clearPendingDrain('rearm');
     const timeoutMs = this.deps.config.playbackDrainTimeoutMs;
-    if (timeoutMs <= 0) return; // 显式关闭（0 = 不等待 ACK）
-    const timer = setTimeout(() => {
-      if (this.pendingDrain?.streamId === streamId) {
+    if (timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const settle = (drained: boolean): void => {
+        if (!this.pendingDrain || this.pendingDrain.streamId !== streamId) return;
+        clearTimeout(this.pendingDrain.timer);
+        this.pendingDrain = null;
+        resolve(drained);
+      };
+      const timer = setTimeout(() => {
         this.log.warn('playback_drain_timeout', {
           stream_id: streamId,
           waited_ms: timeoutMs
         });
-        this.pendingDrain = null;
-      }
-    }, timeoutMs);
-    timer.unref?.();
-    this.pendingDrain = { streamId, timer, sentAt: Date.now() };
-  }
-
-  private handlePlaybackDrained(streamId: string): void {
-    if (!this.pendingDrain || this.pendingDrain.streamId !== streamId) return;
-    const drained = this.pendingDrain;
-    clearTimeout(drained.timer);
-    this.pendingDrain = null;
-    this.log.info('playback_drained', {
-      stream_id: streamId,
-      playback_ms: Date.now() - drained.sentAt
+        settle(false);
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingDrain = { streamId, timer, sentAt: Date.now(), settle };
     });
   }
 
+  private handlePlaybackDrained(streamId: string): void {
+    const pending = this.pendingDrain;
+    if (!pending || pending.streamId !== streamId) return;
+    this.log.info('playback_drained', {
+      stream_id: streamId,
+      playback_ms: Date.now() - pending.sentAt
+    });
+    pending.settle(true);
+  }
+
   private clearPendingDrain(reason: string): void {
-    if (!this.pendingDrain) return;
-    clearTimeout(this.pendingDrain.timer);
-    this.pendingDrain = null;
-    this.log.debug('playback_drain_cleared', { reason });
+    const pending = this.pendingDrain;
+    if (!pending) return;
+    this.log.debug('playback_drain_cleared', { reason, stream_id: pending.streamId });
+    pending.settle(false);
   }
 
   private enterSpeaking(): void {

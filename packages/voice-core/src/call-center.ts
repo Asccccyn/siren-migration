@@ -54,6 +54,12 @@ export class CallCenter {
       asr: deps.realtimeAsr,
       tts: deps.realtimeTts
     });
+    // 审计修复（P2）：进程启动瞬间不可能有活跃通话，
+    // 残留的 active 行（创建了 call 但从未连 WS / 上次进程崩溃）统一收尾
+    const cleaned = this.deps.sessionsRepo?.endAllActive(Date.now()) ?? 0;
+    if (cleaned > 0) {
+      deps.logger.info('call_sessions_stale_cleaned', { rows: cleaned });
+    }
   }
 
   get activeCount(): number {

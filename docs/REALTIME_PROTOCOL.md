@@ -63,12 +63,19 @@ GET /ws/call/{call_id}?token={short-lived-token}   (WebSocket)
   binary 无对应头丢弃。
 - binary 与 stream_id / sequence 的对应**不依赖猜测**。
 
-### Playback Drain（P0-4）
+### Playback Drain（P0-4，v1.1 审计后为状态机语义）
 
 必须区分「服务端发完 PCM」与「用户听完 PCM」。客户端只在
 `pcm_end(stream_id)` **且该流全部 AudioBufferSourceNode 播完**后发送
-`playback_drained`。被打断的流不要求 drained。服务端超时
-（`PLAYBACK_DRAIN_TIMEOUT_MS`，默认 4s）只告警清理，不悬挂 session。
+`playback_drained`。
+
+对声明了 `playback_drain` 能力（协议 v2 ready）的客户端，服务端在
+`pcm_end` 后**保持 speaking**，收到 `playback_drained` 才迁移
+`speaking → listening`；超时（`PLAYBACK_DRAIN_TIMEOUT_MS`，默认 4s）兜底回
+listening，绝不悬挂 session。因此尾音播放期间客户端的
+`isAiActive` 判定仍为 true，本地 barge-in 在尾音阶段照常生效
+（实测 drain 期抢话 <100ms 内 interrupted）。未声明该能力的旧协议客户端
+`pcm_end` 后立即回 listening（降级行为）。被打断的流不要求 drained。
 
 ## 状态机
 
@@ -77,7 +84,8 @@ IDLE → LISTENING → ENDING → THINKING → SPEAKING → LISTENING → ...
 SPEAKING --abort--> INTERRUPTING → LISTENING
 ```
 
-正常说完一句回复是 `speaking → listening` 直达；`interrupting` 只用于真实打断。
+正常说完一句回复是 `speaking → listening` 直达（协议 v2 客户端中间多一段
+drain 等待期，期间状态保持 speaking）；`interrupting` 只用于真实打断。
 
 ## Barge-in 语义（三层）
 

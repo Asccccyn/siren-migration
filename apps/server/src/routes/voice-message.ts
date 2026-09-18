@@ -10,6 +10,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { SIREN_EMOTIONS } from '@siren/contracts';
 import type { AsyncVoicePipeline, SirenConfig, VoiceService } from '@siren/voice-core';
+import { contentTypeFor } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { errorFields } from '@siren/telemetry';
 import { ProviderError } from '@siren/contracts';
@@ -211,12 +212,6 @@ export function serializeAsset(record: {
     created_at: new Date(record.createdAt).toISOString(),
     audio_url: record.audioUrl
   };
-}
-
-function contentTypeFor(format: string): string {
-  if (format === 'wav') return 'audio/wav';
-  if (format === 'pcm') return 'audio/pcm';
-  return 'audio/mpeg';
 }
 
 function guessAudioFormat(contentType: string): string {

@@ -40,7 +40,7 @@ pnpm start
 | `pnpm dev` | tsx 热重载启动服务 |
 | `pnpm build` | 构建 server（esbuild bundle）与 playground 页面 |
 | `pnpm start` | 运行构建产物 `apps/server/dist/index.js` |
-| `pnpm test` | Vitest 全量测试（27 个文件 / 150 个用例，含协议/并发/背压专项） |
+| `pnpm test` | Vitest 全量测试（28 个文件 / 162 个用例，含协议/并发/背压/审计回归专项） |
 | `pnpm typecheck` | TypeScript 严格类型检查 |
 | `pnpm lint` | ESLint |
 | `pnpm fillers` | 预生成 filler 音频（`--mock` 用 Mock 音色） |

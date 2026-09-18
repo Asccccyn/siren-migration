@@ -85,7 +85,39 @@ describe('SQLite 仓储', () => {
     migrate(db);
     expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 1 });
   });
+
+  it('审计回归：endAllActive 启动清扫（创建后从未连 WS 的 call 不永久残留 active）', () => {
+    const db = openDatabase(':memory:');
+    const sessions = new CallSessionsRepository(db);
+    const now = Date.now();
+    insertSession(sessions, 'call-stale-1', now - 60_000);
+    insertSession(sessions, 'call-stale-2', now - 30_000);
+    sessions.markEnded('call-stale-2', now - 1000, 'ended'); // 已正常结束的不动
+
+    const cleaned = sessions.endAllActive(now);
+    expect(cleaned).toBe(1);
+    expect(sessions.findById('call-stale-1')?.status).toBe('ended');
+    expect(sessions.findById('call-stale-1')?.ended_at).toBe(now);
+    expect(sessions.findById('call-stale-2')?.status).toBe('ended');
+    expect(sessions.findById('call-stale-2')?.ended_at).toBeLessThan(now);
+    // 再次清扫无变化
+    expect(sessions.endAllActive(now + 1)).toBe(0);
+  });
 });
+
+function insertSession(sessions: CallSessionsRepository, id: string, createdAt: number): void {
+  sessions.insert({
+    id,
+    conversation_id: 'conv-stale',
+    voice_profile: 'main',
+    started_at: null,
+    ended_at: null,
+    status: 'active',
+    asr_provider: 'mock',
+    tts_provider: 'mock',
+    created_at: createdAt
+  });
+}
 
 function makeAsset(
   id: string,

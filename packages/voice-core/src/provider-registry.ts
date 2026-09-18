@@ -30,11 +30,14 @@ export interface ProviderBundle {
   warnings: string[];
   /** 实际生效的 provider 名（写入 call_sessions 元数据） */
   active: { asr: string; asyncTts: string; realtimeTts: string; coreBridge: string; storage: string };
+  /** 长生命周期资源清理（如火山双向流式 WebSocket 共享连接），app 关停时调用 */
+  dispose?: () => void;
 }
 
 export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBundle {
   const warnings: string[] = [];
   const isProd = config.env === 'production' && !config.allowMockInProduction;
+  const disposeHooks: (() => void)[] = [];
 
   // --- ASR ---
   let asr: AsrProvider;
@@ -110,6 +113,7 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
           synthesize: (request) => batch.synthesize(request),
           synthesizeStream: (request, signal) => bidirectional.synthesizeStream(request, signal)
         };
+        disposeHooks.push(() => bidirectional.dispose());
         return { tts: realtime, name: 'volc' };
       }
       // 异步链路：纯批量（BatchTtsProvider，异步语音只用 synthesize）
@@ -186,7 +190,9 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
       realtimeTts: realtimeTtsBundle.name,
       coreBridge: coreName,
       storage: storageName
-    }
+    },
+    // 长生命周期资源：火山双向流式共享连接在关停时释放
+    dispose: () => disposeHooks.forEach((hook) => hook())
   };
 }
 

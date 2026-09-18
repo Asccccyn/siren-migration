@@ -53,6 +53,8 @@ interface ServerScript {
   audioChunks: number;
   failSession?: boolean;
   chunkDelayMs?: number;
+  /** 收到 StartConnection 后不回 ConnectionStarted（测门控） */
+  noStartAck?: boolean;
 }
 
 function startFakeServer(script: ServerScript): Promise<{
@@ -60,6 +62,7 @@ function startFakeServer(script: ServerScript): Promise<{
   close: () => Promise<void>;
   seen: {
     headers: Record<string, string>;
+    connections: number;
     startSessionPayloads: { sessionId: string; payload: unknown }[];
     taskRequests: { sessionId: string; text: string }[];
     finishSessions: string[];
@@ -69,11 +72,13 @@ function startFakeServer(script: ServerScript): Promise<{
     const wss = new WebSocketServer({ port: 0 });
     const seen = {
       headers: {} as Record<string, string>,
+      connections: 0,
       startSessionPayloads: [] as { sessionId: string; payload: unknown }[],
       taskRequests: [] as { sessionId: string; text: string }[],
       finishSessions: [] as string[]
     };
     wss.on('connection', (socket: WebSocket, request) => {
+      seen.connections++;
       seen.headers = request.headers as Record<string, string>;
       // 每个 session 的音频发送任务（真实服务端保证 Finished 在全部音频之后）
       const audioSenders = new Map<string, Promise<void>>();
@@ -93,6 +98,7 @@ function startFakeServer(script: ServerScript): Promise<{
         const payloadText = frame.subarray(offset + 4, offset + 4 + payloadLen).toString('utf8');
 
         if (event === EVENT.START_CONNECTION) {
+          if (script.noStartAck) return; // 不回 ConnectionStarted（测门控）
           const connId = randomUUID();
           socket.send(
             serverEventFrame(EVENT.CONNECTION_STARTED, null, Buffer.from(JSON.stringify({ connection_id: connId })), false)
@@ -281,5 +287,80 @@ describe('VolcBidirectionalTtsProvider（P0-9 真流式）', () => {
     await expect(async () => {
       for await (const _chunk of tts.synthesizeStream(request('失败句'))) void _chunk;
     }).rejects.toThrowError(/tts session failed|speaker/i);
+  });
+
+  it('审计回归：并发 A+B -> abort A -> B 完整继续（session 级取消，不杀共享连接）', async () => {
+    const server = await startFakeServer({ audioChunks: 8, chunkDelayMs: 12 });
+    servers.push(server);
+    const tts = provider(server.port);
+
+    const controller = new AbortController();
+    const collectB = async (): Promise<number> => {
+      let count = 0;
+      for await (const _chunk of tts.synthesizeStream(request('通话B继续说话。'))) count++;
+      return count;
+    };
+    const collectA = (async (): Promise<number> => {
+      let count = 0;
+      try {
+        for await (const _chunk of tts.synthesizeStream(request('通话A被抢话。'), controller.signal)) {
+          count++;
+          if (count >= 2) controller.abort(); // A 被 barge-in
+        }
+      } catch {
+        // A 的取消错误
+      }
+      return count;
+    })();
+
+    const [aCount, bCount] = await Promise.all([collectA, collectB()]);
+    expect(aCount).toBeLessThan(8); // A 提前终止
+    expect(bCount).toBe(8); // B 完整收到全部音频（连接没有被 A 的 abort 杀掉）
+    // FinishSession 共 3 次：A 正常流程 1 + A 取消补发 1 + B 正常 1
+    expect(server.seen.finishSessions.length).toBe(3);
+    // 连接只有一条（共享连接保持存活）
+    expect(server.seen.connections).toBe(1);
+
+    // 连接仍然可用：第三个调用复用同一连接
+    let third = 0;
+    for await (const _chunk of tts.synthesizeStream(request('第三个通话。'))) third++;
+    expect(third).toBe(8);
+    expect(server.seen.connections).toBe(1);
+  });
+
+  it('审计回归：StartConnection 未收到 ConnectionStarted 前不发 StartSession（门控）', async () => {
+    const server = await startFakeServer({ audioChunks: 1, noStartAck: true });
+    servers.push(server);
+    const tts = new VolcBidirectionalTtsProvider(
+      {
+        appId: 'app-1',
+        accessToken: 'token-1',
+        resourceId: 'volc.service_type.10029',
+        wsUrl: `ws://127.0.0.1:${server.port}`,
+        connectTimeoutMs: 400,
+        sessionTimeoutMs: 2000
+      },
+      logger
+    );
+    await expect(async () => {
+      for await (const _chunk of tts.synthesizeStream(request('不该开始'))) void _chunk;
+    }).rejects.toThrowError(/connection start timeout|connection/i);
+    // 关键断言：连接未就绪时 StartSession 从未发出
+    expect(server.seen.startSessionPayloads.length).toBe(0);
+  });
+
+  it('审计回归：并发首次调用只建立一条连接（建连互斥，无孤儿连接）', async () => {
+    const server = await startFakeServer({ audioChunks: 2, chunkDelayMs: 5 });
+    servers.push(server);
+    const tts = provider(server.port);
+
+    const collect = async (): Promise<number> => {
+      let count = 0;
+      for await (const _chunk of tts.synthesizeStream(request('并发首连。'))) count++;
+      return count;
+    };
+    const [a, b] = await Promise.all([collect(), collect()]);
+    expect(a + b).toBe(4);
+    expect(server.seen.connections).toBe(1); // 没有第二个孤儿连接
   });
 });

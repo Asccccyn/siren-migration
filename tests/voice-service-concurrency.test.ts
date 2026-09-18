@@ -13,11 +13,11 @@ import { buildTestVoice, silentLogger, testConfig, testProfiles } from './helper
 
 /** 记录 put/delete 的内存存储（测试并发清理行为） */
 class RecordingStore extends MemoryObjectStore {
-  readonly puts: string[] = [];
+  readonly puts: { key: string; contentType: string }[] = [];
   readonly deletes: string[] = [];
 
   override async put(key: string, body: Buffer, contentType: string): Promise<void> {
-    this.puts.push(key);
+    this.puts.push({ key, contentType });
     return super.put(key, body, contentType);
   }
 
@@ -26,8 +26,8 @@ class RecordingStore extends MemoryObjectStore {
     return super.delete(key);
   }
 
-  audioKeys(): string[] {
-    return this.puts.filter((key) => key.includes('/audio.'));
+  audioPuts(): { key: string; contentType: string }[] {
+    return this.puts.filter((put) => put.key.includes('/audio.'));
   }
 }
 
@@ -71,9 +71,9 @@ describe('message_id 并发幂等（P1-3 immutable object key）', () => {
     expect(a.id).toBe(b.id);
 
     // 并发产生了两个不同的物理 key（各含自己的 asset_id）
-    const audioKeys = store.audioKeys();
-    expect(audioKeys.length).toBe(2);
-    expect(new Set(audioKeys).size).toBe(2);
+    const audioPuts = store.audioPuts();
+    expect(audioPuts.length).toBe(2);
+    expect(new Set(audioPuts.map((put) => put.key)).size).toBe(2);
 
     // winner 的音频对象仍然存在（没有被 loser 删掉）
     const winnerKey = all[0].objectKey;
@@ -82,7 +82,7 @@ describe('message_id 并发幂等（P1-3 immutable object key）', () => {
     expect(audio.length).toBeGreaterThan(0);
 
     // loser 的对象（另一个 key）被清理
-    const loserKey = audioKeys.find((key) => key !== winnerKey);
+    const loserKey = audioPuts.find((put) => put.key !== winnerKey)?.key;
     expect(loserKey).toBeTruthy();
     expect(await store.exists(loserKey as string)).toBe(false);
   });
@@ -109,5 +109,32 @@ describe('message_id 并发幂等（P1-3 immutable object key）', () => {
     expect(all.length).toBe(1);
     expect(results[0].asset.id).toBe(results[1].asset.id);
     expect(await store.exists(all[0].objectKey)).toBe(true);
+  });
+
+  it('审计回归：m4a / webm 上传的对象扩展名与 Content-Type 闭环（不再伪装成 mp3）', async () => {
+    const { voice, store, assetsRepo } = await buildVoiceWithSharedStore();
+    const audio = Buffer.alloc(512, 3);
+
+    await voice.storeUserVoice({ audio, format: 'm4a', messageId: 'msg-fmt-m4a', conversationId: 'conv-fmt' });
+    await voice.storeUserVoice({ audio, format: 'webm', messageId: 'msg-fmt-webm', conversationId: 'conv-fmt' });
+
+    const m4a = assetsRepo.list({ messageId: 'msg-fmt-m4a' })[0];
+    const webm = assetsRepo.list({ messageId: 'msg-fmt-webm' })[0];
+
+    // DB 格式 / 对象扩展名 / MIME 三者一致（FORMAT_META 单一来源）
+    expect(m4a.audioFormat).toBe('m4a');
+    expect(m4a.objectKey.endsWith('/audio.m4a')).toBe(true);
+    expect(store.audioPuts().find((put) => put.key === m4a.objectKey)?.contentType).toBe('audio/mp4');
+
+    expect(webm.audioFormat).toBe('webm');
+    expect(webm.objectKey.endsWith('/audio.webm')).toBe(true);
+    expect(store.audioPuts().find((put) => put.key === webm.objectKey)?.contentType).toBe('audio/webm');
+
+    // assistant 语音条：key/MIME 与 provider 实际返回格式一致（Mock TTS 返回 wav）
+    await voice.speak({ text: '语音条。', messageId: 'msg-fmt-tts', conversationId: 'conv-fmt' });
+    const tts = assetsRepo.list({ messageId: 'msg-fmt-tts' })[0];
+    expect(tts.objectKey.endsWith(`/audio.${tts.audioFormat}`)).toBe(true);
+    const ttsMime = store.audioPuts().find((put) => put.key === tts.objectKey)?.contentType;
+    expect(ttsMime).toBe(tts.audioFormat === 'mp3' ? 'audio/mpeg' : 'audio/wav');
   });
 });

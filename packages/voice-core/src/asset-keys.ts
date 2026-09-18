@@ -1,11 +1,27 @@
 /**
- * 语音资产的 object key 与内容类型约定（规范第 30 节 / v1.1 P1-3）。
+ * 语音资产的 object key 与内容类型约定（规范第 30 节 / v1.1 P1-3 + 审计修复）。
  * voice/{YYYY}/{MM}/{conversation_id}/{message_id}/{asset_id}/audio.{ext} + meta.json
  *
  * key 包含 asset_id（P1-3 immutable object key）：并发同 message_id 的两个请求
  * 写不同的物理 key，DB 唯一索引决定 winner；落败者只清理自己的 key，
  * 永远不会误删 winner 的音频对象。
+ *
+ * 格式闭环（审计修复）：DB 里的 audio_format、对象扩展名、Content-Type
+ * 三者来自同一张 FORMAT_META 表——m4a/webm/ogg 不再被错误命名为 audio.mp3
+ * 或标成 audio/mpeg。
  */
+
+/** 容器格式 -> 物理扩展名 + MIME（对象存储 put 与资源代理共用） */
+export const FORMAT_META: Readonly<Record<string, { ext: string; mime: string }>> = {
+  mp3: { ext: 'mp3', mime: 'audio/mpeg' },
+  wav: { ext: 'wav', mime: 'audio/wav' },
+  pcm: { ext: 'pcm', mime: 'audio/pcm' },
+  m4a: { ext: 'm4a', mime: 'audio/mp4' },
+  mp4: { ext: 'm4a', mime: 'audio/mp4' },
+  webm: { ext: 'webm', mime: 'audio/webm' },
+  ogg: { ext: 'ogg', mime: 'audio/ogg' },
+  bin: { ext: 'bin', mime: 'application/octet-stream' }
+};
 
 /** 生成规范第 30 节的分形 object key（asset 维度不可变） */
 export function buildObjectKey(
@@ -20,8 +36,8 @@ export function buildObjectKey(
   const conversation = sanitizeKeyPart(conversationId ?? 'anonymous');
   const message = sanitizeKeyPart(messageId);
   const asset = sanitizeKeyPart(assetId);
-  const ext = format === 'pcm' ? 'pcm' : format === 'wav' ? 'wav' : 'mp3';
-  return `voice/${year}/${month}/${conversation}/${message}/${asset}/audio.${ext}`;
+  const meta = FORMAT_META[format] ?? FORMAT_META.bin;
+  return `voice/${year}/${month}/${conversation}/${message}/${asset}/audio.${meta.ext}`;
 }
 
 /** key 段只允许安全字符，长度封顶（配合 isValidObjectKey 双重防护） */
@@ -31,9 +47,7 @@ export function sanitizeKeyPart(input: string): string {
 }
 
 export function contentTypeFor(format: string): string {
-  if (format === 'wav') return 'audio/wav';
-  if (format === 'pcm') return 'audio/pcm';
-  return 'audio/mpeg';
+  return (FORMAT_META[format] ?? FORMAT_META.bin).mime;
 }
 
 /** 上传容器归一化（webm;codecs=opus -> webm） */

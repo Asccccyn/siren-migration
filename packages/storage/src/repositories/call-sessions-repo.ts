@@ -40,4 +40,16 @@ export class CallSessionsRepository {
       .prepare('UPDATE call_sessions SET ended_at = ?, status = ? WHERE id = ?')
       .run(at, status, id);
   }
+
+  /**
+   * 进程启动清扫（审计修复）：启动瞬间不可能有活跃通话，
+   * 所有 status=active 的行都是上一进程的残留（如创建后从未连 WS、或进程崩溃）。
+   * 返回清理行数。
+   */
+  endAllActive(at: number): number {
+    const result = this.db
+      .prepare("UPDATE call_sessions SET ended_at = ?, status = 'ended' WHERE status = 'active'")
+      .run(at);
+    return Number(result.changes);
+  }
 }
