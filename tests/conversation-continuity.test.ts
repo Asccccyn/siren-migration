@@ -9,9 +9,27 @@
  */
 import { describe, expect, it } from 'vitest';
 import { openDatabase, CallTurnsRepository, CallSessionsRepository } from '@siren/storage';
-import { MockAsrProvider } from '@siren/provider-mock';
+import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import type { CoreBridge, CoreTurnInput, CoreDelta } from '@siren/core-bridge';
+import type { PcmChunk, TtsAudioResult, TtsProvider, TtsRequest } from '@siren/contracts';
 import { buildSessionHarness, waitFor } from './helpers.ts';
+
+/** 慢速 TTS：每块间隔固定耗时，保证"speaking 期间打断"的前提确定性成立
+ * （v1.1.1 起 AsyncQueue 死锁已修，瞬时 TTS 会让整轮在 abort 前就完成） */
+class SlowMockTts implements TtsProvider {
+  private readonly inner = new MockTtsProvider();
+
+  synthesize(request: TtsRequest): Promise<TtsAudioResult> {
+    return this.inner.synthesize(request);
+  }
+
+  async *synthesizeStream(request: TtsRequest, _signal?: AbortSignal): AsyncGenerator<PcmChunk> {
+    for await (const chunk of this.inner.synthesizeStream(request)) {
+      await new Promise((r) => setTimeout(r, 8));
+      yield chunk;
+    }
+  }
+}
 
 /** 记录全部 turn 输入的 Core 桩：模拟"同一个Peer Core / 同一个 conversation" */
 class RecordingCoreBridge implements CoreBridge {
@@ -41,6 +59,7 @@ function buildRecording(options: {
   callId: string;
   reply?: string;
   final?: string;
+  tts?: TtsProvider;
 }) {
   const db = openDatabase(':memory:');
   const turnsRepo = new CallTurnsRepository(db);
@@ -60,6 +79,7 @@ function buildRecording(options: {
   const core = new RecordingCoreBridge(options.reply ?? '好的，我看到了。我去看这个目录。');
   const harness = buildSessionHarness({
     asr: new MockAsrProvider({ partials: ['等一', '等一下'], final: options.final ?? '等一下，我把路径发给你。', finalDelayMs: 5 }),
+    tts: options.tts,
     core,
     turnsRepo,
     sessionsRepo,
@@ -163,7 +183,8 @@ describe('Conversation 连续性（P0-4.5 电话与网页共享同一 conversati
     const { harness, turnsRepo } = buildRecording({
       conversationId: 'conv-int',
       callId: 'call-int',
-      reply: '第一句话说完。第二句话也说完了。第三句话继续。第四句还没说。'
+      reply: '第一句话说完。第二句话也说完了。第三句话继续。第四句还没说。',
+      tts: new SlowMockTts() // 确定性 speaking 窗口：瞬时 TTS 会让整轮先完成
     });
     const { session } = harness;
     session.handleMessage({ t: 'start' });

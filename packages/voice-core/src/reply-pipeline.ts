@@ -145,7 +145,10 @@ export class ReplyPipeline {
       await producer;
     } catch (error) {
       if (error instanceof TurnAbortedError || turn.aborted) {
-        // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发
+        // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发。
+        // 关闭队列把可能停在 waitForDrain 的生产者放出（其循环会因 turn.aborted 退出），
+        // 避免生产者协程永久挂起（审计修复）
+        sentenceQueue.close();
         return { status: 'aborted' };
       }
       await producer.catch(() => undefined);

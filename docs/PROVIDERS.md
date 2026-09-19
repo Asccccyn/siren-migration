@@ -46,12 +46,15 @@ CoreBridge 与 conversation 所有权不变。
   - 连接复用：一条 WebSocket 承载多个 session（按 session id 多路复用），
     句间无需重新握手；建连互斥（并发首次调用共享同一个连接建立过程，
     无孤儿连接）；`StartConnection → ConnectionStarted` 就绪门控后才发
-    `StartSession`。
-  - 取消是 session 级的：AbortSignal 只 fail 自己的 session 并补发
-    FinishSession，共享连接与其他通话的 session 不受影响；只有 socket 级
-    错误才废弃整条连接。进程关停时经 ProviderBundle.dispose 释放连接。
-  - `synthesizeStream(request, signal)`：AbortSignal 立即 terminate 连接
-    （barge-in 不再后台烧 TTS）；chunk 携带真实 sampleRate（P0-7）。
+    `StartSession`（就绪超时会关闭 socket，不积累僵尸连接）。
+  - 取消是 session 级的（v1.1.1）：AbortSignal 发送 `CancelSession(101)`，
+    服务端真正停止该 session 的剩余合成并回 `SessionCanceled(151)`；
+    只 fail 自己的 session channel，共享连接与其他通话的 session 不受影响；
+    正常结束仍走 `FinishSession(102) → SessionFinished(152)`；只有 socket 级
+    错误才废弃整条连接。进程关停时经 ProviderBundle.dispose 释放连接
+    （dispose 打断 in-flight 建连，连接不会复活）。
+  - `synthesizeStream(request, signal)`：barge-in 时上游真正停止合成；
+    chunk 携带真实 sampleRate（P0-7）。
   - 情绪映射：`voice-map.ts` 的 emotion / emotion_scale 进入 `audio_params`；
     语速映射为 `speech_rate`（[-50,100]）；音色 ID 只来自 profile / `VOLC_VOICE_ID`。
 - 旧的「句子级批量 + 预取」假流式实现已删除。

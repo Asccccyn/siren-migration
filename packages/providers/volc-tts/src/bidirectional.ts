@@ -11,8 +11,9 @@
  *   才 resolve（官方顺序）；ConnectionFailed(51)/超时则拒绝
  * - 连接复用：一条 WebSocket 承载多个 session（按 session id 多路复用），
  *   句间无需重新握手；socket 级错误才 kill 整条连接，下次调用重建
- * - 取消是 session 级的（审计修复）：AbortSignal 只 fail 自己的 session
- *   channel 并补发 FinishSession，连接继续承载其他通话的 session
+ * - 取消是 session 级的（审计修复）：AbortSignal 发送 CancelSession(101) 让服务端
+ *   真正停止该 session 的合成（回 SessionCanceled/151），只 fail 自己的 channel，
+ *   连接继续承载其他通话的 session
  * - 建连互斥（审计修复）：并发首次调用共享同一个 connecting promise，
  *   不会产生孤儿连接
  * - 采样率：chunk 携带真实 sampleRate（P0-7）
@@ -127,8 +128,10 @@ class BidirectionConnection {
       this.readyReject = reject;
     });
     const timer = setTimeout(() => {
-      this.settleReady(
-        new ProviderError('provider_unavailable', 'volc-tts', 'tts connection start timeout')
+      // 审计修复：超时必须 kill 整条 socket（terminate），只 settleReady 会留下
+      // 已建立但永不就绪的孤儿连接，连续失败会积累
+      this.kill(
+        new ProviderError('provider_timeout', 'volc-tts', 'tts connection start timeout')
       );
     }, connectTimeoutMs);
     timer.unref?.();
@@ -185,7 +188,9 @@ class BidirectionConnection {
   }
 
   /**
-   * session 级取消（审计修复）：只 fail 自己的 channel 并尽力补发 FinishSession，
+   * session 级取消（审计修复）：只 fail 自己的 channel，并向服务端发
+   * CancelSession(101)——与 FinishSession(102) 不同，101 语义是"停止合成"，
+   * 服务端会中止该 session 的剩余音频并回 SessionCanceled(151)。
    * 连接保持存活，其他通话的 session 不受影响。
    */
   cancelSession(sessionId: string, cause: string): void {
@@ -196,7 +201,7 @@ class BidirectionConnection {
     }
     if (!this.dead) {
       try {
-        this.socket.send(encodeClientEventFrame(EVENT.FINISH_SESSION, sessionId, {}));
+        this.socket.send(encodeClientEventFrame(EVENT.CANCEL_SESSION, sessionId, {}));
       } catch {
         // socket 已不可写：连接随后会被 kill 兜底
       }
@@ -271,6 +276,8 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
   private connection: BidirectionConnection | null = null;
   /** 建连互斥：并发首次调用共享同一个连接建立过程（审计修复） */
   private connecting: Promise<BidirectionConnection> | null = null;
+  /** dispose 后拒绝新会话，并防止 in-flight 建连结果复活 connection（审计修复） */
+  private disposed = false;
 
   constructor(
     private readonly config: VolcBidirectionalTtsConfig,
@@ -322,8 +329,11 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
 
   /** 进程关停：关闭共享连接（app dispose 时调用） */
   dispose(): void {
+    this.disposed = true;
     this.connection?.kill(new ProviderError('tts_failed', 'volc-tts', 'provider disposed'));
     this.connection = null;
+    // connecting 不在此处等待：open 结果在 ensureConnection 的回调里按
+    // disposed 标志拦截并 kill，不会写回 this.connection
     this.connecting = null;
   }
 
@@ -355,19 +365,23 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
 
   private async ensureConnection(signal?: AbortSignal): Promise<BidirectionConnection> {
     if (signal?.aborted) throw new ProviderError('tts_failed', 'volc-tts', 'tts aborted');
+    if (this.disposed) {
+      throw new ProviderError('provider_unavailable', 'volc-tts', 'provider disposed');
+    }
     if (this.connection && !this.connection.isDead) return this.connection;
     if (!this.connecting) {
-      this.connecting = BidirectionConnection.open(this.config, this.logger).then(
-        (connection) => {
-          this.connection = connection;
-          this.connecting = null;
-          return connection;
-        },
-        (error: unknown) => {
-          this.connecting = null;
-          throw error;
+      this.connecting = (async () => {
+        const connection = await BidirectionConnection.open(this.config, this.logger);
+        if (this.disposed) {
+          // dispose 发生在建连期间：立即关闭新连接，禁止写回（防复活）
+          connection.kill(new Error('provider disposed during connect'));
+          throw new ProviderError('provider_unavailable', 'volc-tts', 'provider disposed');
         }
-      );
+        this.connection = connection;
+        return connection;
+      })().finally(() => {
+        this.connecting = null;
+      });
     }
     return this.connecting;
   }

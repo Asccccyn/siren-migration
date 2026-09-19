@@ -1,4 +1,4 @@
-# Siren v1.1（Realtime Hardening）
+# Siren v1.1.1（Realtime Hardening · 审计修复轮）
 
 > Siren 是对方的耳朵和嘴巴，不是第二个对方。
 > 独立语音能力层：ASR / TTS / 异步语音消息 / 实时通话 / MCP。

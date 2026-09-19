@@ -141,11 +141,8 @@ export class CallSession {
     turn.asr.feed(pcm);
   }
 
-  /**
-   * 连接关闭 / 服务停止 / 背压超限：统一走幂等 finalize（P0-6）。
-   * 在 cleanup 完成前不置 terminal flag，保证 abort / 落库 / token 吊销 /
-   * 注册表移除一定发生；重复调用直接返回。
-   */
+  /** 连接关闭/服务停止/背压超限：幂等 finalize（P0-6）。cleanup 完成前
+   * 不置 terminal flag，保证 abort/落库/token 吊销/注册表移除一定发生 */
   destroy(reason = 'closed', closeInfo?: { code: number; reason: string }): void {
     if (this.closed || this.closing) return;
     this.closing = true;
@@ -321,27 +318,34 @@ export class CallSession {
     if (turn.pcmStarted) {
       this.sendJson({ t: 'pcm_end', stream_id: turn.outputStreamId });
     }
-    this.writeTurn(turn, 'completed');
-    turn.metrics.markEnd();
-    this.sendJson({ t: 'metrics', metrics: turn.metrics.compute() });
-    this.log.info('turn_completed', {
-      turn_index: turn.index,
-      ...turn.metrics.compute(),
-      user_len: turn.userText.length,
-      assistant_len: turn.fullText.length
-    });
-    // 审计修复：pcm_end 只代表服务端发完，客户端 jitter buffer 里可能还有
-    // 300-500ms 尾音。支持 playback_drain 的客户端（协议 v2）必须等真正
-    // 播完（或超时兜底）才回 listening——尾音期间 state 保持 speaking，
-    // 本地 barge-in 判定（isAiActive）依然成立，抢话不再有窗口。
+    // drain 门控：pcm_end 只代表服务端发完，客户端还有尾音。v2 客户端等真正
+    // 播完（或超时兜底）才收尾——期间保持 speaking，本地 barge-in 判定仍成立
     if (turn.pcmStarted && this.clientDrainCapable && this.deps.config.playbackDrainTimeoutMs > 0) {
       const drained = await this.armPendingDrain(turn.outputStreamId);
-      if (this.closed || this.turn !== turn || turn.aborted) return; // drain 期间被打断/销毁：interrupted 流程已接管
+      if (turn.aborted || this.turn !== turn) return; // 尾音被打断：interrupted 流程已接管
       if (!drained) {
         this.log.debug('playback_drain_fallback_listening', { stream_id: turn.outputStreamId });
       }
     }
+    // completed 落库/metrics 在 drain 最终结果之后：被打断时由 handleAbort 写
+    // interrupted 并只发一份 interrupted metrics（不会出现两份矛盾记录）
+    this.finalizeCompletedTurn(turn);
+    if (this.closed || this.closing) return;
     this.backToListening();
+  }
+
+  /** 轮次正常收尾：completed 落库 + 单份 completed metrics（drain 之后调用） */
+  private finalizeCompletedTurn(turn: ActiveTurn): void {
+    this.writeTurn(turn, 'completed');
+    turn.metrics.markEnd();
+    const metrics = turn.metrics.compute();
+    this.sendJson({ t: 'metrics', metrics });
+    this.log.info('turn_completed', {
+      turn_index: turn.index,
+      ...metrics,
+      user_len: turn.userText.length,
+      assistant_len: turn.fullText.length
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -401,10 +405,7 @@ export class CallSession {
     this.log.debug('turn_abort', { reason, turn_index: turn.index });
   }
 
-  /**
-   * 回到 listening。正常说完一句是 speaking -> listening 直达；
-   * `interrupting` 只用于真实打断（P0-2 状态机修正），不再伪造中转。
-   */
+  /** 回 listening：正常结束 speaking->listening 直达；interrupting 只用于真实打断 */
   private backToListening(): void {
     this.turn = null;
     this.lastPartialText = '';
@@ -420,12 +421,8 @@ export class CallSession {
   // 输出
   // -------------------------------------------------------------------------
 
-  /**
-   * P0-4：pcm_end 只代表服务端发完，不等于用户听完。
-   * 等待客户端 playback_drained ACK，返回是否在超时内收到；
-   * 被 interrupted / destroy / 新流覆盖时立即以 false 结束等待。
-   * 超时只告警清理，绝不悬挂 session。
-   */
+  /** P0-4：等待 playback_drained ACK，返回是否在超时内收到；
+   * interrupted / destroy / 新流覆盖立即以 false 放行，绝不悬挂 session */
   private armPendingDrain(streamId: string): Promise<boolean> {
     this.clearPendingDrain('rearm');
     const timeoutMs = this.deps.config.playbackDrainTimeoutMs;

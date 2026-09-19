@@ -23,6 +23,8 @@ export const EVENT = {
   CONNECTION_FAILED: 51,
   CONNECTION_FINISHED: 52,
   START_SESSION: 100,
+  /** 取消会话（barge-in）：服务端停止合成并回 SessionCanceled(151)，区别于 FinishSession(102) */
+  CANCEL_SESSION: 101,
   FINISH_SESSION: 102,
   SESSION_STARTED: 150,
   SESSION_CANCELED: 151,

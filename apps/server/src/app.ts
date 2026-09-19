@@ -37,7 +37,7 @@ import { registerAssetsRoute } from './routes/assets.ts';
 import { registerCallWebSocket } from './websocket/call-handler.ts';
 import { registerMcpRoute } from './mcp/server.ts';
 
-export const SIREN_VERSION = '1.1.0';
+export const SIREN_VERSION = '1.1.1';
 
 export interface BuildAppOptions {
   config?: SirenConfig;

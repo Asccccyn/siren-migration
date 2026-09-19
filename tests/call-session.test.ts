@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import { MockCoreBridge } from '@siren/core-bridge';
 import type { PcmChunk, TtsProvider, TtsRequest, TtsAudioResult } from '@siren/contracts';
+import { openDatabase, CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import { buildSessionHarness, testConfig, waitFor } from './helpers.ts';
 
 /** 输出固定采样率 PCM 的假 TTS（验证 P0-7 采样率全链路保留） */
@@ -269,17 +270,21 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     session.handleBinary(Buffer.alloc(3200, 1));
     session.handleMessage({ t: 'end' });
 
-    // 服务端 PCM 发完 + metrics 已发，但状态必须仍是 speaking（客户端还在播尾音）
+    // 服务端 PCM 发完，但状态必须仍是 speaking（客户端还在播尾音）；
+    // v1.1.1 起 completed 落库与 metrics 延后到 drain 之后：此刻不应有 metrics
     await waitFor(() => harness.texts().some((m) => m.t === 'pcm_end'));
-    await waitFor(() => harness.texts().some((m) => m.t === 'metrics'));
+    expect(harness.texts().filter((m) => m.t === 'metrics').length).toBe(0);
     const states = harness.texts().filter((m) => m.t === 'state').map((m) => m.state);
     expect(states[states.length - 1]).toBe('speaking');
     expect(session.state).toBe('speaking');
 
-    // 客户端播完 ACK -> listening
+    // 客户端播完 ACK -> metrics(completed) -> listening
     const pcmEnd = harness.texts().find((m) => m.t === 'pcm_end') as { stream_id: string };
     session.handleMessage({ t: 'playback_drained', stream_id: pcmEnd.stream_id });
     await waitFor(() => session.state === 'listening');
+    const metricsFrames = harness.texts().filter((m) => m.t === 'metrics');
+    expect(metricsFrames.length).toBe(1); // 只有一份 completed metrics
+    expect((metricsFrames[0].metrics as { interrupted: boolean }).interrupted).toBe(false);
     // 不产生 interrupting（正常完成路径）
     expect(harness.texts().filter((m) => m.t === 'state').map((m) => m.state)).not.toContain('interrupting');
   });
@@ -351,5 +356,76 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
       harness.texts().some((m) => m.t === 'state' && m.state === 'listening' && harness.texts().some((x) => x.t === 'pcm_end'))
     );
     expect(session.state).toBe('listening');
+  });
+
+  it('v1.1.1 审计回归：6 句长回复不死锁（生产者 waitForDrain 被消费唤醒），完整收到 pcm_end', async () => {
+    const harness = buildSessionHarness({
+      core: new MockCoreBridge({
+        reply: '第一句话。第二句话。第三句话。第四句话。第五句话。第六句话。',
+        intervalMs: 1,
+        charsPerDelta: 3
+      })
+    });
+    const { session } = harness;
+    session.handleMessage({ t: 'start' });
+    session.handleBinary(Buffer.alloc(3200, 1));
+    session.handleMessage({ t: 'end' });
+    // 旧实现：队列 size 达 2 后生产者 park 在 waitForDrain(1)，消费者消费不唤醒
+    // -> 第 3 句永远进不了队列 -> pcm_end 永远不出现（waitFor 5s 超时失败）
+    await waitFor(
+      () =>
+        harness.texts().some((m) => m.t === 'pcm_end') &&
+        harness.texts().some((m) => m.t === 'state' && m.state === 'listening'),
+      5000
+    );
+    // 6 句全部播出（reply 文本完整、pcm 头 sequence 连续推进）
+    const reply = harness.texts().find((m) => m.t === 'reply');
+    expect(String(reply?.text)).toContain('第六句话');
+    expect(harness.binaries().length).toBeGreaterThan(6);
+  });
+
+  it('v1.1.1 审计回归：尾音 drain 期间被打断，DB 落 interrupted=1 且 metrics 只有一份', async () => {
+    const db = openDatabase(':memory:');
+    const turnsRepo = new CallTurnsRepository(db);
+    const sessionsRepo = new CallSessionsRepository(db);
+    sessionsRepo.insert({
+      id: 'call-drain-abort',
+      conversation_id: 'conv-da',
+      voice_profile: 'main',
+      started_at: Date.now(),
+      ended_at: null,
+      status: 'active',
+      asr_provider: 'mock',
+      tts_provider: 'mock',
+      created_at: Date.now()
+    });
+    const harness = buildSessionHarness({
+      config: testConfig({ PLAYBACK_DRAIN_TIMEOUT_MS: '5000' }),
+      callId: 'call-drain-abort',
+      conversationId: 'conv-da',
+      turnsRepo,
+      sessionsRepo
+    });
+    const { session } = harness;
+    session.handleMessage({ t: 'ready', protocol: 2, capabilities: { playback_drain: true } });
+    session.handleMessage({ t: 'start' });
+    session.handleBinary(Buffer.alloc(3200, 1));
+    session.handleMessage({ t: 'end' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'pcm_end'));
+    expect(session.state).toBe('speaking');
+
+    // completed 尚未落库（延后到 drain 之后）——此刻打断
+    session.handleMessage({ t: 'abort' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'interrupted'));
+    await waitFor(() => session.state === 'listening');
+
+    // DB：只有一行，且是 interrupted（不是被 completed 抢先覆盖）
+    const turns = turnsRepo.listByCall('call-drain-abort');
+    expect(turns.length).toBe(1);
+    expect(turns[0].interrupted).toBe(1);
+    // metrics 只有一份，且是 interrupted 版本（不再出现 completed+interrupted 两份互相矛盾）
+    const metricsFrames = harness.texts().filter((m) => m.t === 'metrics');
+    expect(metricsFrames.length).toBe(1);
+    expect((metricsFrames[0].metrics as { interrupted: boolean }).interrupted).toBe(true);
   });
 });

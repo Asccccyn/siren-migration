@@ -6,7 +6,7 @@
 export class AsyncQueue<T> {
   private items: T[] = [];
   private waiters: ((value: IteratorResult<T>) => void)[] = [];
-  private drainWaiters: (() => void)[] = [];
+  private drainWaiters: { threshold: number; resolve: () => void }[] = [];
   private closed = false;
   private failure: unknown = null;
   private hasFailure = false;
@@ -50,7 +50,11 @@ export class AsyncQueue<T> {
     return {
       next: (): Promise<IteratorResult<T>> => {
         if (this.items.length > 0) {
-          return Promise.resolve({ value: this.items.shift() as T, done: false });
+          const value = this.items.shift() as T;
+          // 审计修复（P0）：消费使队列变短，必须唤醒等待 drain 的生产者，
+          // 否则 size>=2 时生产者 waitForDrain(1) 永远不会被叫醒 -> 死锁
+          this.notifyDrain();
+          return Promise.resolve({ value, done: false });
         }
         if (this.hasFailure) {
           return Promise.reject(this.failure);
@@ -69,15 +73,23 @@ export class AsyncQueue<T> {
   waitForDrain(threshold = 1): Promise<void> {
     if (this.items.length <= threshold || this.closed) return Promise.resolve();
     return new Promise((resolve) => {
-      this.drainWaiters.push(resolve);
+      this.drainWaiters.push({ threshold, resolve });
     });
   }
 
+  /** 按 waiter 各自等待的 threshold 唤醒（而非仅队列清空时） */
   private notifyDrain(): void {
-    if (this.items.length === 0 || this.closed) {
-      const waiters = this.drainWaiters.splice(0);
-      for (const resolve of waiters) resolve();
+    if (this.drainWaiters.length === 0) return;
+    if (this.closed) {
+      for (const waiter of this.drainWaiters.splice(0)) waiter.resolve();
+      return;
     }
+    const remaining: { threshold: number; resolve: () => void }[] = [];
+    for (const waiter of this.drainWaiters.splice(0)) {
+      if (this.items.length <= waiter.threshold) waiter.resolve();
+      else remaining.push(waiter);
+    }
+    this.drainWaiters.push(...remaining);
   }
 }
 

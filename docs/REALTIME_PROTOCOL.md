@@ -77,6 +77,10 @@ listening，绝不悬挂 session。因此尾音播放期间客户端的
 （实测 drain 期抢话 <100ms 内 interrupted）。未声明该能力的旧协议客户端
 `pcm_end` 后立即回 listening（降级行为）。被打断的流不要求 drained。
 
+本轮 turn 的 completed 落库与 `metrics` 帧同样以 drain 的最终结果为准：
+正常播完 → 一份 completed metrics；drain 期间被打断 → 由打断流程写
+`interrupted` 并只发一份 interrupted metrics（不会出现两份矛盾的 metrics）。
+
 ## 状态机
 
 ```text
