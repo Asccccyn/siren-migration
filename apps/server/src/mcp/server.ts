@@ -13,6 +13,7 @@ import { registerSpeakTool } from './tools/speak.ts';
 import { registerTranscribeTool } from './tools/transcribe.ts';
 import { registerGetVoiceTool } from './tools/get-voice.ts';
 import { registerListVoicesTool } from './tools/list-voices.ts';
+import { registerVoicePlayerResource } from './voice-player.ts';
 
 export interface McpDeps {
   voice: VoiceService;
@@ -24,8 +25,9 @@ export interface McpDeps {
 export function createSirenMcpServer(deps: McpDeps): McpServer {
   const server = new McpServer(
     { name: 'siren-voice', version: deps.version },
-    { capabilities: { tools: {} } }
+    { capabilities: { tools: {}, resources: {} } }
   );
+  registerVoicePlayerResource(server);
   registerSpeakTool(server, deps);
   registerTranscribeTool(server, deps);
   registerGetVoiceTool(server, deps);
@@ -44,6 +46,7 @@ export function registerMcpRoute(app: FastifyInstance, deps: McpDeps): void {
         await reply.code(405).send({ error: 'method_not_allowed', hint: 'POST JSON-RPC only (stateless)' });
         return;
       }
+      logMcpEnvelope(deps.logger, request.body, request.headers['user-agent']);
       reply.hijack();
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -64,4 +67,43 @@ export function registerMcpRoute(app: FastifyInstance, deps: McpDeps): void {
       }
     }
   });
+}
+
+/**
+ * MCP App 兼容诊断：只记录协议方法和非敏感的 UI 路由信息。
+ * 不记录 tool arguments、文本、Authorization、签名 URL 或其他用户内容。
+ */
+function logMcpEnvelope(logger: Logger, body: unknown, userAgent: string | undefined): void {
+  const messages = Array.isArray(body) ? body : [body];
+  for (const raw of messages) {
+    if (!raw || typeof raw !== 'object') continue;
+    const message = raw as {
+      method?: unknown;
+      params?: {
+        name?: unknown;
+        uri?: unknown;
+        capabilities?: { extensions?: Record<string, unknown> };
+      };
+    };
+    if (typeof message.method !== 'string') continue;
+
+    const fields: Record<string, unknown> = {
+      method: message.method,
+      user_agent: userAgent ?? null
+    };
+    if (message.method === 'tools/call' && typeof message.params?.name === 'string') {
+      fields.tool = message.params.name;
+    }
+    if (message.method === 'resources/read' && typeof message.params?.uri === 'string') {
+      fields.resource = message.params.uri.startsWith('ui://') ? message.params.uri : '<non-ui-resource>';
+    }
+    if (message.method === 'initialize') {
+      const ui = message.params?.capabilities?.extensions?.['io.modelcontextprotocol/ui'] as
+        | { mimeTypes?: unknown }
+        | undefined;
+      fields.ui_extension = Boolean(ui);
+      fields.ui_mime_types = Array.isArray(ui?.mimeTypes) ? ui.mimeTypes : [];
+    }
+    logger.info('mcp_request', fields);
+  }
 }

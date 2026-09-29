@@ -32,12 +32,42 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
       expect(payload.voice_message_id).toBeTruthy();
       expect(String(payload.audio_url)).toContain('/v1/assets/');
       expect(Number(payload.duration_ms)).toBeGreaterThan(0);
+      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.audio_url).toBe(payload.audio_url);
+      expect((result as { _meta?: Record<string, unknown> })._meta?.['openai/outputTemplate']).toBe(
+        'ui://siren/voice-player-v1.html'
+      );
       // 幂等：重复调用同一 message_id
       const again = await client.callTool({
         name: 'voice_speak',
         arguments: { text: '你，我在。', conversation_id: 'conv-mcp', message_id: 'mcp-msg-1' }
       });
       expect(toolPayload(again as never).voice_message_id).toBe(payload.voice_message_id);
+    } finally {
+      await close();
+    }
+  });
+
+  it('暴露标准 MCP App 语音播放器 resource', async () => {
+    const bundle = buildTestVoice();
+    const server = createSirenMcpServer({
+      voice: bundle.voice,
+      store: bundle.store,
+      logger: silentLogger,
+      version: 'test'
+    });
+    const { client, close } = await connectMcpClient(server);
+    try {
+      const resources = await client.listResources();
+      const player = resources.resources.find((item) => item.uri === 'ui://siren/voice-player-v1.html');
+      expect(player?.mimeType).toBe('text/html;profile=mcp-app');
+      const read = await client.readResource({ uri: 'ui://siren/voice-player-v1.html' });
+      const content = read.contents[0] as { text?: string; mimeType?: string; _meta?: Record<string, unknown> };
+      expect(content.mimeType).toBe('text/html;profile=mcp-app');
+      expect(content.text).toContain('ui/initialize');
+      expect(content.text).toContain('ui/notifications/tool-result');
+      expect(content.text).toContain('ui/notifications/size-changed');
+      expect(content.text).toContain('openai:set_globals');
+      expect(content.text).toContain('JSON.parse');
     } finally {
       await close();
     }

@@ -4,6 +4,7 @@ import { voiceSpeakInputSchema } from '@siren/contracts';
 import type { Logger } from '@siren/telemetry';
 import type { VoiceService } from '@siren/voice-core';
 import { serializeAsset } from '../../routes/voice-message.ts';
+import { VOICE_PLAYER_TOOL_META } from '../voice-player.ts';
 
 export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService; logger: Logger }): void {
   server.registerTool(
@@ -21,7 +22,8 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
         message_id: voiceSpeakInputSchema.shape.message_id,
         language: voiceSpeakInputSchema.shape.language,
         speed: voiceSpeakInputSchema.shape.speed
-      }
+      },
+      _meta: VOICE_PLAYER_TOOL_META
     },
     async (args) => {
       const parsed = voiceSpeakInputSchema.safeParse(args);
@@ -43,18 +45,22 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           language: parsed.data.language
         });
         deps.logger.info('mcp_tool_called', { tool: 'voice_speak', voice_message_id: asset.id });
+        const payload = {
+          voice_message_id: asset.id,
+          audio_url: asset.audioUrl,
+          duration_ms: asset.durationMs,
+          format: asset.audioFormat,
+          text: asset.text ?? parsed.data.text
+        };
         return {
+          structuredContent: payload,
           content: [
             {
               type: 'text',
-              text: JSON.stringify({
-                voice_message_id: asset.id,
-                audio_url: asset.audioUrl,
-                duration_ms: asset.durationMs,
-                format: asset.audioFormat
-              })
+              text: JSON.stringify(payload)
             }
-          ]
+          ],
+          _meta: VOICE_PLAYER_TOOL_META
         };
       } catch (error) {
         deps.logger.warn('mcp_tool_failed', { tool: 'voice_speak', error_message: (error as Error).message });
