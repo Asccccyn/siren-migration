@@ -1,18 +1,25 @@
 import { mkdtemp, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
-import { cleanupTmpDir, removeTmpFile, saveBufferToTmp } from '../apps/server/src/tmp-files.ts';
+import { cleanupTmpDir, removeTmpFile, savePartStreamToTmp } from '../apps/server/src/tmp-files.ts';
 
 describe('临时文件管理（规范第 33 节）', () => {
-  it('UUID 文件名保存 / 删除', async () => {
+  it('UUID 文件名流式保存 / 删除', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'siren-tmp-'));
-    const path = await saveBufferToTmp(dir, Buffer.from('hello'), 'webm');
+    const { path } = await savePartStreamToTmp(
+      dir,
+      Readable.from([Buffer.from('hello')]),
+      1024 * 1024,
+      '.webm'
+    );
+    expect(path).toBeTruthy();
     expect(path).toContain(dir);
     expect(path).not.toContain('hello'); // 内容不进入文件名
     expect(path).toMatch(/[0-9a-f-]{36}\.webm$/); // UUID 命名
-    await removeTmpFile(path);
-    await expect(stat(path)).rejects.toThrow();
+    await removeTmpFile(path as string);
+    await expect(stat(path as string)).rejects.toThrow();
   });
 
   it('启动清理：只删除超龄文件', async () => {

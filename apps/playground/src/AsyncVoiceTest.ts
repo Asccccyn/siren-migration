@@ -3,10 +3,12 @@
  * 录音（MediaRecorder WebM/Opus）→ POST /v1/voice/transcribe → transcript；
  * 文字 → POST /v1/voice/synthesize → 播放。
  */
-export {};
+import { getStoredToken, requireToken } from './login-gate.ts';
+
+requireToken();
 
 function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('siren_token') ?? '';
+  const token = getStoredToken();
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 

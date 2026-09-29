@@ -73,6 +73,13 @@ export class LocalObjectStore implements ObjectStore {
     }
   }
 
+  /** 供本地资产代理构造 Content-Length / Range 响应。 */
+  async size(key: string): Promise<number> {
+    const s = await stat(this.pathFor(key));
+    if (!s.isFile()) throw new Error(`object is not a file: ${JSON.stringify(key)}`);
+    return s.size;
+  }
+
   async signedUrl(key: string, ttlSeconds: number): Promise<string> {
     assertValidObjectKey(key);
     const expires = Math.floor(Date.now() / 1000) + ttlSeconds;
@@ -82,7 +89,7 @@ export class LocalObjectStore implements ObjectStore {
   }
 
   /** 供 REST 代理路由安全读取文件流 */
-  openStream(key: string): ReturnType<typeof createReadStream> {
-    return createReadStream(this.pathFor(key));
+  openStream(key: string, range?: { start?: number; end?: number }): ReturnType<typeof createReadStream> {
+    return createReadStream(this.pathFor(key), range);
   }
 }

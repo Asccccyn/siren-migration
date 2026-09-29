@@ -155,6 +155,28 @@ describe('UtteranceUplink（P0-1 pre-roll / P0-2 本地 barge-in）', () => {
     expect(h.frames.length).toBeGreaterThan(0);
   });
 
+  it('F19：PTT 每轮收尾 flush 分帧残余，第二轮不混入上一轮样本', () => {
+    const h = buildHarness();
+    h.uplink.setMode('ptt');
+    h.uplink.startPtt();
+    h.tick(new Float32Array(BLOCK).fill(0.5)); // 160 样本 = 半帧
+    h.uplink.endPtt();
+    // 残余作为末帧立即发出（旧行为：0 帧，残余滞留）
+    expect(h.frames.length).toBe(1);
+    const first = new Int16Array(h.frames[0]);
+    expect(first.length).toBe(BLOCK);
+    expect(first[0]).toBeGreaterThan(0);
+
+    h.uplink.startPtt();
+    h.tick(new Float32Array(BLOCK).fill(-0.5));
+    h.uplink.endPtt();
+    expect(h.frames.length).toBe(2);
+    const second = new Int16Array(h.frames[1]);
+    expect(second.length).toBe(BLOCK);
+    // 第二轮从自己的样本开始：没有串入上一轮的正样本残余
+    expect(second[0]).toBeLessThan(0);
+  });
+
   it('VAD 断句发送 end；PTT 模式直发', () => {
     const h = buildHarness();
     for (let i = 0; i < 6; i++) h.tick(SILENT);

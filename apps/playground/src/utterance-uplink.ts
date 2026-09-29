@@ -52,6 +52,7 @@ export class UtteranceUplink {
     if (this.mode === mode) return;
     if (this.sending) {
       this.sending = false;
+      this.flushFramerTail(); // F19：模式切换前把当前句残余发出
       this.deps.sendJson({ t: 'end' });
       this.deps.log?.('切换模式，结束当前 utterance -> end');
     }
@@ -65,6 +66,7 @@ export class UtteranceUplink {
       this.deps.preRoll.clear(); // 静音期间不积累，避免解除静音后送出旧音频
       if (this.sending) {
         this.sending = false;
+        this.flushFramerTail(); // F19：静音断句同样先发残余
         this.deps.sendJson({ t: 'end' });
       }
     }
@@ -112,6 +114,7 @@ export class UtteranceUplink {
   endPtt(): void {
     if (!this.sending) return;
     this.sending = false;
+    this.flushFramerTail(); // F19：PTT 结束把不满一帧的残余发出，不串入下一轮
     this.deps.sendJson({ t: 'end' });
     this.deps.log?.('PTT: end');
   }
@@ -145,6 +148,7 @@ export class UtteranceUplink {
     if (outcome.event !== 'end') return;
     if (!this.sending) return;
     this.sending = false;
+    this.flushFramerTail(); // F19：静音断句前发出尾帧残余
     this.deps.sendJson({ t: 'end' });
     this.deps.log?.(`VAD: 静音断句 -> end（spoken ${Math.round(outcome.spokenMs)}ms）`);
   }
@@ -152,6 +156,13 @@ export class UtteranceUplink {
   private sendFrames(samples: Float32Array): void {
     if (samples.length === 0) return;
     for (const frame of this.deps.framer.push(samples)) {
+      this.deps.sendFrame(frame);
+    }
+  }
+
+  /** utterance 收尾：framer 残余作为末帧直发（已是 PCM16 ArrayBuffer） */
+  private flushFramerTail(): void {
+    for (const frame of this.deps.framer.flush()) {
       this.deps.sendFrame(frame);
     }
   }

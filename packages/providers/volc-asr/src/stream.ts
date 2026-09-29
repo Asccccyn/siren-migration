@@ -73,11 +73,17 @@ export class VolcStreamAsrProvider implements StreamAsrProvider {
 
   private async connect(connectId: string): Promise<WebSocket> {
     return new Promise((resolve, reject) => {
+      // 新版控制台单一 API Key -> X-Api-Key 单头；旧版双件套 -> App-Key + Access-Key
+      const authHeaders: Record<string, string> = this.config.apiKey
+        ? { 'X-Api-Key': this.config.apiKey }
+        : {
+            'X-Api-App-Key': this.config.appId,
+            'X-Api-Access-Key': this.config.accessToken
+          };
       const socket = new WebSocket(this.config.wsUrl, {
         handshakeTimeout: this.config.connectTimeoutMs,
         headers: {
-          'X-Api-App-Key': this.config.appId,
-          'X-Api-Access-Key': this.config.accessToken,
+          ...authHeaders,
           'X-Api-Resource-Id': this.config.resourceId,
           'X-Api-Connect-Id': connectId
         }
@@ -96,6 +102,8 @@ class VolcAsrSession implements AsrStream {
   private pendingFinal: PendingFinal | null = null;
   private lastPartialText = '';
   private lastFinalText = '';
+  /** F13：已提交 definite 分句的 start_time 身份集合（代替文字后缀匹配去重） */
+  private readonly committedUtterances = new Set<string>();
   private feedBatch: Buffer[] = [];
   private feedBatchBytes = 0;
 
@@ -151,11 +159,17 @@ class VolcAsrSession implements AsrStream {
     this.cleanup();
   }
 
-  handleServerFrame(
-    frame:
-      | { kind: 'result'; sequence: number; payload: { result?: { text?: string; utterances?: { text?: string; definite?: boolean }[] } }; isLast: boolean }
-      | { kind: 'error'; code: number; message: string }
-  ): void {
+  handleServerFrame(frame: {
+    kind: 'result';
+    sequence: number;
+    payload: {
+      result?: {
+        text?: string;
+        utterances?: { text?: string; definite?: boolean; start_time?: number; end_time?: number }[];
+      };
+    };
+    isLast: boolean;
+  } | { kind: 'error'; code: number; message: string }): void {
     if (this.aborted) return;
     if (frame.kind === 'error') {
       const error = new ProviderError(
@@ -169,12 +183,19 @@ class VolcAsrSession implements AsrStream {
       return;
     }
     const utterances = frame.payload.result?.utterances ?? [];
-    // partial 可重复更新（覆盖式）；final（definite=true）只提交一次且不重复拼接
+    // partial 可重复更新（覆盖式）；final（definite=true）只提交一次且不重复拼接。
+    // F13：按 start_time 识别重传——两次真实说出的相同话语时间戳不同，都会保留；
+    // 服务端跨帧重发同一分句时 start_time 相同，只提交一次
     for (const utterance of utterances) {
-      if (utterance.definite && utterance.text) {
-        if (!this.lastFinalText.endsWith(utterance.text)) {
-          this.lastFinalText += utterance.text;
-        }
+      if (!utterance.definite || !utterance.text) continue;
+      if (typeof utterance.start_time === 'number') {
+        const key = `${utterance.start_time}|${utterance.text}`;
+        if (this.committedUtterances.has(key)) continue;
+        this.committedUtterances.add(key);
+        this.lastFinalText += utterance.text;
+      } else if (!this.lastFinalText.endsWith(utterance.text)) {
+        // 无时间戳兜底：沿用后缀防重（同帧/紧邻重发）
+        this.lastFinalText += utterance.text;
       }
     }
     const interim = frame.payload.result?.text ?? '';

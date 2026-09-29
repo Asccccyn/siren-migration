@@ -18,6 +18,8 @@
 export interface VolcAsrStreamConfig {
   appId: string;
   accessToken: string;
+  /** 新版控制台单一 API Key（设置后握手走 X-Api-Key 单头） */
+  apiKey?: string;
   /** 资源 ID，如 volc.bigasr.sauc.duration（Seed ASR 为 volc.seedasr.sauc.duration） */
   resourceId: string;
   /** 大模型流式端点：.../bigmodel（双向流式）| bigmodel_nostream | bigmodel_async */
@@ -83,8 +85,12 @@ export function buildFullRequest(
   requestId: string,
   options: { language?: string; uid?: string } = {}
 ): Buffer {
+  // v3 鉴权以握手 header 为准；首帧 app 字段为兼容保留——
+  // 新版 API Key 模式下以 key 作为调用方标识填充
+  const appIdentity = config.apiKey || config.appId;
+  const appSecret = config.apiKey || config.accessToken;
   const full: VolcAsrFullRequest = {
-    app: { appid: config.appId, token: config.accessToken },
+    app: { appid: appIdentity, token: appSecret },
     user: { uid: options.uid ?? 'siren' },
     audio: {
       format: 'pcm',
@@ -141,7 +147,7 @@ export type VolcAsrServerFrame =
   | { kind: 'result'; sequence: number; payload: VolcAsrResponse; isLast: boolean }
   | { kind: 'error'; code: number; message: string };
 
-/** 解析服务端下行帧 */
+/** 解析服务端下行帧（压缩方式按帧头 compression 半字节判断：1=gzip，0=不压缩） */
 export function decodeServerFrame(data: Buffer): VolcAsrServerFrame {
   if (data.length < 4) throw new Error('volc asr frame too short');
   const messageType = data[1] >> 4;
@@ -163,8 +169,10 @@ export function decodeServerFrame(data: Buffer): VolcAsrServerFrame {
   }
   const payloadSize = data.readUInt32BE(offset);
   offset += 4;
-  const compressed = data.subarray(offset, offset + payloadSize);
-  const json = gunzipSync(compressed).toString('utf8');
+  const payloadBytes = data.subarray(offset, offset + payloadSize);
+  // Seed-ASR 2.0 等新一代服务可能返回不压缩的 JSON 载荷（compression=0）
+  const compression = data[2] & 0x0f;
+  const json = (compression === COMPRESS_GZIP ? gunzipSync(payloadBytes) : payloadBytes).toString('utf8');
   return {
     kind: 'result',
     sequence,

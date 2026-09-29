@@ -42,10 +42,6 @@ export function newOutputStreamId(): string {
   return `out_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
 }
 
-function signalAborted(turn: ActiveTurn): boolean {
-  return turn.ttsAbort.signal.aborted;
-}
-
 /** 一轮通话的运行时状态（CallSession 创建，流水线读写音频相关字段） */
 export interface ActiveTurn {
   index: number;
@@ -107,6 +103,10 @@ export class ReplyPipeline {
     const style: VoiceStyle = resolveStyle(this.deps.profile);
     const splitter = new SentenceSplitter();
     const sentenceQueue = new AsyncQueue<{ sentence: string; eager: EagerIterable<PcmChunk> }>();
+    // F07：失败路径的取消信号——pipeline 出错时除 user abort 外也要终止在途 TTS，
+    // 否则已排队的句子继续在后台合成，浪费供应商配额
+    const failureAbort = new AbortController();
+    const ttsSignal: AbortSignal = AbortSignal.any([turn.ttsAbort.signal, failureAbort.signal]);
 
     // 生产者：core 句子 -> 预取的 TTS chunk 流（深度 1 的流水线）
     const producer = (async () => {
@@ -115,11 +115,11 @@ export class ReplyPipeline {
         for await (const sentence of streamSentences(deltas, splitter)) {
           turn.fullText += sentence;
           turn.metrics.mark('first_sentence_ready');
-          while (sentenceQueue.size >= 2 && !turn.aborted) {
+          while (sentenceQueue.size >= 2 && !turn.aborted && !sentenceQueue.closed) {
             await sentenceQueue.waitForDrain(1);
           }
-          if (turn.aborted) break;
-          const eager = new EagerIterable(() => this.synthSentenceToPcm(turn, sentence, style));
+          if (turn.aborted || sentenceQueue.closed) break;
+          const eager = new EagerIterable(() => this.synthSentenceToPcm(turn, sentence, style, ttsSignal));
           // 真实预取（审计修复）：句子进入队列即开始 TTS，
           // 上一句播放期间下一句已在合成，而不是等消费者迭代才启动
           eager.start();
@@ -144,11 +144,12 @@ export class ReplyPipeline {
       }
       await producer;
     } catch (error) {
+      // F07 错误路径必须按序解锁：先关队列（唤醒卡在 waitForDrain 的生产者）、
+      // 再取消在途 TTS、最后才 await 生产者——任何颠倒都会重新互等
+      sentenceQueue.close();
+      failureAbort.abort();
       if (error instanceof TurnAbortedError || turn.aborted) {
-        // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发。
-        // 关闭队列把可能停在 waitForDrain 的生产者放出（其循环会因 turn.aborted 退出），
-        // 避免生产者协程永久挂起（审计修复）
-        sentenceQueue.close();
+        // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发
         return { status: 'aborted' };
       }
       await producer.catch(() => undefined);
@@ -176,12 +177,16 @@ export class ReplyPipeline {
     })();
   }
 
-  /** 单句合成：流式优先，失败回退批量 PCM（规范第 40 节降级链） */
+  /** 单句合成：流式优先，失败回退批量 PCM（规范第 40 节降级链）。
+   * F12：降级只在句子尚未输出任何音频时进行——流式已下发前缀后再批量合成
+   * 整句会重播句首，此时按 tts_failed 失败处理，保留已播出内容 */
   private async *synthSentenceToPcm(
     turn: ActiveTurn,
     sentence: string,
-    style: VoiceStyle
+    style: VoiceStyle,
+    signal: AbortSignal
   ): AsyncGenerator<PcmChunk> {
+    if (signal.aborted) throw new TurnAbortedError();
     const request = {
       text: sentence,
       profile: this.deps.profile,
@@ -190,20 +195,29 @@ export class ReplyPipeline {
       sampleRate: REALTIME_OUTPUT_SAMPLE_RATE,
       language: this.deps.profile.language
     };
+    let emitted = false;
     try {
-      for await (const chunk of this.deps.tts.synthesizeStream(request, turn.ttsAbort.signal)) {
+      for await (const chunk of this.deps.tts.synthesizeStream(request, signal)) {
         if (turn.aborted) throw new TurnAbortedError();
         turn.metrics.mark('tts_first_chunk');
+        emitted = true;
         yield { audio: chunk.audio, sampleRate: chunk.sampleRate };
       }
       return;
     } catch (error) {
       // provider 被 abort 时上游抛错：翻译成本轮取消信号
-      if (turn.aborted || signalAborted(turn)) throw new TurnAbortedError();
+      if (turn.aborted || signal.aborted) throw new TurnAbortedError();
       if (error instanceof TurnAbortedError) throw error;
       if (!(error instanceof ProviderError)) throw error;
+      if (emitted) {
+        this.log.warn('tts_stream_failed_after_partial_audio', {
+          turn_index: turn.index,
+          sentence_len: sentence.length
+        });
+        throw new ProviderError('tts_failed', 'reply-pipeline', 'tts stream failed after partial audio emitted');
+      }
     }
-    // 降级：Batch TTS（按 provider 返回的真实采样率）
+    // 降级：Batch TTS（按 provider 返回的真实采样率）；仅零输出句子可整句重来
     this.log.warn('tts_stream_fallback_batch', { turn_index: turn.index, sentence_len: sentence.length });
     const result = await this.deps.tts.synthesize(request);
     turn.metrics.mark('tts_first_chunk');

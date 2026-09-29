@@ -91,4 +91,58 @@ describe('ElevenLabs 格式映射（P1-2）', () => {
     }).rejects.toThrow();
     abortSpy.mockRestore();
   });
+
+  it('F17：speed 传官方 voice_settings.speed（0.7–1.2），不再误写 stability', async () => {
+    const bodies: unknown[] = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input: unknown, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(new Uint8Array(480 * 2), { status: 200 });
+    });
+
+    await provider().synthesize({ ...request('pcm', 24000), style: { emotion: 'warm', speed: 0.7 } });
+    await provider().synthesize({ ...request('pcm', 24000), style: { emotion: 'warm', speed: 1.5 } });
+    spy.mockRestore();
+
+    const first = bodies[0] as { voice_settings: Record<string, number> };
+    const second = bodies[1] as { voice_settings: Record<string, number> };
+    // speed=0.7 落在允许区间：原样传 speed；stability 保持情绪预设（warm=0.55）
+    expect(first.voice_settings.speed).toBe(0.7);
+    expect(first.voice_settings.stability).toBe(0.55);
+    // 超出官方区间（0.7–1.2）静默收敛到边界，而不是覆盖 stability
+    expect(second.voice_settings.speed).toBe(1.2);
+    expect(second.voice_settings.stability).toBe(0.55);
+  });
+
+  it('F16：网络故障（fetch rejection / reader 异常）归类为 ProviderError tts_failed，不再透传 TypeError', async () => {
+    const netFail = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new TypeError('fetch failed');
+    });
+    // 批量路径
+    await expect(provider().synthesize(request('pcm', 24000))).rejects.toMatchObject({
+      name: 'ProviderError',
+      code: 'tts_failed'
+    });
+    // 流式路径
+    await expect(async () => {
+      for await (const _chunk of provider().synthesizeStream(request('pcm', 24000))) void _chunk;
+    }).rejects.toMatchObject({ name: 'ProviderError', code: 'tts_failed' });
+    netFail.mockRestore();
+
+    // reader 中途异常（body 半途损坏）同样归类
+    const brokenBody = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(480 * 2));
+            controller.error(new Error('stream broken'));
+          }
+        }),
+        { status: 200 }
+      )
+    );
+    await expect(async () => {
+      for await (const _chunk of provider().synthesizeStream(request('pcm', 24000))) void _chunk;
+    }).rejects.toMatchObject({ name: 'ProviderError', code: 'tts_failed' });
+    brokenBody.mockRestore();
+  });
 });

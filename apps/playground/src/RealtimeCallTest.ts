@@ -15,14 +15,17 @@ import { StreamRouter } from './stream-router.ts';
 import { UtteranceUplink } from './utterance-uplink.ts';
 import { AudioPreRollBuffer } from './pre-roll-buffer.ts';
 import { Float32Resampler, Pcm16Framer } from './uplink-encoder.ts';
+import { getStoredToken, requireToken } from './login-gate.ts';
 import { ui, setBadge, logEvent, renderMetrics } from './ui.ts';
 import { setupCapture as setupCaptureModule, type CapturePipeline } from './capture-worklet.ts';
+
+requireToken();
 
 const PRE_ROLL_MS = 400; // P0-1：16kHz 下 6400 samples
 const PROTOCOL_VERSION = 2;
 
 function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('siren_token') ?? '';
+  const token = getStoredToken();
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
@@ -33,6 +36,8 @@ let player: JitteredPcmPlayer | null = null;
 let router: StreamRouter | null = null;
 let uplink: UtteranceUplink | null = null;
 let resampler: Float32Resampler | null = null;
+/** F18：通话代数——挂断后迟到的 getUserMedia 结果直接释放，不复活已 teardown 的采集 */
+let captureGeneration = 0;
 let serverState = 'idle';
 let serverProtocol = 0;
 let muted = false;
@@ -140,7 +145,14 @@ async function connectSocket(wsUrl: string, token: string): Promise<void> {
 }
 
 async function setupCapture(): Promise<void> {
-  capture = await setupCaptureModule((samples) => handleCapturedSamples(samples));
+  const generation = captureGeneration;
+  const pipeline = await setupCaptureModule((samples) => handleCapturedSamples(samples));
+  if (generation !== captureGeneration) {
+    // F18：挂断/换通话发生在授权等待期间——迟到的采集立即释放
+    await pipeline.dispose().catch(() => undefined);
+    return;
+  }
+  capture = pipeline;
   player = new JitteredPcmPlayer(
     capture.context,
     jitterBufferMs,
@@ -276,6 +288,7 @@ ui.stateBadge.addEventListener('click', () => {
 });
 
 function teardown(): void {
+  captureGeneration++;
   uplink?.reset();
   router?.reset();
   player?.stopAll();
@@ -283,8 +296,8 @@ function teardown(): void {
   router = null;
   uplink = null;
   resampler = null;
-  capture?.worklet.disconnect();
-  void capture?.context.close().catch(() => undefined);
+  // F18：统一 dispose——停止全部麦克风轨道（track.stop），不只断 worklet
+  void capture?.dispose().catch(() => undefined);
   capture = null;
   serverState = 'idle';
   ui.muteBtn.disabled = true;

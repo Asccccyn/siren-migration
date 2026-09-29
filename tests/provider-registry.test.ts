@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import { MockCoreBridge } from '@siren/core-bridge';
-import { buildProviders, loadConfig, assertProductionReadiness } from '@siren/voice-core';
+import {
+  buildProviders,
+  loadConfig,
+  assertProductionReadiness,
+  packageBidirectionalPcmForBatch
+} from '@siren/voice-core';
 import { silentLogger } from './helpers.ts';
 
 describe('Provider 注册与生产守卫（规范第 47 节）', () => {
@@ -107,5 +112,21 @@ describe('Provider 注册与生产守卫（规范第 47 节）', () => {
     expect(bundle.asr).toBeInstanceOf(MockAsrProvider);
     expect(bundle.asyncTts).toBeInstanceOf(MockTtsProvider);
     expect(bundle.core).toBeInstanceOf(MockCoreBridge);
+  });
+
+  it('双向 TTS 聚合：PCM 不能伪装成 mp3，容器请求统一封装 WAV', () => {
+    const pcm = Buffer.alloc(24_000 * 2); // 1 秒，PCM16 mono @ 24kHz
+    pcm.writeInt16LE(1234, 128);
+
+    const requestedMp3 = packageBidirectionalPcmForBatch(pcm, 24_000, 'mp3');
+    expect(requestedMp3.format).toBe('wav');
+    expect(requestedMp3.durationMs).toBe(1000);
+    expect(requestedMp3.audio.toString('ascii', 0, 4)).toBe('RIFF');
+    expect(requestedMp3.audio.toString('ascii', 8, 12)).toBe('WAVE');
+
+    const requestedPcm = packageBidirectionalPcmForBatch(pcm, 24_000, 'pcm');
+    expect(requestedPcm.format).toBe('pcm');
+    expect(requestedPcm.durationMs).toBe(1000);
+    expect(requestedPcm.audio.equals(pcm)).toBe(true);
   });
 });

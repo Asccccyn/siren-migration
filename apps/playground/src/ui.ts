@@ -1,5 +1,6 @@
 /**
  * Realtime 页面的 DOM 引用与渲染（只做展示，不含任何逻辑状态）。
+ * 登录门在 RealtimeCallTest.ts 入口统一调用（login-gate）。
  */
 export const ui = {
   stateBadge: document.getElementById('stateBadge') as HTMLSpanElement,

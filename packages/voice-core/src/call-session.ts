@@ -147,8 +147,15 @@ export class CallSession {
     if (this.closed || this.closing) return;
     this.closing = true;
     try {
+      const turn = this.turn;
       this.abortTurn(`destroy:${reason}`);
       this.clearPendingDrain('destroy');
+      if (turn && !turn.written && (turn.userText || turn.fullText || this.lastPartialText)) {
+        // F10：销毁（断线/背压/关停）不丢当前轮——已识别/已产出内容的轮次幂等落库；
+        // ending 阶段仅有 partial 时也保留（文字不丢），outcome 记 interrupted
+        turn.userText = turn.userText || this.lastPartialText;
+        this.writeTurn(turn, 'interrupted');
+      }
       this.stateMachine.forceEnded();
       this.deps.sessionsRepo?.markEnded(this.deps.callId, Date.now(), 'ended');
       this.log.info('call_ended', { reason });
@@ -201,7 +208,7 @@ export class CallSession {
       this.stateMachine.transition('listening');
     }
     this.turnIndex++;
-    this.turn = {
+    const turn: ActiveTurn = {
       index: this.turnIndex,
       turnId: randomUUID(),
       outputStreamId: newOutputStreamId(),
@@ -210,6 +217,8 @@ export class CallSession {
       asr: createAsrSession(
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
         (text) => {
+          // F09：旧 turn 的迟到 partial 不得写入共享 lastPartialText / 转发给客户端
+          if (this.turn !== turn || this.closed) return;
           this.lastPartialText = text;
           this.sendJson({ t: 'partial', text });
         },
@@ -226,6 +235,7 @@ export class CallSession {
       pcmStarted: false,
       written: false
     };
+    this.turn = turn;
     // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）
     void this.turn.asr.connect().catch(() => undefined);
     this.sendJson({ t: 'state', state: 'listening' });
@@ -265,7 +275,8 @@ export class CallSession {
   private async adoptTranscript(turn: ActiveTurn): Promise<string | null> {
     const outcome = await adoptTranscript(turn.asr, {
       graceMs: this.deps.config.partialGraceMs,
-      lastPartialText: this.lastPartialText
+      // F08：传 getter——grace 到期时读的是等待期间持续更新的最新 partial
+      getLatestPartial: () => (this.turn === turn ? this.lastPartialText : '')
     });
     if (outcome.kind === 'error') {
       if (turn.aborted || this.turn !== turn || this.closed) return null; // 已被 abort 接管

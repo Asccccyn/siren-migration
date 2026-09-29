@@ -37,7 +37,11 @@ export type TranscriptAdoption =
 /** 采纳识别结果：end() 与 grace 计时赛跑；失败显式上抛 */
 export async function adoptTranscript(
   session: PrebufferedAsrSession,
-  options: { graceMs: number; lastPartialText: string }
+  options: {
+    graceMs: number;
+    /** F08：grace 到期时读取当前最新 partial——传快照会丢掉等待期间到达的新 partial */
+    getLatestPartial: () => string;
+  }
 ): Promise<TranscriptAdoption> {
   const endPromise = session.end().then(
     (result) => ({ kind: 'final' as const, result }),
@@ -49,5 +53,5 @@ export async function adoptTranscript(
   const outcome = await Promise.race([endPromise, gracePromise]);
   if (outcome.kind === 'error') return { kind: 'error', error: outcome.error };
   if (outcome.kind === 'final') return { kind: 'final', text: outcome.result.text.trim() };
-  return { kind: 'grace', text: options.lastPartialText.trim() };
+  return { kind: 'grace', text: options.getLatestPartial().trim() };
 }

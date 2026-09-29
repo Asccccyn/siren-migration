@@ -26,16 +26,28 @@ export class PrebufferedAsrSession implements AsrStream {
     if (this.readyPromise) return this.readyPromise;
     this.readyPromise = (async () => {
       try {
-        this.session = await this.provider.createStream(this.options, {
+        const session = await this.provider.createStream(this.options, {
           onPartial: (text) => this.handlers.onPartial?.(text),
           onError: (error) => {
             this.sessionError = this.sessionError ?? error;
             this.handlers.onError?.(error);
           }
         });
+        if (this.aborted) {
+          // F09：建连途中被 abort——迟到的 ASR 连接立即关闭并丢弃，
+          // 否则它会保持打开并继续回吐已取消轮次的 partial
+          try {
+            session.abort();
+          } catch {
+            // 已关闭
+          }
+          return;
+        }
+        this.session = session;
       } catch (error) {
         this.sessionError = error;
         this.handlers.onError?.(error);
+        return;
       }
       this.flushPrebuffer();
       for (const waiter of this.readyWaiters.splice(0)) waiter();

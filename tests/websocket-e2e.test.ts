@@ -104,10 +104,13 @@ describe('实时通话 WebSocket e2e', () => {
         socket.once('error', reject);
       });
 
+      // 声明 playback_drain 能力但不 ACK：服务端 pcm_end 后保持 speaking 等待
+      socket.send(JSON.stringify({ t: 'ready', capabilities: { playback_drain: true } }));
       socket.send(JSON.stringify({ t: 'start' }));
       socket.send(Buffer.alloc(3200, 1));
       socket.send(JSON.stringify({ t: 'end' }));
-      await waitFor(() => frames.texts.some((m) => m.t === 'pcm'));
+      // 审计修复（同步竞争）：drain 门控让 abort 落在确定性的 speaking 窗口内，
+      // 不再依赖 Mock TTS 的输出节奏与 10ms 轮询的相对时序
       socket.send(JSON.stringify({ t: 'abort' }));
 
       await waitFor(() => frames.texts.some((m) => m.t === 'interrupted'));

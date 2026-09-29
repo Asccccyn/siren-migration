@@ -15,6 +15,7 @@ import { ElevenLabsTtsProvider } from '@siren/provider-elevenlabs';
 import { MockAsrProvider, MockTtsProvider } from '@siren/provider-mock';
 import { VolcBatchAsrProvider, VolcStreamAsrProvider } from '@siren/provider-volc-asr';
 import { VolcBatchTtsProvider, VolcBidirectionalTtsProvider } from '@siren/provider-volc-tts';
+import { buildWav, pcmDurationMs } from '@siren/audio';
 import type { ObjectStore } from '@siren/storage';
 import { LocalObjectStore, MemoryObjectStore, R2ObjectStore } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
@@ -42,14 +43,17 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
   // --- ASR ---
   let asr: AsrProvider;
   let asrName = config.providers.asr;
-  const volcAsrReady = Boolean(config.volc.appId && config.volc.accessToken);
+  // 新版控制台单一 API Key（VOLC_API_KEY）与旧版双件套任一齐备即算就绪
+  const volcAsrReady = Boolean(
+    (config.volc.appId && config.volc.accessToken) || config.volc.apiKey
+  );
   if (asrName === 'mock') {
     assertMockAllowed(isProd, 'ASR_PROVIDER');
     asr = new MockAsrProvider();
   } else if (asrName === 'volc' && volcAsrReady) {
     asr = compositeVolcAsr(config);
   } else if (asrName === 'volc' && !volcAsrReady) {
-    if (isProd) throw new Error('VOLC_APP_ID / VOLC_ACCESS_TOKEN 未配置，生产环境禁止回退 mock');
+    if (isProd) throw new Error('VOLC_API_KEY 或 VOLC_APP_ID/VOLC_ACCESS_TOKEN 未配置，生产环境禁止回退 mock');
     warnings.push('火山 ASR 凭据缺失，开发环境回退 MockAsrProvider');
     asrName = 'mock(dev-fallback)';
     asr = new MockAsrProvider();
@@ -89,19 +93,20 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
         warnings.push('火山 TTS 凭据缺失，开发环境回退 MockTtsProvider');
         return { tts: new MockTtsProvider(), name: 'mock(dev-fallback)' };
       }
-      const batch = new VolcBatchTtsProvider({
-        appId: config.volc.appId,
-        accessToken: config.volc.accessToken,
-        cluster: config.volc.ttsCluster,
-        endpointUrl: config.volc.ttsUrl,
-        timeoutMs: config.volc.httpTimeoutMs
-      });
-      if (forRealtime) {
-        // 实时链路：火山 v3 双向流式 WebSocket（真 provider-level streaming，P0-9）
-        const bidirectional = new VolcBidirectionalTtsProvider(
+      const makeBatch = (): VolcBatchTtsProvider =>
+        new VolcBatchTtsProvider({
+          appId: config.volc.appId,
+          accessToken: config.volc.accessToken,
+          cluster: config.volc.ttsCluster,
+          endpointUrl: config.volc.ttsUrl,
+          timeoutMs: config.volc.httpTimeoutMs
+        });
+      const makeBidirectional = (): VolcBidirectionalTtsProvider =>
+        new VolcBidirectionalTtsProvider(
           {
             appId: config.volc.appId,
             accessToken: config.volc.accessToken,
+            apiKey: config.volc.apiKey || undefined,
             resourceId: config.volc.ttsResourceId,
             wsUrl: config.volc.ttsWsUrl,
             connectTimeoutMs: config.volc.httpTimeoutMs,
@@ -109,15 +114,33 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
           },
           logger
         );
+      if (forRealtime) {
+        // 实时链路：v3 双向流式为主，批量兜底（降级链规范第 40 节）。
+        // apiKey 账号没有 v1 批量端点权限——兜底同样用双向流式聚合（审计 F-A 修复）
+        const bidirectional = makeBidirectional();
+        disposeHooks.push(() => bidirectional.dispose());
+        let fallback: BatchTtsProvider;
+        if (config.volc.apiKey) {
+          const fallbackBidi = makeBidirectional();
+          disposeHooks.push(() => fallbackBidi.dispose());
+          fallback = aggregateBidiAsBatch(fallbackBidi);
+        } else {
+          fallback = makeBatch();
+        }
         const realtime: TtsProvider = {
-          synthesize: (request) => batch.synthesize(request),
+          synthesize: (request) => fallback.synthesize(request),
           synthesizeStream: (request, signal) => bidirectional.synthesizeStream(request, signal)
         };
-        disposeHooks.push(() => bidirectional.dispose());
         return { tts: realtime, name: 'volc' };
       }
-      // 异步链路：纯批量（BatchTtsProvider，异步语音只用 synthesize）
-      return { tts: batch, name: 'volc' };
+      if (config.volc.apiKey) {
+        // 新版 API Key 账号无 v1 批量端点权限：异步链路聚合双向流式实现 synthesize
+        const bidi = makeBidirectional();
+        disposeHooks.push(() => bidi.dispose());
+        return { tts: aggregateBidiAsBatch(bidi), name: 'volc(seed-2.0-bidi)' };
+      }
+      // 旧版双件套：纯批量（异步语音只用 synthesize）
+      return { tts: makeBatch(), name: 'volc' };
     }
     throw new Error(`不支持的 TTS provider: ${configured}`);
   };
@@ -196,10 +219,57 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
   };
 }
 
+/**
+ * 把双向流式 TTS 聚合成批量接口。
+ * 新版 API Key 账号没有 v1 批量端点权限，异步链路（语音消息合成）以
+ * 一次完整的双向流式会话等价实现 synthesize。
+ */
+function aggregateBidiAsBatch(bidi: VolcBidirectionalTtsProvider): BatchTtsProvider {
+  return {
+    synthesize: async (request) => {
+      const parts: Buffer[] = [];
+      let sampleRate = request.sampleRate ?? 24000;
+      for await (const chunk of bidi.synthesizeStream(request)) {
+        parts.push(chunk.audio);
+        sampleRate = chunk.sampleRate;
+      }
+      return packageBidirectionalPcmForBatch(Buffer.concat(parts), sampleRate, request.format);
+    }
+  };
+}
+
+/**
+ * 火山双向 TTS 的 session 输出固定是 PCM16 mono。
+ * 异步语音链路不能把这些字节“按请求格式”伪装成 mp3；否则文件扩展名、MIME、
+ * duration 都会一起错误，Safari/iOS 会直接判定媒体不可播放。
+ *
+ * - 请求 pcm：如实返回裸 PCM
+ * - 请求 wav / mp3 / 其他容器：封装成标准 WAV 并如实标记 format=wav
+ *
+ * 这里宁可发生“mp3 请求降级为 wav”，也绝不能返回伪 mp3。
+ */
+export function packageBidirectionalPcmForBatch(
+  pcm: Buffer,
+  sampleRate: number,
+  requestedFormat: string
+): { audio: Buffer; format: 'pcm' | 'wav'; sampleRate: number; durationMs: number } {
+  const durationMs = pcmDurationMs(pcm.length, sampleRate);
+  if (requestedFormat === 'pcm') {
+    return { audio: pcm, format: 'pcm', sampleRate, durationMs };
+  }
+  return {
+    audio: buildWav(pcm, sampleRate),
+    format: 'wav',
+    sampleRate,
+    durationMs
+  };
+}
+
 function compositeVolcAsr(config: SirenConfig): AsrProvider {
   const batch = new VolcBatchAsrProvider({
     appId: config.volc.appId,
     accessToken: config.volc.accessToken,
+    apiKey: config.volc.apiKey || undefined,
     resourceId: config.volc.asrBatchResourceId,
     endpointUrl: config.volc.asrBatchUrl,
     timeoutMs: config.volc.httpTimeoutMs
@@ -207,6 +277,7 @@ function compositeVolcAsr(config: SirenConfig): AsrProvider {
   const stream = new VolcStreamAsrProvider({
     appId: config.volc.appId,
     accessToken: config.volc.accessToken,
+    apiKey: config.volc.apiKey || undefined,
     resourceId: config.volc.asrCluster,
     wsUrl: config.volc.asrWsUrl,
     sampleRate: 16000,

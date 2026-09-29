@@ -95,4 +95,30 @@ describe('Core Bridge', () => {
       server.close();
     }
   });
+
+  it('F11：超时不是正常完成——半途截断的流必须抛 core_timeout，不得静默返回', async () => {
+    // 先给一条 delta，然后服务端停住不结束：超时发生在已有部分文本之后
+    const server = createServer((request, response) => {
+      request.on('data', () => undefined);
+      response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      response.write(JSON.stringify({ type: 'delta', text: '半截' }) + '\n');
+      // 不 end()：连接悬挂直到测试结束
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const bridge = new HttpCoreBridge({ baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 120, logger: silentLogger });
+    try {
+      const collected: string[] = [];
+      await expect(
+        (async () => {
+          for await (const delta of bridge.streamReply({ callId: 'call', turnId: 't6', text: 'hi', modality: 'voice_call' })) {
+            collected.push(delta.text);
+          }
+        })()
+      ).rejects.toMatchObject({ code: 'core_timeout' });
+      expect(collected).toEqual(['半截']); // 超时前的数据不丢，但绝不能被当成功收尾
+    } finally {
+      server.close();
+    }
+  });
 });

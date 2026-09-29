@@ -161,6 +161,97 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     await waitFor(() => harness.session.state === 'listening');
   });
 
+  it('F07：6 句回复 + TTS 全失败——生产者/消费者不死锁，错误收尾回 listening', async () => {
+    const tts = new MockTtsProvider();
+    tts.faults = { failStream: true, failBatch: true };
+    // 6 句让 sentenceQueue 达到深度 2 的背压窗口（死锁触发条件）
+    const harness = buildSessionHarness({
+      tts,
+      core: new MockCoreBridge({
+        reply: '一句。二句。三句。四句。五句。六句。七句。八句。',
+        intervalMs: 1,
+        charsPerDelta: 1
+      })
+    });
+    harness.session.handleMessage({ t: 'start' });
+    harness.session.handleBinary(Buffer.alloc(3200, 1));
+    harness.session.handleMessage({ t: 'end' });
+    // waitFor 带 5s 超时：若互等（F07 旧缺陷）这里直接超时失败
+    await waitFor(() => harness.texts().some((m) => m.t === 'error' && m.code === 'tts_failed'));
+    await waitFor(() => harness.texts().some((m) => m.t === 'reply'));
+    await waitFor(() => harness.session.state === 'listening');
+    // 文字不丢：完整回复文本已下发
+    const reply = harness.texts().find((m) => m.t === 'reply') as { text?: string };
+    expect((reply?.text ?? '').length).toBeGreaterThan(0);
+  });
+
+  it('F12：流式已下发部分音频后再失败——不整句降级重播，按 tts_failed 收尾', async () => {
+    const tts = new MockTtsProvider();
+    tts.faults = { failStream: true, failStreamAfterChunks: 1, failBatch: false }; // batch 可用
+    const harness = buildSessionHarness({
+      tts,
+      core: new MockCoreBridge({ reply: '只有一句话。', intervalMs: 1, charsPerDelta: 2 })
+    });
+    harness.session.handleMessage({ t: 'start' });
+    harness.session.handleBinary(Buffer.alloc(3200, 1));
+    harness.session.handleMessage({ t: 'end' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'error' && m.code === 'tts_failed'));
+    await waitFor(() => harness.session.state === 'listening');
+    // 只允许出现已播出的 1 个 pcm 头；旧行为会 batch 重合成整句（几十帧）重播句首
+    const pcmCount = harness.texts().filter((m) => m.t === 'pcm').length;
+    expect(pcmCount).toBe(1);
+    // batch 未被调用（部分输出后不再降级）
+    expect(tts.calls.batchCount).toBe(0);
+  });
+
+  it('F08：grace 采纳等待期间到达的最新 partial（不是 end 时刻的快照）', async () => {
+    const harness = buildSessionHarness({
+      asr: new MockAsrProvider({ partials: ['你', '你好世界'], final: '迟到的 final。', finalDelayMs: 200 }),
+      config: testConfig({ PARTIAL_GRACE_MS: '30' })
+    });
+    harness.session.handleMessage({ t: 'start' });
+    harness.session.handleBinary(Buffer.alloc(3200, 1)); // 触发第 1 个 partial
+    harness.session.handleMessage({ t: 'end' }); // 剩余 partial 在 end() 内到达，落在 grace 窗口中
+    await waitFor(() => harness.texts().some((m) => m.t === 'asr'));
+    const asr = harness.texts().find((m) => m.t === 'asr') as { text?: string };
+    expect(asr?.text).toBe('你好世界'); // 旧实现的调用点快照只有 '你'
+    await waitFor(() => harness.session.state === 'listening');
+  });
+
+  it('F10：speaking 中途 destroy——当前轮幂等落库（interrupted），不随连接丢失', async () => {
+    const db = openDatabase(':memory:');
+    const turnsRepo = new CallTurnsRepository(db);
+    const sessionsRepo = new CallSessionsRepository(db);
+    sessionsRepo.insert({
+      id: 'call-test-1',
+      conversation_id: 'conv-f10',
+      voice_profile: 'main',
+      started_at: Date.now(),
+      ended_at: null,
+      status: 'active',
+      asr_provider: 'mock',
+      tts_provider: 'mock',
+      created_at: Date.now()
+    });
+    // 慢速 Core：destroy 时回复仍在产出（快速 mock 会在轮询间隔内整轮完成）
+    const harness = buildSessionHarness({
+      turnsRepo,
+      sessionsRepo,
+      core: new MockCoreBridge({ reply: '第一句话说完。第二句继续说。第三句继续说。', intervalMs: 40, charsPerDelta: 2 })
+    });
+    harness.session.handleMessage({ t: 'start' });
+    harness.session.handleBinary(Buffer.alloc(3200, 1));
+    harness.session.handleMessage({ t: 'end' });
+    await waitFor(() => harness.texts().some((m) => m.t === 'pcm'));
+    expect(turnsRepo.listByCall('call-test-1').length).toBe(0); // 轮次进行中未落库
+    harness.session.destroy('client_closed');
+    const turns = turnsRepo.listByCall('call-test-1');
+    expect(turns.length).toBe(1); // F10：销毁不丢当前轮
+    expect(turns[0].interrupted).toBe(1);
+    expect(String(turns[0].user_text ?? '').length).toBeGreaterThan(0);
+    db.close();
+  });
+
   it('destroy 后：状态 ended 且不再输出任何帧', async () => {
     const harness = buildSessionHarness({});
     harness.session.handleMessage({ t: 'start' });
@@ -198,6 +289,13 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     const destroyed: string[] = [];
     let overflow = false;
     const harness = buildSessionHarness({
+      // 审计修复（同步竞争）：慢速 Core 让音频跨越数百 ms 的窗口，
+      // overflow 置位后必有后续帧触发背压，不再依赖两簇音频间的采样运气
+      core: new MockCoreBridge({
+        reply: '第一句话说完。第二句继续说。第三句继续说。第四句继续说。',
+        intervalMs: 40,
+        charsPerDelta: 2
+      }),
       bufferedAmount: () => (overflow ? 999_999_999 : 0),
       onDestroyed: (session) => destroyed.push(session.callId)
     });

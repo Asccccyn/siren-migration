@@ -4,6 +4,7 @@ import { voiceTranscribeInputObjectSchema, voiceTranscribeInputSchema } from '@s
 import type { ObjectStore } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
 import type { VoiceService } from '@siren/voice-core';
+import { downloadWithLimits } from './audio-fetch.ts';
 
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -34,9 +35,12 @@ export function registerTranscribeTool(
         let audio: Buffer;
         let format = 'webm';
         if (parsed.data.audio_url) {
-          const downloaded = await fetchAudio(parsed.data.audio_url);
+          const downloaded = await downloadWithLimits(parsed.data.audio_url, {
+            maxBytes: MAX_DOWNLOAD_BYTES,
+            timeoutMs: DOWNLOAD_TIMEOUT_MS
+          });
           audio = downloaded.audio;
-          format = downloaded.format;
+          format = guessFormatFromMime(downloaded.contentType);
         } else {
           audio = await deps.store.get(parsed.data.object_key as string);
           format = guessFormatFromKey(parsed.data.object_key as string);
@@ -64,19 +68,6 @@ export function registerTranscribeTool(
       }
     }
   );
-}
-
-async function fetchAudio(url: string): Promise<{ audio: Buffer; format: string }> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!response.ok) {
-    throw new Error(`audio download failed: ${response.status}`);
-  }
-  const array = await response.arrayBuffer();
-  if (array.byteLength > MAX_DOWNLOAD_BYTES) {
-    throw new Error('audio too large');
-  }
-  const contentType = response.headers.get('content-type') ?? '';
-  return { audio: Buffer.from(array), format: guessFormatFromMime(contentType) };
 }
 
 function guessFormatFromMime(mime: string): string {

@@ -19,7 +19,7 @@ CoreBridge 与 conversation 所有权不变。
 
 ## 火山 ASR（packages/providers/volc-asr）
 
-- **批量**：`POST {VOLC_ASR_BATCH_URL}`（默认 `https://openspeech.bytedance.com/api/v1/auc`，大模型 one-shot），Header `X-Api-App-Key` / `X-Api-Access-Key` / `X-Api-Resource-Id`（默认 `volc.bigasr.auc.duration`）/ `Authorization: Bearer;{token}`，audio.data 为 base64。
+- **批量**：`POST {VOLC_ASR_BATCH_URL}`（默认 `https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash`，大模型录音文件极速版 one-shot），Header `X-Api-App-Key` / `X-Api-Access-Key` / `X-Api-Resource-Id`（默认 `volc.bigasr.auc_turbo`）/ `X-Api-Request-Id` / `X-Api-Sequence: -1`；成败看响应头 `X-Api-Status-Code`（成功=20000000，HTTP 可能恒 200），文本在 `result.text`，`result.utterances[].end_time`（毫秒）取时长；audio.data 为 base64。
 - **流式（v1.1 按当前官方协议重写，P0-8）**：大模型流式识别 v3
   `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`（双向流式，实时出字；
   可用 `VOLC_ASR_WS_URL` 换 `bigmodel_async` 优化版 / `bigmodel_nostream` 多语种版）。

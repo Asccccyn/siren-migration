@@ -71,4 +71,43 @@ describe('ASR Prebuffer', () => {
     await ready;
     expect(session.bufferedBytes).toBe(0);
   });
+
+  it('F09：建连途中 abort——迟到的 ASR 连接被立即关闭，不再回吐 partial', async () => {
+    const aborts: number[] = [];
+    const received: string[] = [];
+    /** createStream 延迟 resolve；底层 stream 的 abort 记录在案（模拟迟到连接） */
+    const provider = new (class extends MockAsrProvider {
+      override async createStream(
+        options: Parameters<MockAsrProvider['createStream']>[0],
+        handlers: Parameters<MockAsrProvider['createStream']>[1]
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        const stream = await super.createStream(options, {
+          ...handlers,
+          onPartial: (text) => {
+            received.push(text);
+            handlers.onPartial?.(text);
+          }
+        });
+        const innerAbort = stream.abort.bind(stream);
+        stream.abort = () => {
+          aborts.push(1);
+          innerAbort();
+        };
+        return stream;
+      }
+    })({ partials: ['迟到的 partial'], final: '不应被采用。', finalDelayMs: 5 });
+    const session = new PrebufferedAsrSession(provider, {}, {}, 1024 * 1024);
+    const ready = session.connect();
+    session.feed(Buffer.alloc(3200, 1));
+    // abort 发生在 createStream 仍在 await 的窗口内
+    session.abort();
+    expect(aborts.length).toBe(0); // 底层连接尚不存在
+    await ready;
+    // 迟到连接一就绪就被关闭（F09 修复点），且不会被采纳
+    expect(aborts.length).toBe(1);
+    expect(session.isReady).toBe(false);
+    await expect(session.end()).rejects.toThrowError(/unavailable|abort/i);
+    expect(received).toEqual([]);
+  });
 });

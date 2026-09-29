@@ -31,11 +31,17 @@ export interface ElevenLabsConfig {
 /** ElevenLabs pcm 输出支持的采样率 */
 const PCM_RATES = new Set([8000, 16000, 22050, 24000, 32000, 44100, 48000]);
 
+/** 官方 voice_settings.speed 允许范围（https://elevenlabs.io/docs … text-to-speech） */
+const ELEVEN_SPEED_MIN = 0.7;
+const ELEVEN_SPEED_MAX = 1.2;
+
 interface VoiceSettings {
   stability: number;
   similarity_boost: number;
   style: number;
   use_speaker_boost: boolean;
+  /** 官方 voice_settings.speed，允许范围 0.7–1.2（F17） */
+  speed?: number;
 }
 
 const EMOTION_SETTINGS: Record<SirenEmotion, Partial<VoiceSettings>> = {
@@ -101,17 +107,18 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
     }
     const mapped = mapFormat(request.format === 'mp3' ? 'pcm' : request.format, request.sampleRate ?? REALTIME_OUTPUT_SAMPLE_RATE);
     const sampleRate = mapped.actualSampleRate;
-    const response = await this.fetchStream(voiceId, request, mapped.outputFormat, signal);
-    if (!response.ok) {
-      const message = await response.text().catch(() => '');
-      throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
-    }
-    if (!response.body) {
-      throw new ProviderError('tts_failed', 'elevenlabs', 'tts stream body missing');
-    }
-    const reader = response.body.getReader();
     const framer = new PcmAccumulator(sampleRate);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
+      const response = await this.fetchStream(voiceId, request, mapped.outputFormat, signal);
+      if (!response.ok) {
+        const message = await response.text().catch(() => '');
+        throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
+      }
+      if (!response.body) {
+        throw new ProviderError('tts_failed', 'elevenlabs', 'tts stream body missing');
+      }
+      reader = response.body.getReader();
       while (true) {
         if (signal?.aborted) throw new ProviderError('tts_failed', 'elevenlabs', 'tts aborted');
         const { done, value } = await reader.read();
@@ -123,8 +130,16 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
       for (const frame of framer.flush()) {
         yield { audio: frame, sampleRate };
       }
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      if (signal?.aborted) {
+        throw new ProviderError('tts_failed', 'elevenlabs', 'tts aborted', error);
+      }
+      // F16：网络故障（fetch rejection / reader 异常 / 超时）统一归类 tts_failed，
+      // 调用方的降级链只认 ProviderError——透传 TypeError 会被当成 Core 故障
+      throw new ProviderError('tts_failed', 'elevenlabs', `tts network error: ${(error as Error).message}`, error);
     } finally {
-      await reader.cancel().catch(() => undefined);
+      await reader?.cancel().catch(() => undefined);
     }
   }
 
@@ -140,12 +155,24 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
   }
 
   private async rawRequest(voiceId: string, request: TtsRequest, outputFormat: string): Promise<Buffer> {
-    const response = await this.post(voiceId, request, outputFormat, '', AbortSignal.timeout(this.config.timeoutMs));
+    let response: Response;
+    try {
+      response = await this.post(voiceId, request, outputFormat, '', AbortSignal.timeout(this.config.timeoutMs));
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      // F16：批量路径的网络故障同样归类 tts_failed（REST 层才能回 502 而不是 500）
+      throw new ProviderError('tts_failed', 'elevenlabs', `tts network error: ${(error as Error).message}`, error);
+    }
     if (!response.ok) {
       const message = await response.text().catch(() => '');
       throw new ProviderError('tts_failed', 'elevenlabs', `tts http ${response.status} ${message.slice(0, 200)}`);
     }
-    return Buffer.from(await response.arrayBuffer());
+    try {
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      if (error instanceof ProviderError) throw error;
+      throw new ProviderError('tts_failed', 'elevenlabs', `tts network error: ${(error as Error).message}`, error);
+    }
   }
 
   private post(
@@ -163,8 +190,9 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
       ...EMOTION_SETTINGS[request.style.emotion]
     };
     if (request.style.speed !== undefined) {
-      // ElevenLabs 无原生语速参数，通过 stability 间接微调
-      settings.stability = clamp(1.1 - request.style.speed * 0.5, 0.05, 1.0);
+      // F17：官方 API 提供原生 speed（0.7–1.2）；此前误写成 stability，
+      // 既没变速又破坏了情绪预设的稳定性
+      settings.speed = clamp(request.style.speed, ELEVEN_SPEED_MIN, ELEVEN_SPEED_MAX);
     }
     return fetch(
       `${this.config.baseUrl.replace(/\/$/, '')}/v1/text-to-speech/${encodeURIComponent(voiceId)}${suffix}?output_format=${outputFormat}`,

@@ -7,7 +7,7 @@ export class AsyncQueue<T> {
   private items: T[] = [];
   private waiters: ((value: IteratorResult<T>) => void)[] = [];
   private drainWaiters: { threshold: number; resolve: () => void }[] = [];
-  private closed = false;
+  private closedFlag = false;
   private failure: unknown = null;
   private hasFailure = false;
 
@@ -15,8 +15,12 @@ export class AsyncQueue<T> {
     return this.items.length;
   }
 
+  get closed(): boolean {
+    return this.closedFlag;
+  }
+
   push(item: T): void {
-    if (this.closed) return;
+    if (this.closedFlag) return;
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: item, done: false });
@@ -27,10 +31,10 @@ export class AsyncQueue<T> {
   }
 
   fail(error: unknown): void {
-    if (this.closed || this.hasFailure) return;
+    if (this.closedFlag || this.hasFailure) return;
     this.hasFailure = true;
     this.failure = error;
-    this.closed = true;
+    this.closedFlag = true;
     for (const waiter of this.waiters.splice(0)) {
       waiter(Promise.reject(error) as unknown as IteratorResult<T>);
     }
@@ -38,8 +42,8 @@ export class AsyncQueue<T> {
   }
 
   close(): void {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.closedFlag) return;
+    this.closedFlag = true;
     for (const waiter of this.waiters.splice(0)) {
       waiter({ value: undefined as never, done: true });
     }
@@ -59,7 +63,7 @@ export class AsyncQueue<T> {
         if (this.hasFailure) {
           return Promise.reject(this.failure);
         }
-        if (this.closed) {
+        if (this.closedFlag) {
           return Promise.resolve({ value: undefined as never, done: true });
         }
         return new Promise<IteratorResult<T>>((resolve) => {
@@ -71,7 +75,7 @@ export class AsyncQueue<T> {
 
   /** 等待队列长度低于阈值（生产者背压） */
   waitForDrain(threshold = 1): Promise<void> {
-    if (this.items.length <= threshold || this.closed) return Promise.resolve();
+    if (this.items.length <= threshold || this.closedFlag) return Promise.resolve();
     return new Promise((resolve) => {
       this.drainWaiters.push({ threshold, resolve });
     });
@@ -80,7 +84,7 @@ export class AsyncQueue<T> {
   /** 按 waiter 各自等待的 threshold 唤醒（而非仅队列清空时） */
   private notifyDrain(): void {
     if (this.drainWaiters.length === 0) return;
-    if (this.closed) {
+    if (this.closedFlag) {
       for (const waiter of this.drainWaiters.splice(0)) waiter.resolve();
       return;
     }

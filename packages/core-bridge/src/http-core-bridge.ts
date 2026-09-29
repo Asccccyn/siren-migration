@@ -1,5 +1,5 @@
 /**
- * HttpCoreBridge：HTTP streaming（NDJSON）对接Peer Core（规范第 27 节）。
+ * HttpCoreBridge：HTTP streaming（NDJSON）对接 Peer Core（规范第 27 节）。
  * POST {CORE_BASE_URL}/v1/chat/stream，逐行读取 {"type":"delta","text":"..."}。
  */
 import type { Logger } from '@siren/telemetry';
@@ -21,10 +21,14 @@ export class HttpCoreBridge implements CoreBridge {
   async *streamReply(input: CoreTurnInput): AsyncGenerator<CoreDelta> {
     const controller = new AbortController();
     this.controllers.set(input.turnId, controller);
-    const timeout = setTimeout(
-      () => controller.abort(),
-      this.options.timeoutMs ?? 60000
-    );
+    // F11：超时与主动取消共用 abort 信号，必须单独标记——
+    // 超时静默 return 会把截断的回复当正常完成（success + 空/半截文本）
+    let timedOut = false;
+    const timeoutMs = this.options.timeoutMs ?? 60000;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
     try {
       const response = await fetch(`${this.options.baseUrl.replace(/\/$/, '')}/v1/chat/stream`, {
         method: 'POST',
@@ -70,8 +74,11 @@ export class HttpCoreBridge implements CoreBridge {
         }
       }
     } catch (error) {
+      if (timedOut) {
+        throw new CoreBridgeError('core_timeout', `core reply timed out after ${timeoutMs}ms`);
+      }
       if (controller.signal.aborted) {
-        // 主动取消（cancel() 或超时）不视为错误抛给上层日志
+        // 主动取消（cancel()）不视为错误抛给上层日志
         return;
       }
       this.options.logger?.warn('core_bridge_error', { ...errorFields(error), call_id: input.callId });

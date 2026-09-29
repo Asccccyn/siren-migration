@@ -20,6 +20,8 @@ export type VadOutcome =
   | { event: 'end'; spokenMs: number };
 
 const INITIAL_NOISE_FLOOR = 0.005;
+/** 噪声底自适应时间常数：平滑系数按块间隔换算（审计 F05），与回调频率无关 */
+const NOISE_TAU_MS = 2000;
 
 export class VadMachine {
   private noiseFloor = INITIAL_NOISE_FLOOR;
@@ -28,6 +30,7 @@ export class VadMachine {
   private lastVoiceAt = 0;
   private inSpeech = false;
   private lastRms = 0;
+  private lastNoiseUpdateAt = 0;
 
   constructor(
     private readonly getParams: () => VadParams,
@@ -60,9 +63,9 @@ export class VadMachine {
     const now = this.now();
 
     if (!this.inSpeech) {
-      // 静音期自适应噪声基线（规范第 21 节）
-      this.noiseFloor = this.noiseFloor * 0.98 + rmsValue * 0.02;
       if (rmsValue > threshold) {
+        // 候选语音（确认窗口内）：冻结噪声估计（审计 F05）——
+        // 高频回调下继续学习会把噪声底追到语音电平，阈值随之抬到永远确认不了
         if (this.speechStartAt === 0) this.speechStartAt = now;
         if (now - this.speechStartAt >= params.confirmMs) {
           this.inSpeech = true;
@@ -72,6 +75,11 @@ export class VadMachine {
         }
       } else {
         this.speechStartAt = 0;
+        // 静音期自适应噪声基线（规范第 21 节）；alpha 按真实块间隔归一化
+        const dt = this.lastNoiseUpdateAt === 0 ? 0 : Math.max(0, now - this.lastNoiseUpdateAt);
+        this.lastNoiseUpdateAt = now;
+        const alpha = dt > 0 ? 1 - Math.exp(-dt / NOISE_TAU_MS) : 0;
+        this.noiseFloor = this.noiseFloor * (1 - alpha) + rmsValue * alpha;
       }
       return { event: 'none' };
     }
@@ -95,5 +103,6 @@ export class VadMachine {
     this.utteranceStartAt = 0;
     this.lastVoiceAt = 0;
     this.inSpeech = false;
+    this.lastNoiseUpdateAt = 0;
   }
 }

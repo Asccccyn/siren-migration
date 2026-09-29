@@ -7,9 +7,9 @@
  * - 服务端心跳检测死连接
  */
 import type { FastifyInstance } from 'fastify';
-import { WS_CLOSE_CODES, type ClientWsMessage } from '@siren/contracts';
+import { WS_CLOSE_CODES, parseClientWsMessage } from '@siren/contracts';
 import type { CallCenter, SirenConfig } from '@siren/voice-core';
-import type { Logger } from '@siren/telemetry';
+import { errorFields, type Logger } from '@siren/telemetry';
 
 export interface CallHandlerDeps {
   config: SirenConfig;
@@ -82,18 +82,41 @@ export function registerCallWebSocket(app: FastifyInstance, deps: CallHandlerDep
     });
 
     socket.on('message', (data, isBinary) => {
-      if (isBinary) {
-        session.handleBinary(Buffer.from(data as ArrayBuffer));
-        return;
-      }
-      let message: ClientWsMessage | null = null;
+      // F02：单连接内的任何异常（解析/校验/handler）只关闭本连接，绝不冒泡到进程
       try {
-        message = JSON.parse(String(data)) as ClientWsMessage;
-      } catch {
-        log.warn('ws_invalid_json_frame', {});
-        return;
+        if (isBinary) {
+          session.handleBinary(Buffer.from(data as ArrayBuffer));
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(String(data));
+        } catch {
+          log.warn('ws_invalid_json_frame', {});
+          return;
+        }
+        const message = parseClientWsMessage(parsed);
+        if (!message) {
+          log.warn('ws_invalid_message_frame', { body: String(data).slice(0, 120) });
+          try {
+            socket.send(
+              JSON.stringify({ t: 'error', code: 'invalid_message', message: 'invalid client message' })
+            );
+          } catch {
+            // socket 已不可写
+          }
+          socket.close(WS_CLOSE_CODES.PROTOCOL_ERROR, 'invalid client message');
+          return;
+        }
+        session.handleMessage(message);
+      } catch (error) {
+        log.error('ws_message_handler_failed', errorFields(error));
+        try {
+          socket.close(WS_CLOSE_CODES.PROTOCOL_ERROR, 'handler error');
+        } catch {
+          // 已关闭
+        }
       }
-      session.handleMessage(message);
     });
 
     socket.on('close', (code) => {

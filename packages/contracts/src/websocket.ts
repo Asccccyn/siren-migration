@@ -9,6 +9,7 @@
  * - playback_drained：客户端真正播完该流后 ACK（P0-4）
  * - ready 能力协商：客户端上报 capabilities，服务端回报协议版本与音频约定（P1-7）
  */
+import { z } from 'zod';
 import type { SirenEmotion } from './voice.ts';
 
 /** Call 状态机（规范第 19 节） */
@@ -54,6 +55,39 @@ export type ClientWsMessage =
   | { t: 'abort' }
   | { t: 'ping' }
   | { t: 'playback_drained'; stream_id: string };
+
+// ---------------------------------------------------------------------------
+// 客户端消息运行时校验（审计 F02：JSON.parse 成功 ≠ 合法消息，
+// `null` / 数字 / 缺字段对象曾直接打穿 handleMessage 导致进程退出）
+// ---------------------------------------------------------------------------
+
+const clientCapabilitiesSchema = z
+  .object({
+    playback_drain: z.boolean().optional(),
+    stream_identity: z.boolean().optional(),
+    local_barge_in: z.boolean().optional()
+  })
+  .passthrough();
+
+const clientWsMessageSchema = z.discriminatedUnion('t', [
+  z.object({
+    t: z.literal('ready'),
+    protocol: z.number().optional(),
+    capabilities: clientCapabilitiesSchema.optional()
+  }),
+  z.object({ t: z.literal('start') }),
+  z.object({ t: z.literal('end') }),
+  z.object({ t: z.literal('abort') }),
+  z.object({ t: z.literal('ping') }),
+  z.object({ t: z.literal('playback_drained'), stream_id: z.string().min(1).max(256) })
+]);
+
+/** 校验客户端文本帧；不合法返回 null（调用方只应关闭当前连接，绝不冒泡异常） */
+export function parseClientWsMessage(value: unknown): ClientWsMessage | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const parsed = clientWsMessageSchema.safeParse(value);
+  return parsed.success ? (parsed.data as ClientWsMessage) : null;
+}
 
 // ---------------------------------------------------------------------------
 // Server -> Client（文本帧）

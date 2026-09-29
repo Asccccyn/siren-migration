@@ -13,6 +13,8 @@ export interface SirenConfig {
   port: number;
   publicUrl: string;
   internalToken: string | null;
+  /** 网页登录密码（人类可记，由部署者自行设置；web 登录成功后换取 internal token） */
+  webPassword: string | null;
   corsOrigins: string[];
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   logTranscripts: boolean;
@@ -33,6 +35,8 @@ export interface SirenConfig {
   volc: {
     appId: string;
     accessToken: string;
+    /** 新版控制台单一 API Key（X-Api-Key 单头鉴权，优先于双件套） */
+    apiKey: string;
     asrCluster: string;
     asrBatchResourceId: string;
     asrWsUrl: string;
@@ -65,6 +69,8 @@ export interface SirenConfig {
   coreApiToken: string;
   coreTimeoutMs: number;
   mockCoreReply: string;
+  peerName: string;
+  mailboxName: string;
 
   fillerEnabled: boolean;
   partialGraceMs: number;
@@ -126,6 +132,7 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     port: num(env, 'SIREN_PORT', 8790),
     publicUrl: (env.SIREN_PUBLIC_URL ?? 'http://127.0.0.1:8790').replace(/\/$/, ''),
     internalToken,
+    webPassword: env.SIREN_WEB_PASSWORD?.trim() || null,
     corsOrigins: parseCorsOrigins(env.CORS_ORIGINS, envName),
     logLevel: (env.SIREN_LOG_LEVEL as SirenConfig['logLevel']) ?? 'info',
     logTranscripts: bool(env, 'LOG_TRANSCRIPTS', false),
@@ -166,11 +173,17 @@ function resolveProviderSections(env: EnvSource) {
     volc: {
       appId: env.VOLC_APP_ID ?? '',
       accessToken: env.VOLC_ACCESS_TOKEN ?? '',
+      /** 新版控制台（2.0）单一 API Key：设置后 v3 接口走 X-Api-Key 单头鉴权，
+       * 优先级高于 appId/accessToken 双件套（旧版控制台） */
+      apiKey: env.VOLC_API_KEY ?? '',
       asrCluster: env.VOLC_ASR_RESOURCE_ID ?? 'volc.bigasr.sauc.duration',
-      asrBatchResourceId: env.VOLC_ASR_BATCH_RESOURCE_ID ?? 'volc.bigasr.auc.duration',
+      // 极速版资源 ID（F06：v3 flash 协议要求，v1 的 auc.duration 资源不适用）
+      asrBatchResourceId: env.VOLC_ASR_BATCH_RESOURCE_ID ?? 'volc.bigasr.auc_turbo',
       // 大模型流式 ASR v3（P0-8）：bigmodel=双向流式（实时出字）；可用 bigmodel_async / bigmodel_nostream 覆盖
       asrWsUrl: env.VOLC_ASR_WS_URL ?? 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel',
-      asrBatchUrl: env.VOLC_ASR_BATCH_URL ?? 'https://openspeech.bytedance.com/api/v1/auc',
+      // 大模型录音文件识别·极速版 v3（F06：one-shot flash，成功码在响应头 X-Api-Status-Code）
+      asrBatchUrl:
+        env.VOLC_ASR_BATCH_URL ?? 'https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash',
       ttsCluster: env.VOLC_TTS_CLUSTER ?? 'volcano_icl',
       ttsUrl: env.VOLC_TTS_URL ?? 'https://openspeech.bytedance.com/api/v1/tts',
       // 双向流式 TTS v3（P0-9）
@@ -202,7 +215,11 @@ function resolveCoreSection(env: EnvSource) {
     coreBaseUrl: env.CORE_BASE_URL ?? '',
     coreApiToken: env.CORE_API_TOKEN ?? '',
     coreTimeoutMs: num(env, 'CORE_TIMEOUT_MS', 60000),
-    mockCoreReply: env.MOCK_CORE_REPLY ?? '嗯，我在听。你说，我慢慢回。'
+    mockCoreReply: env.MOCK_CORE_REPLY ?? '嗯，我在听。你说，我慢慢回。',
+    /** 通话接线方的显示名（身份映射：大脑换人只改这里，页面不改） */
+    peerName: env.SIREN_PEER_NAME ?? '他',
+    /** 信箱侧显示名（同 peerName：真实称呼留在部署方 .env，仓库与页面默认中性） */
+    mailboxName: env.SIREN_MAILBOX_NAME ?? '他'
   };
 }
 

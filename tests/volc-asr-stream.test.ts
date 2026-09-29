@@ -31,7 +31,7 @@ function serverResult(sequence: number, payload: unknown): Buffer {
 
 interface ServerScript {
   /** 收到末包后先回什么 */
-  finals?: { text: string; definite: boolean }[][];
+  finals?: { text: string; definite: boolean; start_time?: number; end_time?: number }[][];
   closeOnLast?: boolean;
 }
 
@@ -169,6 +169,31 @@ describe('VolcStreamAsrProvider（P0-8 v3 重写）', () => {
     const result = await stream.end();
     expect(partials).toEqual(['嗯，', '嗯，我在']);
     expect(result.text).toBe('嗯，我在听。'); // 不重复
+  });
+
+  it('F13：相同文字、不同 start_time 的两句话都保留；同句跨帧重发只提交一次', async () => {
+    const server = await startFakeServer({
+      finals: [
+        // 第一帧：两处真实的"你好。"（时间戳不同）+ 第一句同帧重发一次
+        [
+          { text: '你好。', definite: true, start_time: 0, end_time: 1500 },
+          { text: '你好。', definite: true, start_time: 0, end_time: 1500 },
+          { text: '你好。', definite: true, start_time: 2000, end_time: 3600 }
+        ],
+        // 第二帧：服务端按累积语义重发全部 definite
+        [
+          { text: '你好。', definite: true, start_time: 0, end_time: 1500 },
+          { text: '你好。', definite: true, start_time: 2000, end_time: 3600 }
+        ]
+      ]
+    });
+    servers.push(server);
+    const asr = provider(server.port);
+    const stream = await asr.createStream({ language: 'zh-CN' }, {});
+    stream.feed(PCM);
+    const result = await stream.end();
+    // 旧的后缀去重会把第二处真实重复话语删掉，只剩一个"你好。"
+    expect(result.text).toBe('你好。你好。');
   });
 
   it('abort：pending final 被拒绝', async () => {

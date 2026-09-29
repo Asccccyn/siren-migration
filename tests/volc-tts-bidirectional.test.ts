@@ -125,7 +125,8 @@ describe('VolcBidirectionalTtsProvider（P0-9 真流式）', () => {
     const tts = makeProvider(server.port);
 
     const controller = new AbortController();
-    const aTaskIndex = server.seen.taskRequests.length; // 记录 A 的起始位置
+    // A 的 session 稍后按文本识别：并发建连的注册顺序不保证 A 在前
+    // （F14 修复后带取消信号的调用方多一跳 Promise.race，B 可能先发 StartSession）
     const collectA = (async (): Promise<number> => {
       let count = 0;
       try {
@@ -148,7 +149,7 @@ describe('VolcBidirectionalTtsProvider（P0-9 真流式）', () => {
     expect(aCount).toBeLessThan(8); // A 提前终止
     expect(bCount).toBe(8); // B 完整收到全部音频（连接没有被 A 的 abort 杀掉）
 
-    const aSessionId = server.seen.taskRequests[aTaskIndex]?.sessionId;
+    const aSessionId = server.seen.taskRequests.find((t) => t.text === '通话A被抢话。')?.sessionId;
     expect(aSessionId).toBeTruthy();
     // v1.1.1（审计修复）：取消走 CancelSession(101)，服务端真正停止 A 的剩余合成
     await waitForSeen(() => server.seen.cancelSessions.length >= 1);
@@ -156,11 +157,11 @@ describe('VolcBidirectionalTtsProvider（P0-9 真流式）', () => {
     await waitForSeen(() => server.seen.sessionCanceledAcks.length >= 1);
     expect(server.seen.sessionCanceledAcks).toEqual([aSessionId]);
     // 服务端实际停止生产 A 的音频：远小于完整 8 块，且不再增长
-    await waitForSeen(() => (server.seen.serverSentChunks.get(aSessionId) ?? 0) > 0);
-    const aServerChunks = server.seen.serverSentChunks.get(aSessionId) ?? 0;
+    await waitForSeen(() => (server.seen.serverSentChunks.get(aSessionId!) ?? 0) > 0);
+    const aServerChunks = server.seen.serverSentChunks.get(aSessionId!) ?? 0;
     expect(aServerChunks).toBeLessThan(8);
     await new Promise((r) => setTimeout(r, 60)); // 越过若干 chunk 周期
-    expect(server.seen.serverSentChunks.get(aSessionId)).toBe(aServerChunks);
+    expect(server.seen.serverSentChunks.get(aSessionId!)).toBe(aServerChunks);
     // B 在服务端完整产出
     const bSessionId = server.seen.taskRequests.find((t) => t.sessionId !== aSessionId)?.sessionId;
     expect(server.seen.serverSentChunks.get(bSessionId as string)).toBe(8);

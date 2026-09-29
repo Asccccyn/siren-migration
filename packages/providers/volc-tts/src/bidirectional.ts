@@ -38,6 +38,8 @@ import { mapStyleToVolcAudio } from './voice-map.ts';
 export interface VolcBidirectionalTtsConfig {
   appId: string;
   accessToken: string;
+  /** 新版控制台单一 API Key（设置后握手走 X-Api-Key 单头） */
+  apiKey?: string;
   /** 如 volc.service_type.10029（大模型语音合成） */
   resourceId: string;
   wsUrl: string;
@@ -114,6 +116,8 @@ class SessionChannel {
 class BidirectionConnection {
   private dead = false;
   private readonly channels = new Map<string, SessionChannel>();
+  /** 已发送过 CancelSession 的 session（幂等：abort 回调与 finally 各调一次时不重发） */
+  private readonly canceledSessions = new Set<string>();
   private readonly readyPromise: Promise<void>;
   private readyResolve!: () => void;
   private readyReject!: (error: Error) => void;
@@ -141,11 +145,17 @@ class BidirectionConnection {
   static async open(config: VolcBidirectionalTtsConfig, logger?: Logger): Promise<BidirectionConnection> {
     const connectId = randomUUID();
     const socket = await new Promise<WebSocket>((resolve, reject) => {
+      // 新版控制台单一 API Key -> X-Api-Key 单头；旧版双件套 -> App-Key + Access-Key
+      const authHeaders: Record<string, string> = config.apiKey
+        ? { 'X-Api-Key': config.apiKey }
+        : {
+            'X-Api-App-Key': config.appId,
+            'X-Api-Access-Key': config.accessToken
+          };
       const ws = new WebSocket(config.wsUrl, {
         handshakeTimeout: config.connectTimeoutMs,
         headers: {
-          'X-Api-App-Key': config.appId,
-          'X-Api-Access-Key': config.accessToken,
+          ...authHeaders,
           'X-Api-Resource-Id': config.resourceId,
           'X-Api-Connect-Id': connectId
         }
@@ -199,7 +209,10 @@ class BidirectionConnection {
       channel.fail(new ProviderError('tts_failed', 'volc-tts', cause));
       this.channels.delete(sessionId);
     }
-    if (!this.dead) {
+    if (!this.dead && !this.canceledSessions.has(sessionId)) {
+      // 幂等：同一 session 只向上游发一次 CancelSession（abort 回调与
+      // synthesizeStream finally 都会走到这里）
+      this.canceledSessions.add(sessionId);
       try {
         this.socket.send(encodeClientEventFrame(EVENT.CANCEL_SESSION, sessionId, {}));
       } catch {
@@ -278,14 +291,40 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
   private connecting: Promise<BidirectionConnection> | null = null;
   /** dispose 后拒绝新会话，并防止 in-flight 建连结果复活 connection（审计修复） */
   private disposed = false;
+  /**
+   * session 串行链：seed-tts-2.0 拒绝同一连接上的并发 session
+   * （第二个 StartSession 会收到 55000000 并杀掉整条连接，2026-09-29 实测）。
+   * 每个合成请求排队等前一个 session Finish/Cancel 后再开——共享连接保留，
+   * reply-pipeline 的预取退化为"排队预热"，仍在上一句结束瞬间启动下一句。
+   */
+  private sessionChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: VolcBidirectionalTtsConfig,
     private readonly logger?: Logger
   ) {}
 
-  /** 真 provider-level streaming：边合成边产出 PCM chunk */
+  /** 真 provider-level streaming：边合成边产出 PCM chunk（session 串行化后逐个执行） */
   async *synthesizeStream(request: TtsRequest, signal?: AbortSignal): AsyncGenerator<PcmChunk> {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.sessionChain;
+    this.sessionChain = gate;
+    await previous;
+    if (signal?.aborted) {
+      release();
+      throw new ProviderError('tts_failed', 'volc-tts', 'tts aborted');
+    }
+    try {
+      yield* this.streamOnce(request, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async *streamOnce(request: TtsRequest, signal?: AbortSignal): AsyncGenerator<PcmChunk> {
     const voiceId = request.profile.voiceId;
     if (!voiceId) {
       throw new ProviderError(
@@ -296,6 +335,11 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
     }
     const sampleRate = request.sampleRate ?? 24000;
     const connection = await this.ensureConnection(signal);
+    if (signal?.aborted) {
+      // F14：取消发生在建连 await 期间——此时 abort 监听尚未注册，
+      // 不检查就会照常注册 session 并提交合成
+      throw new ProviderError('tts_failed', 'volc-tts', 'tts aborted');
+    }
     const sessionId = randomUUID();
     const channel = connection.register(sessionId);
 
@@ -303,6 +347,7 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
     const onAbort = () => connection.cancelSession(sessionId, 'tts aborted');
     signal?.addEventListener('abort', onAbort, { once: true });
 
+    let completed = false;
     try {
       this.sendStartSession(connection, sessionId, request, voiceId, sampleRate);
       await withTimeout(channel.waitFor(EVENT.SESSION_STARTED), this.config.sessionTimeoutMs, 'tts session start timeout');
@@ -321,8 +366,14 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
       }
       const failure = channel.error;
       if (failure) throw failure;
+      completed = true;
     } finally {
       signal?.removeEventListener('abort', onAbort);
+      if (!completed) {
+        // F15：超时/异常/提前退出都要取消上游 session——只 release 本地通道的话，
+        // 服务端会继续为该 session 合成并推送（与 batch 降级重叠消耗配额）
+        connection.cancelSession(sessionId, 'tts stream did not complete');
+      }
       connection.release(sessionId);
     }
   }
@@ -383,7 +434,20 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
         this.connecting = null;
       });
     }
-    return this.connecting;
+    const connecting = this.connecting;
+    if (!signal) return connecting;
+    // F14：建连等待期间取消也要立即失败，让取消方等到明确结果而不是超时
+    return Promise.race([
+      connecting,
+      new Promise<never>((_, reject) => {
+        const onAbort = () => reject(new ProviderError('tts_failed', 'volc-tts', 'tts aborted'));
+        signal.addEventListener('abort', onAbort, { once: true });
+        // 连接先就绪则解绑监听，不在长寿命信号上留闭包
+        connecting
+          .catch(() => undefined)
+          .finally(() => signal.removeEventListener('abort', onAbort));
+      })
+    ]);
   }
 }
 
