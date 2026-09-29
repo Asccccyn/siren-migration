@@ -14,7 +14,7 @@ import { contentTypeFor } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { errorFields } from '@siren/telemetry';
 import { ProviderError } from '@siren/contracts';
-import { removeTmpFile, saveBufferToTmp } from '../tmp-files.ts';
+import { removeTmpFile, savePartStreamToTmp } from '../tmp-files.ts';
 
 const synthesizeBodySchema = z.object({
   text: z.string().min(1).max(4000),
@@ -46,53 +46,63 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
   const { config, logger, voice, pipeline } = deps;
 
   app.post('/v1/voice/transcribe', async (request, reply) => {
-    let audioFile: { toBuffer: () => Promise<Buffer>; mimetype?: string } | null = null;
+    let tmpPath: string | null = null;
     let partMimeType = 'application/octet-stream';
     const fields: Record<string, string> = {};
+    let saved = false;
     try {
+      // F04：必须在 parts 循环内消费/落盘文件流——先收集 part 再统一 toBuffer
+      // 会让 busboy 缓冲写满后与消费者互等，256 KiB 起即挂起
       for await (const part of request.parts()) {
         if (part.type === 'file') {
-          if (part.fieldname !== 'audio') continue;
-          if (audioFile) {
+          if (part.fieldname !== 'audio') {
+            await part.toBuffer().catch(() => undefined); // 不接受的文件 part 也要消费，保持解析器前进
+            continue;
+          }
+          if (saved) {
+            await part.toBuffer().catch(() => undefined);
             await reply.code(400).send({ error: 'single_audio_file_only' });
             return;
           }
-          audioFile = part;
+          saved = true;
           if (typeof part.mimetype === 'string' && part.mimetype) {
             partMimeType = part.mimetype;
           }
+          const result = await savePartStreamToTmp(config.tmpDir, part.file, config.maxUploadBytes, '.upload');
+          if (result.overflowed) {
+            await reply.code(413).send({ error: 'audio_too_large' });
+            return;
+          }
+          tmpPath = result.path;
         } else if (part.fieldname) {
           fields[part.fieldname] = String(part.value ?? '');
         }
       }
     } catch (error) {
-      await reply.code(400).send({ error: 'invalid_multipart', message: (error as Error).message });
+      const name = (error as Error).name ?? '';
+      const message = (error as Error).message ?? '';
+      if (name === 'RequestFileTooLargeError' || /too large|limit|length|size/i.test(message)) {
+        await reply.code(413).send({ error: 'audio_too_large' });
+        return;
+      }
+      await reply.code(400).send({ error: 'invalid_multipart', message });
       return;
     }
-    if (!audioFile) {
+    if (!tmpPath) {
       await reply.code(400).send({ error: 'audio_file_required' });
       return;
     }
 
-    // 落临时文件（UUID 名），读完即删；大小在 multipart limits 层面已限制
-    let buffer: Buffer;
-    let tmpPath: string | null = null;
     try {
-      buffer = await audioFile.toBuffer();
+      const buffer = await readFile(tmpPath);
       if (buffer.length === 0) {
         await reply.code(400).send({ error: 'empty_audio' });
         return;
       }
-      if (buffer.length > config.maxUploadBytes) {
-        await reply.code(413).send({ error: 'audio_too_large' });
-        return;
-      }
-      tmpPath = await saveBufferToTmp(config.tmpDir, buffer, '.upload');
-      const stored = await readFile(tmpPath);
       // P1-6：格式推断必须用上传文件 part 自己的 mimetype，
       // 不能用整个请求的 Content-Type（multipart/form-data 恒为 webm 兜底）
       const output = await pipeline.handleUserVoice({
-        audio: stored,
+        audio: buffer,
         format: fields.format ?? guessAudioFormat(partMimeType),
         language: fields.language || undefined,
         conversationId: fields.conversation_id || undefined,

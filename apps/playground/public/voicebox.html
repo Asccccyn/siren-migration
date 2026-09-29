@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>听见 · Siren</title>
+<link rel="stylesheet" href="/playground/siren.css" />
+<style>
+  /* 登录视图（密码由部署者在 SIREN_WEB_PASSWORD 自行设置） */
+  #loginView { min-height: 100svh; display: flex; flex-direction: column; justify-content: center; padding-bottom: 8vh; }
+  #loginView h1 { margin: 0 0 14px; font-family: var(--font-display); font-weight: 500;
+                  font-size: clamp(52px, 9vw, 72px); letter-spacing: .18em; }
+  #loginView .copy { color: var(--dim); font-size: 16px; line-height: 2; margin: 0 0 40px; max-width: 26rem; }
+  #loginBtn { width: 100%; min-height: 50px; margin-top: 26px; justify-content: space-between; }
+  #loginBtn:disabled { cursor: wait; opacity: .64; }
+  .form-error { min-height: 22px; margin-top: 10px; font-size: 12px; color: var(--danger); }
+
+  /* 应用壳：一个网址，页内三标签 */
+  #appView .topbar { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-top: 40px; }
+  #appView .topbar h1 { margin: 0; font-family: var(--font-display); font-weight: 500;
+                        font-size: clamp(34px, 6vw, 46px); letter-spacing: .16em; }
+  .topbar .me { display: flex; gap: 16px; align-items: baseline; }
+  .topbar button { background: none; border: 0; color: var(--dim); font-size: 13px; cursor: pointer; padding: 6px 2px; letter-spacing: .05em; }
+  .topbar button:hover { color: var(--gold-bright); }
+  .tabbar { display: flex; gap: 4px; margin: 18px 0 0; border-bottom: 1px solid var(--line); }
+  .tabbar button { background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+                   color: var(--dim); font-size: 15px; letter-spacing: .08em; cursor: pointer;
+                   padding: 10px 16px; }
+  .tabbar button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--gold-line); }
+  .tabbar button:hover { color: var(--gold-bright); }
+  section[data-view] { padding-top: 18px; }
+  .view-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .view-head .acts { display: flex; gap: 16px; }
+  .view-head .acts button { background: none; border: 0; color: var(--dim); font-size: 13px; cursor: pointer; padding: 6px 2px; letter-spacing: .05em; }
+  .view-head .acts button:hover { color: var(--gold-bright); }
+  .list-error { color: var(--danger); font-size: 13px; text-align: center; padding: 30px 0; }
+  .peer-note { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .peer-note b { color: var(--gold-bright); font-weight: 500; }
+
+  /* 通话页专属（与原 realtime.html 一致） */
+  .call-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .call-row .input-line { flex: 1 1 200px; }
+  .vad-grid { display: flex; gap: 14px 22px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .vad-grid label { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--dim); }
+  .vad-grid input { width: 64px; }
+  #partial { min-height: 26px; font-style: italic; color: #b7c0d4; margin: 0 0 10px; }
+  #reply { min-height: 26px; margin: 0; }
+  .subhead { margin: 18px 0 10px !important; }
+
+  /* 异步页专属（与原 async.html 一致） */
+  .rec-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .rec-row .input-line { flex: 1 1 180px; }
+  #asrOut { min-height: 72px; }
+  .tts-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .tts-controls label { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--dim); }
+  #ttsMeta { margin: 12px 0 4px; }
+  audio#player { width: 100%; margin-top: 10px; }
+  .rec-live { color: var(--danger); font-weight: 600; letter-spacing: .06em; }
+  .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--dim); cursor: pointer; }
+  .check input { accent-color: var(--gold-line); }
+</style>
+</head>
+<body>
+  <!-- 登录视图：唯一的门 -->
+  <div class="wrap" id="loginView" hidden style="max-width:460px">
+    <h1>听见</h1>
+    <p class="copy">声音都在这里。<br>输入你的密码进来。</p>
+    <div class="field-label"><label for="passwordInput">密码</label></div>
+    <div class="password-field" style="display:flex;align-items:center;border-bottom:1px solid var(--line-soft);background:#111b2b44;transition:border-color .2s">
+      <input class="input-line" id="passwordInput" type="password" placeholder="输入你的密码"
+             autocomplete="current-password" style="border:0;background:none;width:100%" />
+    </div>
+    <div class="form-error" id="loginError"></div>
+    <button class="btn" id="loginBtn"><span id="loginLabel">进来听</span><span aria-hidden="true">→</span></button>
+  </div>
+
+  <!-- 应用壳：三个视图，页内切换，地址栏不变 -->
+  <main class="wrap" id="appView" hidden>
+    <header class="topbar">
+      <h1>听见</h1>
+      <div class="me"><button id="logoutBtn" type="button">退出</button></div>
+    </header>
+    <nav class="tabbar" role="tablist" aria-label="功能">
+      <button type="button" role="tab" data-tab="mailbox" aria-selected="true">语音信箱</button>
+      <button type="button" role="tab" data-tab="call" aria-selected="false">实时通话</button>
+      <button type="button" role="tab" data-tab="async" aria-selected="false">异步语音</button>
+    </nav>
+
+    <!-- 信箱：语音消息 -->
+    <section data-view="mailbox" role="tabpanel">
+      <div class="view-head">
+        <p class="sub" style="margin:14px 0 10px">__MAILBOX_NAME__的声音 · 最新的在最上面</p>
+        <div class="acts"><button id="refreshBtn" type="button">刷新</button></div>
+      </div>
+      <div id="listBox"><div class="empty">加载中…</div></div>
+    </section>
+
+    <!-- 通话：接电话的人由服务端映射（SIREN_PEER_NAME）注入 -->
+    <section data-view="call" role="tabpanel" hidden>
+      <p class="sub" style="margin:14px 0 10px">现在接电话的：<b data-peer>__PEER_NAME__</b> · 你说话他实时听，他说话你能抢话</p>
+      <p class="peer-note">他每轮要想一会儿（约十秒），听到"嘟"之前别挂。</p>
+
+      <section class="card">
+        <div class="call-row">
+          <span class="badge" id="stateBadge" title="点一下强制打断">idle</span>
+          <input class="input-line" id="conversationId" placeholder="conversation_id（可选，空则自动生成）" />
+          <button class="btn" id="callBtn">呼叫</button>
+          <button class="btn btn-ghost" id="muteBtn" disabled>静音</button>
+          <button class="btn btn-danger" id="hangupBtn" disabled>挂断</button>
+        </div>
+        <div class="call-row" style="margin-top:12px">
+          <label class="muted" style="display:inline-flex;align-items:center;gap:8px">
+            模式
+            <select class="input-box" id="mode">
+              <option value="vad">VAD 自动断句</option>
+              <option value="ptt">按住说话（PTT）</option>
+            </select>
+          </label>
+          <button class="btn btn-ghost" id="pttBtn" style="display:none">🎤 按住说话</button>
+          <span class="muted" id="noiseFloor">noise floor: −</span>
+        </div>
+        <div class="vad-grid">
+          <span class="muted" style="letter-spacing:.08em">VAD 参数</span>
+          <label>确认 <input class="input-box" id="vConfirm" type="number" value="200" />ms</label>
+          <label>最短语音 <input class="input-box" id="vMin" type="number" value="400" />ms</label>
+          <label>结束静音 <input class="input-box" id="vEnd" type="number" value="700" />ms</label>
+          <label>RMS 倍数 <input class="input-box" id="vRatio" type="number" value="4" step="0.5" /></label>
+          <label>抖动缓冲 <input class="input-box" id="vJitter" type="number" value="350" />ms</label>
+        </div>
+      </section>
+
+      <div class="grid-2">
+        <section class="card">
+          <h2>他在听的</h2>
+          <p id="partial">（说话字幕会先出现在这里）</p>
+          <pre class="panel" id="asrLog">最终识别文本会出现在这里</pre>
+        </section>
+        <section class="card">
+          <h2>他在说的</h2>
+          <p id="reply">（回复文本）</p>
+          <h2 class="subhead">延迟指标</h2>
+          <table class="metrics"><tbody id="metricsBody"><tr><td class="muted">等待第一轮…</td></tr></tbody></table>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>事件日志</h2>
+        <pre class="panel" id="eventLog" style="max-height:180px"></pre>
+      </section>
+    </section>
+
+    <!-- 异步：录音转写 + 文字合成 -->
+    <section data-view="async" role="tabpanel" hidden>
+      <p class="sub" style="margin:14px 0 10px">说完再转写 · 写完再出声</p>
+
+      <section class="card">
+        <h2>录音 → 转写</h2>
+        <div class="rec-row">
+          <button class="btn" id="startRec">开始录音</button>
+          <button class="btn btn-danger" id="stopRec" disabled>停止并转写</button>
+          <span class="muted" id="recTime"></span>
+        </div>
+        <div class="rec-row">
+          <input class="input-line" id="asrConv" placeholder="conversation_id（可选）" />
+          <label class="check"><input type="checkbox" id="asrStore" checked /> 存为语音资产</label>
+        </div>
+        <pre class="panel" id="asrOut" style="margin-top:12px">尚未转写。</pre>
+      </section>
+
+      <section class="card">
+        <h2>文字 → 合成</h2>
+        <textarea class="input-line" id="ttsText">我在。今天慢一点说，不着急。</textarea>
+        <div class="tts-controls">
+          <select class="input-box" id="emotion">
+            <option>warm</option><option>neutral</option><option>happy</option><option>sad</option>
+            <option>angry</option><option>teasing</option><option>sleepy</option><option>excited</option><option>surprised</option>
+          </select>
+          <label>语速 <input id="speed" type="range" min="0.5" max="2" step="0.05" value="1" /> <span id="speedVal">1.0</span></label>
+          <button class="btn" id="speakBtn">合成并播放</button>
+        </div>
+        <div class="muted" id="ttsMeta"></div>
+        <audio id="player" controls></audio>
+      </section>
+    </section>
+  </main>
+
+<script>
+(() => {
+  'use strict';
+  const TOKEN_KEY = 'siren_token';
+  const $ = (id) => document.getElementById(id);
+  const loginView = $('loginView'), appView = $('appView');
+
+  const getToken = () => (localStorage.getItem(TOKEN_KEY) ?? '').replace(/^Bearer\s+/i, '').trim();
+  const setToken = (t) => localStorage.setItem(TOKEN_KEY, t);
+
+  /* ---------- 登录（唯一的门，成功后才加载通话/异步脚本） ---------- */
+  function showLogin() { loginView.hidden = false; appView.hidden = true; $('passwordInput').focus(); }
+
+  async function login() {
+    const btn = $('loginBtn'), input = $('passwordInput'), err = $('loginError');
+    const password = input.value;
+    if (!password) return;
+    btn.disabled = true; $('loginLabel').textContent = '正在开门…'; err.textContent = '';
+    try {
+      const res = await fetch('/v1/web/login', {
+        method:'POST', headers:{ 'content-type':'application/json' },
+        body: JSON.stringify({ password })
+      });
+      if (res.status === 401) { err.textContent = '密码不对，再想想'; input.select(); return; }
+      if (res.status === 429) { err.textContent = '试得太频繁了，一分钟后再来'; return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json();
+      setToken(payload.token);
+      input.value = '';
+      bootApp();
+    } catch (e) {
+      err.textContent = `登录失败：${e.message || e}`;
+    } finally {
+      btn.disabled = false; $('loginLabel').textContent = '进来听';
+    }
+  }
+
+  /* ---------- 应用壳：标签切换 + 脚本按需注入一次 ---------- */
+  let scriptsLoaded = false;
+  function loadFeatureScripts() {
+    if (scriptsLoaded) return;
+    scriptsLoaded = true;
+    for (const src of ['/playground/realtime-call-test.js', '/playground/async-voice-test.js']) {
+      const s = document.createElement('script');
+      s.src = src;
+      document.body.appendChild(s);
+    }
+  }
+
+  function switchTab(name) {
+    for (const btn of document.querySelectorAll('.tabbar button')) {
+      btn.setAttribute('aria-selected', btn.dataset.tab === name ? 'true' : 'false');
+    }
+    for (const sec of document.querySelectorAll('section[data-view]')) {
+      sec.hidden = sec.dataset.view !== name;
+    }
+  }
+
+  function bootApp() {
+    loginView.hidden = true;
+    appView.hidden = false;
+    // 先用信箱接口验证 token 有效，再注入通话/异步脚本——
+    // 避免失效 token 下它们各自再弹登录门（双门）
+    void loadList().then((tokenValid) => { if (tokenValid) loadFeatureScripts(); });
+  }
+
+  /* ---------- 语音信箱列表（原 voicebox 逻辑） ---------- */
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+  function fmtWhen(iso) {
+    const d = new Date(iso); if (Number.isNaN(d.getTime())) return '';
+    const diff = Date.now() - d.getTime();
+    if (diff < 60_000) return '刚刚';
+    if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} 小时前`;
+    return d.toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' });
+  }
+  function fmtDur(ms) { return ms ? `${(ms/1000).toFixed(1)}″` : ''; }
+
+  /** 加载信箱列表；返回 token 是否有效（仅 401 视为无效） */
+  async function loadList() {
+    const listBox = $('listBox');
+    listBox.innerHTML = '<div class="empty">加载中…</div>';
+    try {
+      const res = await fetch('/v1/voice/messages?limit=200', { headers:{ authorization:`Bearer ${getToken()}` } });
+      if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); showLogin(); return false; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json();
+      const items = payload.items ?? [];
+      if (items.length === 0) {
+        listBox.innerHTML = '<div class="empty">还没有语音。<br>让他说一句话，它就会出现在这里。</div>';
+        return true;
+      }
+      listBox.innerHTML = items.map((item) => `
+        <div class="voice-item">
+          <div class="meta">
+            <span class="who">${item.direction === 'user' ? '你录的' : '他'}</span>
+            <span class="dur">${fmtDur(item.duration_ms)}</span>
+            <span class="when">${fmtWhen(item.created_at)}</span>
+          </div>
+          <audio controls preload="none" src="${escapeHtml(item.audio_url)}"></audio>
+          ${item.text ? `<div class="text">${escapeHtml(item.text)}</div>` : ''}
+        </div>`).join('');
+      return true;
+    } catch (e) {
+      listBox.innerHTML = `<div class="list-error">加载失败：${escapeHtml(String(e.message || e))}</div>`;
+      return true; // 网络抖动不代表 token 无效
+    }
+  }
+
+  /* ---------- 接线 ---------- */
+  $('loginBtn').addEventListener('click', () => void login());
+  $('passwordInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') void login(); });
+  $('logoutBtn').addEventListener('click', () => { localStorage.removeItem(TOKEN_KEY); location.reload(); });
+  $('refreshBtn').addEventListener('click', () => void loadList());
+  for (const btn of document.querySelectorAll('.tabbar button')) {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  }
+
+  if (getToken()) bootApp(); else showLogin();
+})();
+</script>
+</body>
+</html>

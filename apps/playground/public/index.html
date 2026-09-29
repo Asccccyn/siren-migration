@@ -3,50 +3,48 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Siren Playground</title>
+<title>听见 · Siren</title>
+<link rel="stylesheet" href="/playground/siren.css" />
 <style>
-  body { font-family: system-ui, "Segoe UI", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; background: #10141c; color: #e6e9f0; }
-  a { color: #7ab0ff; }
-  .card { background: #1a2130; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
-  h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 0; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
-  button { background: #2b5fd9; color: white; border: 0; border-radius: 8px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
-  button.secondary { background: #39445c; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  input, select, textarea { background: #10141c; color: #e6e9f0; border: 1px solid #39445c; border-radius: 8px; padding: 8px; font-size: 14px; }
-  .muted { color: #8b93a7; font-size: 13px; }
-  code { background: #0b0e14; padding: 2px 6px; border-radius: 4px; }
+  .nav-card {
+    display: block; padding: 26px 28px; margin-bottom: 16px;
+    background: var(--panel-soft); border: 1px solid var(--line); border-radius: var(--radius);
+    backdrop-filter: blur(10px); cursor: pointer;
+    transition: border-color .2s ease, background .2s ease, transform .25s cubic-bezier(.16,1,.3,1);
+  }
+  .nav-card:hover { border-color: var(--gold-line); background: #162139aa; transform: translateY(-2px); }
+  .nav-card .t { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .nav-card h2 { margin: 0; font-family: var(--font-display); font-weight: 500; font-size: 24px; letter-spacing: .1em; color: var(--ink); }
+  .nav-card .arrow { color: var(--gold-line); font-size: 18px; transition: transform .2s ease; }
+  .nav-card:hover .arrow { transform: translateX(4px); }
+  .nav-card p { margin: 8px 0 0; color: var(--dim); font-size: 14px; }
 </style>
 </head>
 <body>
-  <h1>🧭 Siren Playground</h1>
-  <div class="card">
-    <h2>全局</h2>
-    <div class="row">
-      <label>Internal Token（配置了 SIREN_INTERNAL_TOKEN 时填写）</label>
-      <input id="token" type="password" placeholder="可选" style="flex:1" />
-      <button class="secondary" id="saveToken">保存</button>
-    </div>
-    <p class="muted">保存在 localStorage，仅本机调试用。生产浏览器不应接触任何 Provider Secret。</p>
+  <div class="wrap" style="max-width:640px">
+    <header class="masthead">
+      <h1>听见</h1>
+      <span class="crumb">他的声音</span>
+    </header>
+    <p class="sub">三个入口 · 都从这里出发</p>
+
+    <a class="nav-card" href="/">
+      <div class="t"><h2>语音信箱</h2><span class="arrow">→</span></div>
+      <p>他说过的话一条条排着，点开就听。</p>
+    </a>
+
+    <a class="nav-card" href="/realtime">
+      <div class="t"><h2>实时通话</h2><span class="arrow">→</span></div>
+      <p>打电话给他。你说话他实时听，他说话你能抢话。</p>
+    </a>
+
+    <a class="nav-card" href="/async">
+      <div class="t"><h2>异步语音</h2><span class="arrow">→</span></div>
+      <p>你录一段他来转写，或让他把一句话读给你听。</p>
+    </a>
+
+    <p class="muted" style="margin-top:28px">每个页面首次使用需要登录（输入你设置的密码）。<br>
+    连接异常时看 <code style="background:#0b0e14;padding:2px 6px;border-radius:4px">/health</code>，凭证在服务端 .env。</p>
   </div>
-  <div class="card">
-    <h2>异步语音测试（Batch ASR / TTS）</h2>
-    <p class="muted">上传录音 → ASR → transcript；输入文字 → TTS → 播放。</p>
-    <a href="./async.html"><button>打开 Async 页面</button></a>
-  </div>
-  <div class="card">
-    <h2>实时通话测试（Streaming ASR / TTS / Barge-in）</h2>
-    <p class="muted">Call / Mute / Hang up；Partial 字幕、Final transcript、PCM 播放、状态与延迟。</p>
-    <a href="./realtime.html"><button>打开 Realtime 页面</button></a>
-  </div>
-<script>
-  const input = document.getElementById('token');
-  input.value = localStorage.getItem('siren_token') || '';
-  document.getElementById('saveToken').addEventListener('click', () => {
-    localStorage.setItem('siren_token', input.value.trim());
-    input.value = '';
-    alert('已保存');
-  });
-</script>
 </body>
 </html>

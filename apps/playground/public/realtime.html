@@ -3,82 +3,77 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Siren Realtime Call Test</title>
+<title>实时通话 · 听见</title>
+<link rel="stylesheet" href="/playground/siren.css" />
 <style>
-  body { font-family: system-ui, "Segoe UI", sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; background: #10141c; color: #e6e9f0; }
-  a { color: #7ab0ff; }
-  .card { background: #1a2130; border-radius: 12px; padding: 20px 24px; margin-bottom: 16px; }
-  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 0; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
-  button { background: #2b5fd9; color: white; border: 0; border-radius: 8px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
-  button.stop { background: #d94b4b; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  input, select { background: #10141c; color: #e6e9f0; border: 1px solid #39445c; border-radius: 8px; padding: 8px; font-size: 14px; }
-  .muted { color: #8b93a7; font-size: 13px; }
-  .badge { display: inline-block; padding: 4px 14px; border-radius: 999px; font-weight: 600; background: #39445c; }
-  .badge.listening { background: #1d6b45; } .badge.thinking { background: #8a6a1f; }
-  .badge.speaking { background: #2b5fd9; } .badge.ending { background: #6b5a1d; }
-  .badge.error, .badge.ended { background: #7a2b2b; } .badge.connecting { background: #4a4a6b; }
-  #partial { min-height: 24px; font-style: italic; color: #b7c0d4; }
-  #reply { min-height: 24px; }
-  pre { background: #0b0e14; border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; max-height: 220px; }
-  table.metrics { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.metrics td { padding: 4px 8px; border-bottom: 1px solid #26304a; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
-  .vadcfg input { width: 70px; }
+  /* 本页专属：通话控制区的细排 */
+  .call-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .call-row .input-line { flex: 1 1 200px; }
+  .vad-grid { display: flex; gap: 14px 22px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .vad-grid label { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--dim); }
+  .vad-grid input { width: 64px; }
+  #partial { min-height: 26px; font-style: italic; color: #b7c0d4; margin: 0 0 10px; }
+  #reply { min-height: 26px; margin: 0; }
+  .subhead { margin: 18px 0 10px !important; }
 </style>
 </head>
 <body>
-  <h1>📞 Realtime Call Test <span class="muted">· <a href="./index.html">返回</a></span></h1>
+  <div class="wrap">
+    <header class="masthead">
+      <h1>实时通话</h1>
+      <span class="crumb"><a href="/">听见</a> · <a href="/async">异步语音</a> · 通话</span>
+    </header>
+    <p class="sub">打电话给他 · 你说话他实时听，他说话你能抢话</p>
 
-  <div class="card">
-    <div class="row">
-      <span class="badge connecting" id="stateBadge">idle</span>
-      <input id="conversationId" placeholder="conversation_id（可选）" />
-      <button id="callBtn">📞 Call</button>
-      <button id="muteBtn" class="secondary" disabled>🔇 Mute</button>
-      <button id="hangupBtn" class="stop" disabled>⛔ Hang up</button>
+    <section class="card">
+      <div class="call-row">
+        <span class="badge" id="stateBadge" title="点一下强制打断">idle</span>
+        <input class="input-line" id="conversationId" placeholder="conversation_id（可选，空则自动生成）" />
+        <button class="btn" id="callBtn">呼叫</button>
+        <button class="btn btn-ghost" id="muteBtn" disabled>静音</button>
+        <button class="btn btn-danger" id="hangupBtn" disabled>挂断</button>
+      </div>
+      <div class="call-row" style="margin-top:12px">
+        <label class="muted" style="display:inline-flex;align-items:center;gap:8px">
+          模式
+          <select class="input-box" id="mode">
+            <option value="vad">VAD 自动断句</option>
+            <option value="ptt">按住说话（PTT）</option>
+          </select>
+        </label>
+        <button class="btn btn-ghost" id="pttBtn" style="display:none">🎤 按住说话</button>
+        <span class="muted" id="noiseFloor">noise floor: −</span>
+      </div>
+      <div class="vad-grid">
+        <span class="muted" style="letter-spacing:.08em">VAD 参数</span>
+        <label>确认 <input class="input-box" id="vConfirm" type="number" value="200" />ms</label>
+        <label>最短语音 <input class="input-box" id="vMin" type="number" value="400" />ms</label>
+        <label>结束静音 <input class="input-box" id="vEnd" type="number" value="700" />ms</label>
+        <label>RMS 倍数 <input class="input-box" id="vRatio" type="number" value="4" step="0.5" /></label>
+        <label>抖动缓冲 <input class="input-box" id="vJitter" type="number" value="350" />ms</label>
+      </div>
+    </section>
+
+    <div class="grid-2">
+      <section class="card">
+        <h2>他在听见的</h2>
+        <p id="partial">（说话字幕会先出现在这里）</p>
+        <pre class="panel" id="asrLog">最终识别文本会出现在这里</pre>
+      </section>
+      <section class="card">
+        <h2>他在说的</h2>
+        <p id="reply">（回复文本）</p>
+        <h2 class="subhead">延迟指标</h2>
+        <table class="metrics"><tbody id="metricsBody"><tr><td class="muted">等待第一轮…</td></tr></tbody></table>
+      </section>
     </div>
-    <div class="row">
-      <label class="muted">模式：
-        <select id="mode">
-          <option value="vad">VAD 自动断句</option>
-          <option value="ptt">按住说话（Push to Talk）</option>
-        </select>
-      </label>
-      <button id="pttBtn" class="secondary" style="display:none">🎤 按住说话</button>
-    </div>
-    <div class="row vadcfg">
-      <span class="muted">VAD 参数(ms/倍)：</span>
-      确认<input id="vConfirm" type="number" value="200" />
-      最短语音<input id="vMin" type="number" value="400" />
-      结束静音<input id="vEnd" type="number" value="700" />
-      RMS倍数<input id="vRatio" type="number" value="4" step="0.5" />
-      抖动缓冲<input id="vJitter" type="number" value="350" />
-    </div>
-    <div class="row"><span class="muted" id="noiseFloor">noise floor: -</span></div>
+
+    <section class="card">
+      <h2>事件日志</h2>
+      <pre class="panel" id="eventLog" style="max-height:180px"></pre>
+    </section>
+
+    <script src="/playground/realtime-call-test.js"></script>
   </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2>识别</h2>
-      <div id="partial">（partial 字幕）</div>
-      <pre id="asrLog">final transcript 会出现在这里</pre>
-    </div>
-    <div class="card">
-      <h2>回复</h2>
-      <div id="reply">（assistant 文本）</div>
-      <h2 style="margin-top:14px">延迟指标</h2>
-      <table class="metrics"><tbody id="metricsBody"><tr><td class="muted">等待第一轮…</td></tr></tbody></table>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>事件日志</h2>
-    <pre id="eventLog"></pre>
-  </div>
-
-  <script src="./realtime-call-test.js"></script>
 </body>
 </html>

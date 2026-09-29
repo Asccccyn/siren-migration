@@ -3,6 +3,8 @@
  * 单进程统一挂载：REST / MCP / WebSocket / Health / Assets / Playground（规范第 3 节）。
  */
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import fastifyCors from '@fastify/cors';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
@@ -34,6 +36,8 @@ import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
 import { registerCallSessionRoutes } from './routes/call-session.ts';
 import { registerAssetsRoute } from './routes/assets.ts';
+import { registerPlayRoute } from './routes/play.ts';
+import { registerWebAuthRoute } from './routes/web-auth.ts';
 import { registerCallWebSocket } from './websocket/call-handler.ts';
 import { registerMcpRoute } from './mcp/server.ts';
 
@@ -88,7 +92,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
       profiles.loadSync([
         {
           id: 'main',
-          displayName: '对方',
+          displayName: '他',
           language: 'zh-CN',
           provider: providers.active.realtimeTts.startsWith('elevenlabs') ? 'elevenlabs' : 'volc',
           voiceId: '',
@@ -174,8 +178,30 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     config,
     store: providers.store instanceof LocalObjectStore ? providers.store : null
   });
+  registerPlayRoute(app, { voice });
+  registerWebAuthRoute(app, { config });
   registerCallWebSocket(app, { config, logger, callCenter });
   registerMcpRoute(app, { voice, store: providers.store, logger, version: SIREN_VERSION });
+
+  // 根路径 = 唯一入口（一个网址，页内三标签）：注入显示名（身份映射，真实称呼在 .env）
+  const voiceboxHtml = join(config.playgroundDir, 'voicebox.html');
+  app.get('/', async (_request, reply) => {
+    if (existsSync(voiceboxHtml)) {
+      const html = (await readFile(voiceboxHtml, 'utf8'))
+        .replaceAll('__PEER_NAME__', config.peerName)
+        .replaceAll('__MAILBOX_NAME__', config.mailboxName);
+      await reply.header('content-type', 'text/html; charset=utf-8').send(html);
+      return;
+    }
+    await reply.redirect('/playground/');
+  });
+
+  // 旧短路径收拢回唯一入口（不再有第二、第三个地址）
+  for (const legacy of ['/realtime', '/async']) {
+    app.get(legacy, async (_request, reply) => {
+      await reply.redirect('/', 302);
+    });
+  }
 
   if (existsSync(config.playgroundDir)) {
     await app.register(fastifyStatic, {

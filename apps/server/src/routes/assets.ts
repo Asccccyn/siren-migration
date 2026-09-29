@@ -37,12 +37,61 @@ export function registerAssetsRoute(app: FastifyInstance, deps: AssetsRoutesDeps
       return;
     }
     try {
+      const size = await store.size(key);
+      const range = parseByteRange(request.headers.range, size);
+      if (range === 'invalid') {
+        await reply
+          .code(416)
+          .header('accept-ranges', 'bytes')
+          .header('content-range', `bytes */${size}`)
+          .send();
+        return;
+      }
+
+      reply.header('content-type', contentTypeForKey(key)).header('accept-ranges', 'bytes');
+      if (range) {
+        const length = range.end - range.start + 1;
+        const stream = store.openStream(key, range);
+        await reply
+          .code(206)
+          .header('content-range', `bytes ${range.start}-${range.end}/${size}`)
+          .header('content-length', String(length))
+          .send(stream);
+        return;
+      }
+
       const stream = store.openStream(key);
-      await reply.header('content-type', contentTypeForKey(key)).send(stream);
+      await reply.header('content-length', String(size)).send(stream);
     } catch {
       await reply.code(404).send({ error: 'not_found' });
     }
   });
+}
+
+type ByteRange = { start: number; end: number };
+
+/** 单 Range 足够满足 HTMLAudioElement / Safari 媒体探测；多 Range 明确拒绝。 */
+function parseByteRange(header: string | undefined, size: number): ByteRange | null | 'invalid' {
+  if (!header) return null;
+  if (size <= 0) return 'invalid';
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || (!match[1] && !match[2])) return 'invalid';
+
+  let start: number;
+  let end: number;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return 'invalid';
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] ? Number(match[2]) : size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return 'invalid';
+    if (start < 0 || start >= size || end < start) return 'invalid';
+    end = Math.min(end, size - 1);
+  }
+  return { start, end };
 }
 
 function contentTypeForKey(key: string): string {

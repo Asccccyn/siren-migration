@@ -1,6 +1,6 @@
 # Siren v1.1.1（Realtime Hardening · 审计修复轮）
 
-> Siren 是对方的耳朵和嘴巴，不是第二个对方。
+> Siren 是耳朵和嘴巴，不是第二个大脑。
 > 独立语音能力层：ASR / TTS / 异步语音消息 / 实时通话 / MCP。
 > v1.1：实时通话链路强化（pre-roll 首音保护 / 本地 barge-in / 下行流标识 /
 > playback_drained / 共享 conversation / 火山 v3 双向流式协议 / 幂等与 fail-closed）。
@@ -65,7 +65,7 @@ VOLC_VOICE_ID=你的音色ID                             # 也可配在 config/v
 
 - 流式识别 = 大模型 sauc v3 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`（双向流式实时出字；`VOLC_ASR_WS_URL` 可换 `bigmodel_async` / `bigmodel_nostream`）。
 - 实时合成 = v3 双向流式 `wss://openspeech.bytedance.com/api/v3/tts/bidirection`（文本流式输入、音频流式输出、连接复用多 session）。
-- 批量识别默认走 one-shot `volc.bigasr.auc.duration`（`VOLC_ASR_BATCH_RESOURCE_ID` 可覆盖）。
+- 批量识别默认走大模型录音文件极速版 v3 flash（one-shot，`volc.bigasr.auc_turbo`，`VOLC_ASR_BATCH_RESOURCE_ID` 可覆盖）。
 - 端点可用 `VOLC_ASR_WS_URL` / `VOLC_ASR_BATCH_URL` / `VOLC_TTS_URL` / `VOLC_TTS_WS_URL` 覆盖；协议编解码集中在各 provider 的 `protocol.ts` / `bidirectional-protocol.ts` / `batch.ts`。
 - 音色配置的唯一来源是 `config/voices/main.json`（`voiceId` 留空回退环境变量），业务代码没有写死的 Voice ID。
 - 真实验收（可选）：`VOLC_REAL_INTEGRATION=1` + 凭据运行 `tests/volc-real-integration.test.ts`。
@@ -82,7 +82,7 @@ R2_BUCKET=siren-voice
 - Bucket 必须 private；客户端只拿 presigned URL（`SIGNED_URL_TTL_S`，默认 1 小时）。
 - 未配置 R2 时自动回退本地对象存储 `data/objects/`，通过 `/v1/assets/*` 的 HMAC 签名 URL 代理（访问模型与 R2 一致），生产环境会打警告。
 
-## 接入Peer Core
+## 接入 Peer Core（对话主体）
 
 Siren 不绑定任何 LLM；人格 / 记忆 / 对话历史 / 工具全部在 Core：
 
