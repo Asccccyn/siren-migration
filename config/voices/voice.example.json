@@ -1,14 +1,21 @@
 {
   "id": "main",
-  "displayName": "对方",
+  "displayName": "他",
   "language": "zh-CN",
   "provider": "volc",
   "voiceId": "",
   "defaultEmotion": "warm",
   "defaultSpeed": 1.0,
   "emotionMap": {
-    "warm": { "speed_ratio": 0.95 },
-    "sleepy": { "speed_ratio": 0.85 },
-    "excited": { "emotion": "happy", "emotion_scale": 4 }
+    "warm": {
+      "speed_ratio": 0.95
+    },
+    "sleepy": {
+      "speed_ratio": 0.85
+    },
+    "excited": {
+      "emotion": "happy",
+      "emotion_scale": 4
+    }
   }
 }

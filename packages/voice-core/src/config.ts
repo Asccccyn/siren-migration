@@ -156,7 +156,7 @@ function resolvePaths(env: EnvSource, cwd: string, dataDir: string) {
     tmpDir: resolve(dataDir, 'tmp'),
     fillersDir: resolve(dataDir, 'fillers'),
     logsDir: resolve(dataDir, 'logs'),
-    voicesDir: resolve(cwd, './config/voices'),
+    voicesDir: resolve(cwd, './data/voices'),
     playgroundDir: resolve(cwd, './apps/playground/public'),
     localObjectDir: resolve(cwd, env.LOCAL_OBJECT_DIR ?? './data/objects')
   };
