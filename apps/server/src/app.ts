@@ -32,6 +32,7 @@ import {
 import type { Logger } from '@siren/telemetry';
 import { createLogger } from '@siren/telemetry';
 import { registerAuthHook } from './auth.ts';
+import { createOAuth } from './oauth/index.ts';
 import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
 import { registerCallSessionRoutes } from './routes/call-session.ts';
@@ -158,7 +159,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     options: { maxPayload: config.wsMaxPayloadBytes }
   });
 
-  registerAuthHook(app, config);
+  const oauth = createOAuth(config, logger);
+  registerAuthHook(app, config, oauth.acceptBearer);
   registerHealthRoute(app, {
     version: SIREN_VERSION,
     providers: {
@@ -180,6 +182,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   });
   registerPlayRoute(app, { voice });
   registerWebAuthRoute(app, { config });
+  await oauth.registerRoutes(app);
   registerCallWebSocket(app, { config, logger, callCenter });
   registerMcpRoute(app, { voice, store: providers.store, logger, version: SIREN_VERSION });
 
