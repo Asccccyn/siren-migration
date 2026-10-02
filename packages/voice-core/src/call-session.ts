@@ -214,11 +214,13 @@ export class CallSession {
       outputStreamId: newOutputStreamId(),
       nextSequence: 0,
       userText: '',
+      asrPartials: 0,
       asr: createAsrSession(
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
         (text) => {
           // F09：旧 turn 的迟到 partial 不得写入共享 lastPartialText / 转发给客户端
           if (this.turn !== turn || this.closed) return;
+          turn.asrPartials += 1;
           this.lastPartialText = text;
           this.sendJson({ t: 'partial', text });
         },
@@ -236,12 +238,17 @@ export class CallSession {
       written: false
     };
     this.turn = turn;
-    // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）；记录就绪耗时供空转写诊断
+    // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）。
+    // info 级就绪日志（1002 空转写排障）：ready=false 即建连失败/挂起，是关键鉴别信号
     const connectStartedAt = Date.now();
     void this.turn.asr
       .connect()
       .then(() => {
-        this.log.debug('asr_session_ready', { turn_index: turn.index, ms: Date.now() - connectStartedAt });
+        this.log.info('asr_session_ready', {
+          turn_index: turn.index,
+          ms: Date.now() - connectStartedAt,
+          ready: turn.asr.isReady
+        });
       })
       .catch(() => undefined);
     this.sendJson({ t: 'state', state: 'listening' });
@@ -267,10 +274,11 @@ export class CallSession {
     turn.metrics.mark('asr_final');
     if (!transcript) {
       // 空转写不再静默丢弃（实测故障模式：打断后续接轮拿到空 final，用户对黑箱说话）：
-      // 留 warn + fed_bytes 供诊断，客户端给"没听清"提示
+      // 留 warn + fed_bytes/partials 供诊断，客户端给"没听清"提示
       this.log.warn('asr_empty_transcript', {
         turn_index: turn.index,
-        fed_bytes: turn.asr.fedBytes
+        fed_bytes: turn.asr.fedBytes,
+        partials: turn.asrPartials
       });
       this.sendJson({ t: 'notice', code: 'empty_transcript', message: '没听清，请再说一遍' });
       this.backToListening();
@@ -288,7 +296,9 @@ export class CallSession {
   private async adoptTranscript(turn: ActiveTurn): Promise<string | null> {
     const outcome = await adoptTranscript(turn.asr, {
       graceMs: this.deps.config.partialGraceMs,
-      // F08：传 getter——grace 到期时读的是等待期间持续更新的最新 partial
+      // F08：传 getter——grace 到期时读的是等待期间持续更新的最新 partial；
+      // 空 partial 不采纳（1002 实测：空宽限把建连失败/火山静音掩盖成"空转写"），
+      // 改为等 end() 落定（其内部有建连/终包限时），失败可见化
       getLatestPartial: () => (this.turn === turn ? this.lastPartialText : '')
     });
     if (outcome.kind === 'error') {

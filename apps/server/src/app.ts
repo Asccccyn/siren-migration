@@ -193,18 +193,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
       const html = (await readFile(voiceboxHtml, 'utf8'))
         .replaceAll('__PEER_NAME__', config.peerName)
         .replaceAll('__MAILBOX_NAME__', config.mailboxName);
-      await reply.header('content-type', 'text/html; charset=utf-8').send(html);
+      // 唯一入口页禁缓存：手机浏览器对旧 JS 的粘性缓存会让她跑旧版客户端逻辑
+      await reply.header('content-type', 'text/html; charset=utf-8').header('cache-control', 'no-cache').send(html);
       return;
     }
     await reply.code(404).send({ error: 'web_not_built', hint: 'apps/web/public/voicebox.html 缺失' });
   });
 
-  // 唯一入口页的静态资源（css / 客户端 js），无独立页面
+  // 唯一入口页的静态资源（css / 客户端 js），无独立页面；no-cache 保证修复及时送达
   if (existsSync(config.webDir)) {
     await app.register(fastifyStatic, {
       root: config.webDir,
       prefix: '/assets/',
-      index: false
+      index: false,
+      setHeaders: (res) => {
+        res.setHeader('cache-control', 'no-cache');
+      }
     });
   }
 

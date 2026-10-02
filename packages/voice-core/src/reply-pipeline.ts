@@ -51,6 +51,8 @@ export interface ActiveTurn {
   nextSequence: number;
   userText: string;
   asr: PrebufferedAsrSession;
+  /** 本轮收到的 ASR partial 数（1002 空转写排障：0=火山侧全聋） */
+  asrPartials: number;
   metrics: LatencyTracker;
   startedAt: number;
   /** 用户显式 abort */
