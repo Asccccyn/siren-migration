@@ -25,7 +25,7 @@ export interface SirenConfig {
   fillersDir: string;
   logsDir: string;
   voicesDir: string;
-  playgroundDir: string;
+  webDir: string;
 
   providers: {
     asr: string;
@@ -157,7 +157,7 @@ function resolvePaths(env: EnvSource, cwd: string, dataDir: string) {
     fillersDir: resolve(dataDir, 'fillers'),
     logsDir: resolve(dataDir, 'logs'),
     voicesDir: resolve(cwd, './data/voices'),
-    playgroundDir: resolve(cwd, './apps/playground/public'),
+    webDir: resolve(cwd, './apps/web/public'),
     localObjectDir: resolve(cwd, env.LOCAL_OBJECT_DIR ?? './data/objects')
   };
 }

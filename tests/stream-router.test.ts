@@ -6,7 +6,7 @@
  * - pcm_end + 播放器 idle -> drained；interrupted 流不期待 drained
  */
 import { describe, expect, it } from 'vitest';
-import { StreamRouter, type PcmHeader } from '../apps/playground/src/stream-router.ts';
+import { StreamRouter, type PcmHeader } from '../apps/web/src/stream-router.ts';
 
 interface Log {
   dropped: { reason: string; details: Record<string, unknown> }[];

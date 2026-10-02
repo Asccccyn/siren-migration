@@ -38,7 +38,7 @@ v1 只有一个 Node 进程（`apps/server`），统一挂载：
 | 实时通话 | `/ws/call/:callId` |
 | Health | `GET /health` |
 | 资源代理（本地存储模式） | `/v1/assets/*` |
-| Playground | `/playground/` |
+| Web（唯一入口页资源） | `/assets/*` |
 
 Cloudflare Tunnel：`voice.example.invalid → http://127.0.0.1:8790`。
 
@@ -57,7 +57,7 @@ Cloudflare Tunnel：`voice.example.invalid → http://127.0.0.1:8790`。
 | `packages/providers/mock` | 开发 / 测试 Mock |
 | `packages/voice-core` | VoiceService、CallSession、状态机、切句、Filler、Token、配置、ReplyPipeline、CascadeRealtimeProvider |
 | `apps/server` | Fastify 应用（REST + WS + MCP） |
-| `apps/playground` | 独立语音测试页（pre-roll / 本地 barge-in / stream router 均在此层） |
+| `apps/web` | 唯一入口页客户端（pre-roll / 本地 barge-in / stream router 均在此层） |
 
 ## 4. 关键设计约束
 

@@ -5,7 +5,7 @@
  * 修复：候选语音期间冻结噪声估计；平滑系数按真实块间隔（NOISE_TAU_MS）归一化。
  */
 import { describe, expect, it } from 'vitest';
-import { VadMachine, type VadParams } from '../apps/playground/src/vad.ts';
+import { VadMachine, type VadParams } from '../apps/web/src/vad.ts';
 
 const PARAMS: VadParams = { confirmMs: 200, minSpeechMs: 400, endSilenceMs: 700, rmsRatio: 4 };
 

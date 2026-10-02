@@ -1,6 +1,6 @@
 /**
  * Fastify 应用装配（buildApp 可注入依赖，供测试复用）。
- * 单进程统一挂载：REST / MCP / WebSocket / Health / Assets / Playground（规范第 3 节）。
+ * 单进程统一挂载：REST / MCP / WebSocket / Health / Web（规范第 3 节）。
  */
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -184,7 +184,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   registerMcpRoute(app, { voice, store: providers.store, logger, version: SIREN_VERSION });
 
   // 根路径 = 唯一入口（一个网址，页内三标签）：注入显示名（身份映射，真实称呼在 .env）
-  const voiceboxHtml = join(config.playgroundDir, 'voicebox.html');
+  const voiceboxHtml = join(config.webDir, 'voicebox.html');
   app.get('/', async (_request, reply) => {
     if (existsSync(voiceboxHtml)) {
       const html = (await readFile(voiceboxHtml, 'utf8'))
@@ -193,31 +193,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
       await reply.header('content-type', 'text/html; charset=utf-8').send(html);
       return;
     }
-    await reply.redirect('/playground/');
+    await reply.code(404).send({ error: 'web_not_built', hint: 'apps/web/public/voicebox.html 缺失' });
   });
 
-  // 旧短路径收拢回唯一入口（不再有第二、第三个地址）
-  for (const legacy of ['/realtime', '/async']) {
-    app.get(legacy, async (_request, reply) => {
-      await reply.redirect('/', 302);
-    });
-  }
-
-  if (existsSync(config.playgroundDir)) {
+  // 唯一入口页的静态资源（css / 客户端 js），无独立页面
+  if (existsSync(config.webDir)) {
     await app.register(fastifyStatic, {
-      root: config.playgroundDir,
-      prefix: '/playground/',
-      index: 'index.html'
-    });
-    app.get('/playground', async (_request, reply) => {
-      await reply.redirect('/playground/');
-    });
-  } else {
-    app.get('/playground', async (_request, reply) => {
-      await reply.code(404).send({
-        error: 'playground_not_built',
-        hint: '在仓库根目录运行 pnpm build 后重启服务'
-      });
+      root: config.webDir,
+      prefix: '/assets/',
+      index: false
     });
   }
 

@@ -5,7 +5,7 @@
  * - F19：Pcm16Framer 需要 flush（末帧收尾）语义，残余不再跨 utterance 串音
  */
 import { describe, expect, it } from 'vitest';
-import { Float32Resampler, Pcm16Framer } from '../apps/playground/src/uplink-encoder.ts';
+import { Float32Resampler, Pcm16Framer } from '../apps/web/src/uplink-encoder.ts';
 
 describe('Float32Resampler（F20：分数相位）', () => {
   it('44.1kHz -> 16kHz：60s 输入按 128 样本分块，输出恰好 960,000 样本', () => {

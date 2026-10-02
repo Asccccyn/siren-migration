@@ -1,6 +1,6 @@
 /** P0-1：客户端 pre-roll ring buffer 行为 */
 import { describe, expect, it } from 'vitest';
-import { AudioPreRollBuffer } from '../apps/playground/src/pre-roll-buffer.ts';
+import { AudioPreRollBuffer } from '../apps/web/src/pre-roll-buffer.ts';
 
 const BLOCK = 160; // 10ms @16k
 

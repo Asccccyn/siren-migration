@@ -29,7 +29,7 @@ export function registerPlayRoute(app: FastifyInstance, deps: PlayRoutesDeps): v
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title} · 听见</title>
-<link rel="stylesheet" href="/playground/siren.css">
+<link rel="stylesheet" href="/assets/siren.css">
 <style>
   body { display: flex; align-items: center; justify-content: center; min-height: 100svh; }
   .wrap { max-width: 460px; width: 100%; padding-bottom: 0; }

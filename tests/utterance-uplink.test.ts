@@ -5,10 +5,10 @@
  * - 本地 barge-in：AI 活跃时 VAD start -> 先停播再 abort，不等服务端往返
  */
 import { describe, expect, it } from 'vitest';
-import { VadMachine, type VadParams } from '../apps/playground/src/vad.ts';
-import { AudioPreRollBuffer } from '../apps/playground/src/pre-roll-buffer.ts';
-import { Pcm16Framer } from '../apps/playground/src/uplink-encoder.ts';
-import { UtteranceUplink } from '../apps/playground/src/utterance-uplink.ts';
+import { VadMachine, type VadParams } from '../apps/web/src/vad.ts';
+import { AudioPreRollBuffer } from '../apps/web/src/pre-roll-buffer.ts';
+import { Pcm16Framer } from '../apps/web/src/uplink-encoder.ts';
+import { UtteranceUplink } from '../apps/web/src/utterance-uplink.ts';
 
 const BLOCK = 160; // 10ms @16k
 

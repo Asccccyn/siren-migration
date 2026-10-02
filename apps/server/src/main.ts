@@ -40,7 +40,7 @@ async function bootstrap(): Promise<void> {
     port: config.port,
     env: config.env,
     providers: siren.providers.active,
-    playground: `http://${config.host}:${config.port}/playground/`,
+    web: `http://${config.host}:${config.port}/`,
     mcp: `http://${config.host}:${config.port}/mcp`,
     warnings: siren.providers.warnings.length
   });

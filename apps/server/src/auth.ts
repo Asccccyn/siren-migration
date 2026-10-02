@@ -10,15 +10,15 @@ import type { SirenConfig } from '@siren/voice-core';
 
 /**
  * 显式开放路径前缀（默认拒绝之外的白名单）：
- * - /：语音信箱页（客户端凭 web 登录换取的 token 调 API，页面本身公开）
- * - /health、/playground：公开探活/静态页
- * - /realtime、/async：实时通话/异步语音页（同语音信箱：页面公开，数据走 Bearer）
+ * - /：语音信箱页（唯一入口，客户端凭 web 登录换取的 token 调 API，页面本身公开）
+ * - /assets：唯一入口页的静态资源（css/js，无独立页面）
+ * - /health：公开探活
  * - /v1/assets：签名资源（鉴权在签名层，规范第 36 节）
  * - /v1/web/login：网页密码登录（人类入口，服务端自限速）
  * - /play：语音播放页（id 为不可枚举 UUID，页面即凭证）
  * - /ws：实时通话握手，自带 call token 校验（verifyToken），不经 Bearer
  */
-const OPEN_PREFIXES = ['/', '/health', '/playground', '/realtime', '/async', '/v1/assets', '/v1/web', '/play', '/ws'];
+const OPEN_PREFIXES = ['/', '/health', '/assets', '/v1/assets', '/v1/web', '/play', '/ws'];
 
 /**
  * 把请求 URL 归一化成路由器实际匹配的路径：去 query/fragment、折叠重复斜杠、

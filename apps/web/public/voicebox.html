@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>听见 · Siren</title>
-<link rel="stylesheet" href="/playground/siren.css" />
+<link rel="stylesheet" href="/assets/siren.css" />
 <style>
   /* 登录视图（密码由部署者在 SIREN_WEB_PASSWORD 自行设置） */
   #loginView { min-height: 100svh; display: flex; flex-direction: column; justify-content: center; padding-bottom: 8vh; }
@@ -37,7 +37,7 @@
   .peer-note { color: var(--dim); font-size: 13px; margin-top: 6px; }
   .peer-note b { color: var(--gold-bright); font-weight: 500; }
 
-  /* 通话页专属（与原 realtime.html 一致） */
+  /* 通话页专属（通话标签页专属） */
   .call-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
   .call-row .input-line { flex: 1 1 200px; }
   .vad-grid { display: flex; gap: 14px 22px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
@@ -47,7 +47,7 @@
   #reply { min-height: 26px; margin: 0; }
   .subhead { margin: 18px 0 10px !important; }
 
-  /* 异步页专属（与原 async.html 一致） */
+  /* 异步页专属（异步标签页专属） */
   .rec-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .rec-row .input-line { flex: 1 1 180px; }
   #asrOut { min-height: 72px; }
@@ -226,7 +226,7 @@
   function loadFeatureScripts() {
     if (scriptsLoaded) return;
     scriptsLoaded = true;
-    for (const src of ['/playground/realtime-call-test.js', '/playground/async-voice-test.js']) {
+    for (const src of ['/assets/realtime-call-test.js', '/assets/async-voice-test.js']) {
       const s = document.createElement('script');
       s.src = src;
       document.body.appendChild(s);
