@@ -183,6 +183,7 @@ async function setupCapture(): Promise<void> {
     sendJson: (message) => sendJson(message),
     sendFrame: (frame) => sendFrame(frame),
     isAiActive: () => serverState === 'thinking' || serverState === 'speaking',
+    isAiSpeaking: () => serverState === 'speaking',
     onLocalBargeIn: () => player?.stopAll(),
     log: (message) => logEvent(message)
   });
@@ -234,6 +235,9 @@ function handleServerMessage(message: Record<string, unknown>): void {
       break;
     case 'reply':
       ui.reply.textContent = String(message.text ?? '');
+      break;
+    case 'notice':
+      logEvent(String(message.message ?? ''));
       break;
     case 'metrics':
       renderMetrics(message.metrics as Record<string, unknown>);

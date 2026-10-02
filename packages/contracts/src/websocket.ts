@@ -111,6 +111,7 @@ export type ServerWsMessage =
   | { t: 'interrupted'; stream_id?: string }
   | { t: 'metrics'; metrics: TurnLatencyMetrics }
   | { t: 'pong' }
+  | { t: 'notice'; code: string; message: string }
   | { t: 'error'; code: string; message: string };
 
 /** 单轮延迟指标（规范第 39 节），随 metrics 帧下发给前端展示 */

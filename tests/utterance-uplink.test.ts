@@ -24,7 +24,9 @@ interface Harness {
  * 构造可控 VAD 环境：直接用真实 VadMachine，但注入快进时钟与低阈值，
  * 通过静音块 + 高幅块序列驱动 start/end。
  */
-function buildHarness(options: { confirmMs?: number; aiActive?: () => boolean } = {}): Harness {
+function buildHarness(
+  options: { confirmMs?: number; aiActive?: () => boolean; aiSpeaking?: () => boolean } = {}
+): Harness {
   const json: Record<string, unknown>[] = [];
   const frames: ArrayBuffer[] = [];
   const bargeIns: number[] = [];
@@ -45,6 +47,7 @@ function buildHarness(options: { confirmMs?: number; aiActive?: () => boolean } 
     sendJson: (message) => json.push(message),
     sendFrame: (frame) => frames.push(frame),
     isAiActive: options.aiActive ?? (() => false),
+    isAiSpeaking: options.aiSpeaking,
     onLocalBargeIn: () => bargeIns.push(clockMs)
   });
   return {
@@ -190,5 +193,47 @@ describe('UtteranceUplink（P0-1 pre-roll / P0-2 本地 barge-in）', () => {
     h.uplink.endPtt();
     expect(h.json.filter((m) => m.t === 'start').length).toBe(2);
     expect(h.json.filter((m) => m.t === 'end').length).toBe(2);
+  });
+});
+
+describe('UtteranceUplink（P0-4 回声防护：AI speaking 期间 VAD 不触发打断/上行）', () => {
+  it('speaking 中 VAD start 被吞：不 abort、不 start、不上行、不停播', () => {
+    const h = buildHarness({ aiSpeaking: () => true });
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 8; i++) h.tick(loud(i));
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
+    expect(h.json.filter((m) => m.t === 'abort').length).toBe(0);
+    expect(h.bargeIns.length).toBe(0);
+    expect(h.frames.length).toBe(0); // 音频只进 pre-roll，不上行
+  });
+
+  it('他说完回 listening 且用户仍在说话：自动接上，句首来自 pre-roll', () => {
+    let speaking = true;
+    const h = buildHarness({ aiSpeaking: () => speaking });
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 8; i++) h.tick(loud(i)); // VAD start 被吞，preroll 积累
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
+    speaking = false;
+    h.uplink.onServerState('listening'); // vadSpeech 仍为 true -> 自动接上
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(1);
+    expect(h.frames.length).toBeGreaterThan(0);
+    // 继续说话正常直发，静音后正常断句
+    for (let i = 0; i < 6; i++) h.tick(loud(i));
+    for (let i = 0; i < 8; i++) h.tick(SILENT);
+    expect(h.json.filter((m) => m.t === 'end').length).toBe(1);
+  });
+
+  it('他说完前用户已停下：回 listening 不自动开启新 utterance', () => {
+    let speaking = true;
+    const h = buildHarness({ aiSpeaking: () => speaking });
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 8; i++) h.tick(loud(i)); // start 被吞
+    for (let i = 0; i < 10; i++) h.tick(SILENT); // VAD end：用户已停
+    speaking = false;
+    h.uplink.onServerState('listening');
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
+    // 之后重新开口走正常路径
+    for (let i = 0; i < 8; i++) h.tick(loud(i));
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(1);
   });
 });

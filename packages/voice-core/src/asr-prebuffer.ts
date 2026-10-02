@@ -13,12 +13,16 @@ export class PrebufferedAsrSession implements AsrStream {
   private readyWaiters: (() => void)[] = [];
   private aborted = false;
   private readyPromise: Promise<void> | null = null;
+  /** 已喂入本会话的总 PCM 字节数（含 pre-buffer 部分）——空转写诊断用 */
+  private fedBytesTotal = 0;
 
   constructor(
     private readonly provider: StreamAsrProvider,
     private readonly options: StreamAsrOptions,
     private readonly handlers: AsrStreamHandlers,
-    private readonly maxBufferBytes: number
+    private readonly maxBufferBytes: number,
+    /** end() 时等待建连就绪的超时：超时按失败上抛，禁止"无声无息变空文本" */
+    private readonly readyTimeoutMs = 2500
   ) {}
 
   /** 触发建连（幂等） */
@@ -59,6 +63,10 @@ export class PrebufferedAsrSession implements AsrStream {
     return this.session !== null;
   }
 
+  get fedBytes(): number {
+    return this.fedBytesTotal;
+  }
+
   /** 已缓冲且尚未发送的字节数（测试用） */
   get bufferedBytes(): number {
     return this.pendingBytes;
@@ -66,6 +74,7 @@ export class PrebufferedAsrSession implements AsrStream {
 
   feed(pcm: Buffer): void {
     if (this.aborted) return;
+    this.fedBytesTotal += pcm.length;
     if (this.session) {
       this.session.feed(pcm);
       return;
@@ -99,7 +108,14 @@ export class PrebufferedAsrSession implements AsrStream {
   }
 
   async end(): Promise<{ text: string; language: string; durationMs: number }> {
-    await this.ready();
+    // 建连就绪限时：防止 connect 永不落定导致上层宽限赛跑拿到空 partial 而"静默空转写"
+    const timeout = new Promise<'timeout'>((resolve) => {
+      setTimeout(() => resolve('timeout'), this.readyTimeoutMs);
+    });
+    const ready = await Promise.race([this.ready().then(() => 'ready' as const), timeout]);
+    if (ready === 'timeout' && !this.session) {
+      throw new Error(`asr connect not ready within ${this.readyTimeoutMs}ms`);
+    }
     if (this.sessionError) {
       throw this.sessionError;
     }

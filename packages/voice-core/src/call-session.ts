@@ -236,8 +236,14 @@ export class CallSession {
       written: false
     };
     this.turn = turn;
-    // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）
-    void this.turn.asr.connect().catch(() => undefined);
+    // 立即触发建连：prebuffer 在建连期间累积（规范第 22 节）；记录就绪耗时供空转写诊断
+    const connectStartedAt = Date.now();
+    void this.turn.asr
+      .connect()
+      .then(() => {
+        this.log.debug('asr_session_ready', { turn_index: turn.index, ms: Date.now() - connectStartedAt });
+      })
+      .catch(() => undefined);
     this.sendJson({ t: 'state', state: 'listening' });
     this.log.info('turn_started', { turn_index: this.turnIndex, turn_id: this.turn.turnId });
   }
@@ -260,6 +266,13 @@ export class CallSession {
     if (transcript === null) return; // 失败已处理 / 已被 abort 接管
     turn.metrics.mark('asr_final');
     if (!transcript) {
+      // 空转写不再静默丢弃（实测故障模式：打断后续接轮拿到空 final，用户对黑箱说话）：
+      // 留 warn + fed_bytes 供诊断，客户端给"没听清"提示
+      this.log.warn('asr_empty_transcript', {
+        turn_index: turn.index,
+        fed_bytes: turn.asr.fedBytes
+      });
+      this.sendJson({ t: 'notice', code: 'empty_transcript', message: '没听清，请再说一遍' });
       this.backToListening();
       return;
     }

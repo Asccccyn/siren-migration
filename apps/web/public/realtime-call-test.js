@@ -343,6 +343,10 @@
       __publicField(this, "sending", false);
       /** 一次 AI 轮次只发一次本地 abort；回 listening 后重新武装 */
       __publicField(this, "bargeInArmed", true);
+      /** 回声防护：speaking 期间吞掉的 VAD start，等回 listening 再决定是否接上 */
+      __publicField(this, "suppressedBySpeaking", false);
+      /** 最近一次 VAD 判定是否处于说话中（suppression 恢复用，与 sending 解耦） */
+      __publicField(this, "vadSpeech", false);
     }
     get sendingActive() {
       return this.sending;
@@ -377,6 +381,13 @@
     onServerState(state) {
       if (state === "listening" || state === "idle" || state === "interrupted") {
         this.bargeInArmed = true;
+        if (this.suppressedBySpeaking) {
+          this.suppressedBySpeaking = false;
+          if (this.vadSpeech) {
+            this.beginSending();
+            this.deps.log?.("\u56DE\u58F0\u9632\u62A4\u89E3\u9664\uFF1A\u6062\u590D\u4E0A\u884C\uFF08\u53E5\u9996\u6765\u81EA pre-roll\uFF09");
+          }
+        }
       }
     }
     /** 16kHz Float32 采样块入口（已重采样） */
@@ -390,6 +401,11 @@
         this.deps.preRoll.push(samples);
       }
       const outcome = this.deps.vad.process(samples);
+      if (outcome.event === "start") {
+        this.vadSpeech = true;
+      } else if (outcome.event === "end") {
+        this.vadSpeech = false;
+      }
       let consumedByFlush = false;
       if (outcome.event === "start") {
         consumedByFlush = this.handleVadStart();
@@ -423,6 +439,11 @@
       this.deps.framer.reset();
     }
     handleVadStart() {
+      if (this.deps.isAiSpeaking?.()) {
+        this.suppressedBySpeaking = true;
+        this.deps.log?.("AI speaking\uFF1A\u5FFD\u7565\u672C\u6B21 VAD start\uFF08\u56DE\u58F0\u9632\u62A4\uFF09\uFF0C\u53E5\u9996\u7559\u5728 pre-roll");
+        return false;
+      }
       if (this.deps.isAiActive() && this.bargeInArmed) {
         this.bargeInArmed = false;
         this.deps.onLocalBargeIn?.();
@@ -430,11 +451,15 @@
         this.deps.log?.("\u672C\u5730 barge-in\uFF1A\u7ACB\u5373\u505C\u64AD + abort\uFF08\u4E0D\u7B49\u670D\u52A1\u7AEF\u5F80\u8FD4\uFF09");
       }
       if (this.sending) return false;
+      this.beginSending();
+      return true;
+    }
+    /** 开始一次上行 utterance：start + flush pre-roll（句首保护） */
+    beginSending() {
       this.sending = true;
       this.deps.sendJson({ t: "start" });
       this.deps.log?.(`VAD: \u8BF4\u8BDD\u5F00\u59CB -> start\uFF08pre-roll ${Math.round(this.deps.preRoll.bufferedMs)}ms\uFF09`);
       this.sendFrames(this.deps.preRoll.drain());
-      return true;
     }
     handleVadEnd(outcome) {
       if (outcome.event !== "end") return;
@@ -950,6 +975,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       sendJson: (message) => sendJson(message),
       sendFrame: (frame) => sendFrame(frame),
       isAiActive: () => serverState === "thinking" || serverState === "speaking",
+      isAiSpeaking: () => serverState === "speaking",
       onLocalBargeIn: () => player?.stopAll(),
       log: (message) => logEvent(message)
     });
@@ -998,6 +1024,9 @@ ${ui.asrLog.textContent ?? ""}`;
         break;
       case "reply":
         ui.reply.textContent = String(message.text ?? "");
+        break;
+      case "notice":
+        logEvent(String(message.message ?? ""));
         break;
       case "metrics":
         renderMetrics(message.metrics);
