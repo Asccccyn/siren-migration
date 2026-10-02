@@ -57,6 +57,15 @@ CoreBridge 与 conversation 所有权不变。
     chunk 携带真实 sampleRate（P0-7）。
   - 情绪映射：`voice-map.ts` 的 emotion / emotion_scale 进入 `audio_params`；
     语速映射为 `speech_rate`（[-50,100]）；音色 ID 只来自 profile / `VOLC_VOICE_ID`。
+- **声音复刻音色（v3 资源互斥坑）**：复刻音色（控制台「声音复刻」得到的
+  `S_xxx` / `saturn_xxx` 音色 ID）与系统音色分属不同资源，`X-Api-Resource-Id`
+  必须对应：复刻 2.0 用 `seed-icl-2.0`、复刻 1.0 用 `seed-icl-1.0`（需先在
+  控制台开通 megatts）；系统音色用 `seed-tts-2.0` / `volc.service_type.10029`。
+  用错资源时服务端报 `55000000`（= 该资源下音色不存在，与乱编音色 ID 同症），
+  资源未开通报 `45000030 requested resource not granted`。由于
+  `VOLC_TTS_RESOURCE_ID` 是全局单值，切到复刻音色后 `VOLC_VOICE_ID` 的系统
+  音色兜底在该资源下不可用，反之亦然。复刻音色 ID 填在 `data/voices/`
+  各 profile 的 `voiceId`（个人配置，gitignore，不入库）。
 - 旧的「句子级批量 + 预取」假流式实现已删除。
 
 ## ElevenLabs（packages/providers/elevenlabs-tts）
