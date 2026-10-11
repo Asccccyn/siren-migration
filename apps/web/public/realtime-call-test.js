@@ -28,9 +28,6 @@
     get lastRmsValue() {
       return this.lastRms;
     }
-    get isSpeaking() {
-      return this.inSpeech;
-    }
     process(samples) {
       let sum = 0;
       for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
@@ -341,10 +338,8 @@
       __publicField(this, "mode", "vad");
       __publicField(this, "muted", false);
       __publicField(this, "sending", false);
-      /** 一次 AI 轮次只发一次本地 abort；回 listening 后重新武装 */
-      __publicField(this, "bargeInArmed", true);
-      /** 回声防护：speaking 期间吞掉的 VAD start，等回 listening 再决定是否接上 */
-      __publicField(this, "suppressedBySpeaking", false);
+      /** AI 活跃期间吞掉的 VAD start，等回 listening 再决定是否接上 */
+      __publicField(this, "suppressedByAi", false);
       /** 最近一次 VAD 判定是否处于说话中（suppression 恢复用，与 sending 解耦） */
       __publicField(this, "vadSpeech", false);
     }
@@ -377,15 +372,14 @@
         }
       }
     }
-    /** 服务端 state 帧驱动；回 listening/idle 时重新武装本地 barge-in */
+    /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance */
     onServerState(state) {
       if (state === "listening" || state === "idle" || state === "interrupted") {
-        this.bargeInArmed = true;
-        if (this.suppressedBySpeaking) {
-          this.suppressedBySpeaking = false;
+        if (this.suppressedByAi) {
+          this.suppressedByAi = false;
           if (this.vadSpeech) {
             this.beginSending();
-            this.deps.log?.("\u56DE\u58F0\u9632\u62A4\u89E3\u9664\uFF1A\u6062\u590D\u4E0A\u884C\uFF08\u53E5\u9996\u6765\u81EA pre-roll\uFF09");
+            this.deps.log?.("\u534A\u53CC\u5DE5\u95E8\u63A7\u89E3\u9664\uFF1A\u6062\u590D\u4E0A\u884C\uFF08\u53E5\u9996\u6765\u81EA pre-roll\uFF09");
           }
         }
       }
@@ -434,21 +428,16 @@
     /** teardown 时复位 */
     reset() {
       this.sending = false;
-      this.bargeInArmed = true;
+      this.suppressedByAi = false;
+      this.vadSpeech = false;
       this.deps.preRoll.clear();
       this.deps.framer.reset();
     }
     handleVadStart() {
-      if (this.deps.isAiSpeaking?.()) {
-        this.suppressedBySpeaking = true;
-        this.deps.log?.("AI speaking\uFF1A\u5FFD\u7565\u672C\u6B21 VAD start\uFF08\u56DE\u58F0\u9632\u62A4\uFF09\uFF0C\u53E5\u9996\u7559\u5728 pre-roll");
+      if (this.deps.isAiActive()) {
+        this.suppressedByAi = true;
+        this.deps.log?.("AI \u6D3B\u8DC3\uFF08\u534A\u53CC\u5DE5\uFF09\uFF1A\u5FFD\u7565\u672C\u6B21 VAD start\uFF0C\u53E5\u9996\u7559\u5728 pre-roll");
         return false;
-      }
-      if (this.deps.isAiActive() && this.bargeInArmed) {
-        this.bargeInArmed = false;
-        this.deps.onLocalBargeIn?.();
-        this.deps.sendJson({ t: "abort" });
-        this.deps.log?.("\u672C\u5730 barge-in\uFF1A\u7ACB\u5373\u505C\u64AD + abort\uFF08\u4E0D\u7B49\u670D\u52A1\u7AEF\u5F80\u8FD4\uFF09");
       }
       if (this.sending) return false;
       this.beginSending();
@@ -916,7 +905,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       sendJson({
         t: "ready",
         protocol: PROTOCOL_VERSION,
-        capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+        capabilities: { playback_drain: true, stream_identity: true }
       });
       void setupCapture2();
     };
@@ -975,8 +964,6 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       sendJson: (message) => sendJson(message),
       sendFrame: (frame) => sendFrame(frame),
       isAiActive: () => serverState === "thinking" || serverState === "speaking",
-      isAiSpeaking: () => serverState === "speaking",
-      onLocalBargeIn: () => player?.stopAll(),
       log: (message) => logEvent(message)
     });
     uplink.setMode(ui.modeSelect.value === "ptt" ? "ptt" : "vad");
