@@ -1,8 +1,9 @@
 /**
- * P0-1 / P0-2 客户端上行编排：
- * - VAD start 前的音频最终进入发送队列（pre-roll flush）
- * - start 触发块不重复发送
- * - 本地 barge-in：AI 活跃时 VAD start -> 先停播再 abort，不等服务端往返
+ * 客户端上行编排：
+ * - P0-1：VAD start 前的音频最终进入发送队列（pre-roll flush）；触发块不重复发送
+ * - 半双工（1002 定案）：AI 活跃（thinking/speaking）期间 VAD start 一律吞掉
+ *   ——不 abort、不 start、不上行（回声误触发与自动打断故障区收敛）；
+ *   回 listening 且用户仍在说话时自动接上，句首来自 pre-roll
  */
 import { describe, expect, it } from 'vitest';
 import { VadMachine, type VadParams } from '../apps/web/src/vad.ts';
@@ -16,7 +17,6 @@ interface Harness {
   uplink: UtteranceUplink;
   json: Record<string, unknown>[];
   frames: ArrayBuffer[];
-  bargeIns: number[];
   tick(samples: Float32Array): void;
 }
 
@@ -24,12 +24,9 @@ interface Harness {
  * 构造可控 VAD 环境：直接用真实 VadMachine，但注入快进时钟与低阈值，
  * 通过静音块 + 高幅块序列驱动 start/end。
  */
-function buildHarness(
-  options: { confirmMs?: number; aiActive?: () => boolean; aiSpeaking?: () => boolean } = {}
-): Harness {
+function buildHarness(options: { confirmMs?: number; aiActive?: () => boolean } = {}): Harness {
   const json: Record<string, unknown>[] = [];
   const frames: ArrayBuffer[] = [];
-  const bargeIns: number[] = [];
   const params = (): VadParams => ({
     confirmMs: options.confirmMs ?? 40,
     minSpeechMs: 10,
@@ -46,15 +43,12 @@ function buildHarness(
     framer: new Pcm16Framer(320),
     sendJson: (message) => json.push(message),
     sendFrame: (frame) => frames.push(frame),
-    isAiActive: options.aiActive ?? (() => false),
-    isAiSpeaking: options.aiSpeaking,
-    onLocalBargeIn: () => bargeIns.push(clockMs)
+    isAiActive: options.aiActive ?? (() => false)
   });
   return {
     uplink,
     json,
     frames,
-    bargeIns,
     tick(samples: Float32Array): void {
       clockMs += 10;
       uplink.handleSamples(samples);
@@ -69,7 +63,7 @@ function loud(block: number, count = BLOCK): Float32Array {
   return out;
 }
 
-describe('UtteranceUplink（P0-1 pre-roll / P0-2 本地 barge-in）', () => {
+describe('UtteranceUplink（P0-1 pre-roll / 基础上行）', () => {
   it('VAD start 前的音频通过 pre-roll flush 进入发送队列（首音不丢）', () => {
     const h = buildHarness();
     // 静音期若干块（确立噪声基线）
@@ -107,39 +101,10 @@ describe('UtteranceUplink（P0-1 pre-roll / P0-2 本地 barge-in）', () => {
     expect(bytes).toBeGreaterThanOrEqual(5 * 320 * 2);
   });
 
-  it('AI speaking 时 VAD start 触发本地 barge-in：先停播、再 abort、再 start', () => {
-    let aiActive = true;
-    const h = buildHarness({ aiActive: () => aiActive });
-    for (let i = 0; i < 6; i++) h.tick(SILENT);
-    h.tick(loud(0));
-    h.tick(loud(1));
-    h.tick(loud(2));
-    h.tick(loud(3));
-    h.tick(loud(4));
-    expect(h.bargeIns.length).toBe(1); // 立即停播发生
-    const types = h.json.map((m) => m.t);
-    // abort 在 start 之前（本地打断优先于新 utterance）
-    const abortAt = types.lastIndexOf('abort');
-    const startAt = types.lastIndexOf('start');
-    expect(abortAt).toBeGreaterThanOrEqual(0);
-    expect(startAt).toBeGreaterThan(abortAt);
-    // 一次 AI 轮次只 abort 一次（防抖）：继续说也不重复 abort
-    for (let i = 0; i < 6; i++) h.tick(SILENT);
-    for (let i = 0; i < 6; i++) h.tick(loud(i));
-    expect(h.json.filter((m) => m.t === 'abort').length).toBe(1);
-    // 服务端回 listening 后重新武装
-    aiActive = true;
-    h.uplink.onServerState('listening');
-    for (let i = 0; i < 6; i++) h.tick(SILENT);
-    for (let i = 0; i < 6; i++) h.tick(loud(i));
-    expect(h.json.filter((m) => m.t === 'abort').length).toBe(2);
-  });
-
-  it('AI 空闲（listening）时 VAD start 不触发 barge-in', () => {
+  it('AI 空闲（listening）时 VAD start 正常上行，不发 abort', () => {
     const h = buildHarness({ aiActive: () => false });
     for (let i = 0; i < 6; i++) h.tick(SILENT);
     for (let i = 0; i < 5; i++) h.tick(loud(i));
-    expect(h.bargeIns.length).toBe(0);
     expect(h.json.some((m) => m.t === 'abort')).toBe(false);
     expect(h.json.some((m) => m.t === 'start')).toBe(true);
   });
@@ -196,24 +161,23 @@ describe('UtteranceUplink（P0-1 pre-roll / P0-2 本地 barge-in）', () => {
   });
 });
 
-describe('UtteranceUplink（P0-4 回声防护：AI speaking 期间 VAD 不触发打断/上行）', () => {
-  it('speaking 中 VAD start 被吞：不 abort、不 start、不上行、不停播', () => {
-    const h = buildHarness({ aiSpeaking: () => true });
+describe('UtteranceUplink（半双工：AI 活跃期间 VAD 一律不触发上行/打断）', () => {
+  it('AI active（thinking 或 speaking）中 VAD start 被吞：不 abort、不 start、不上行', () => {
+    const h = buildHarness({ aiActive: () => true });
     for (let i = 0; i < 6; i++) h.tick(SILENT);
     for (let i = 0; i < 8; i++) h.tick(loud(i));
     expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
     expect(h.json.filter((m) => m.t === 'abort').length).toBe(0);
-    expect(h.bargeIns.length).toBe(0);
     expect(h.frames.length).toBe(0); // 音频只进 pre-roll，不上行
   });
 
-  it('他说完回 listening 且用户仍在说话：自动接上，句首来自 pre-roll', () => {
-    let speaking = true;
-    const h = buildHarness({ aiSpeaking: () => speaking });
+  it('AI 回 listening 且用户仍在说话：自动接上，句首来自 pre-roll', () => {
+    let aiActive = true;
+    const h = buildHarness({ aiActive: () => aiActive });
     for (let i = 0; i < 6; i++) h.tick(SILENT);
     for (let i = 0; i < 8; i++) h.tick(loud(i)); // VAD start 被吞，preroll 积累
     expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
-    speaking = false;
+    aiActive = false;
     h.uplink.onServerState('listening'); // vadSpeech 仍为 true -> 自动接上
     expect(h.json.filter((m) => m.t === 'start').length).toBe(1);
     expect(h.frames.length).toBeGreaterThan(0);
@@ -223,13 +187,13 @@ describe('UtteranceUplink（P0-4 回声防护：AI speaking 期间 VAD 不触发
     expect(h.json.filter((m) => m.t === 'end').length).toBe(1);
   });
 
-  it('他说完前用户已停下：回 listening 不自动开启新 utterance', () => {
-    let speaking = true;
-    const h = buildHarness({ aiSpeaking: () => speaking });
+  it('AI 结束前用户已停下：回 listening 不自动开启新 utterance', () => {
+    let aiActive = true;
+    const h = buildHarness({ aiActive: () => aiActive });
     for (let i = 0; i < 6; i++) h.tick(SILENT);
     for (let i = 0; i < 8; i++) h.tick(loud(i)); // start 被吞
     for (let i = 0; i < 10; i++) h.tick(SILENT); // VAD end：用户已停
-    speaking = false;
+    aiActive = false;
     h.uplink.onServerState('listening');
     expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
     // 之后重新开口走正常路径

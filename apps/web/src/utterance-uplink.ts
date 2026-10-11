@@ -1,20 +1,21 @@
 /**
- * 上行 utterance 编排（P0-1 pre-roll / P0-2 本地 barge-in 的客户端逻辑，纯逻辑可测试）。
+ * 上行 utterance 编排（客户端纯逻辑，可测试）。
  *
  * 数据流（16kHz Float32）：
  *   采集块 -> [vad 模式且未发送时] pre-roll 环形缓冲
  *          -> VAD 判定
- *          -> start：本地 barge-in（若 AI 活跃）+ flush pre-roll（含当前块）
+ *          -> start：flush pre-roll（含当前块）+ 开始分帧上行
  *          -> 正在发送：当前块直接分帧上行（start 块已随 flush 消费，不重复发）
  *
- * 本地 barge-in（P0-2 第一层）：VAD 确认用户重新开口且 AI 处于 thinking/speaking
- * 时，先立即停播（onLocalBargeIn -> player.stopAll()），再发 {"t":"abort"}，
- * 不等服务端 interrupted 往返。interrupted 帧仍保留作最终确认/清理。
- *
- * 回声防护（P0-4）：AI speaking 期间的 VAD 触发默认按扬声器回声处理——
- * 不 barge-in、不上行，句首留在 pre-roll；回 listening 后若用户仍在说话则自动接上。
- * 播放走 WebAudio 通道，浏览器 AEC 参考信号覆盖不到，外放必然回声；
- * 想真正中途打断用 UI 手动打断（状态徽章点击）。thinking 期间不受此门控。
+ * 半双工合同（对讲机模型，v2）：
+ * - 仅在服务端 listening 状态采信麦克风（VAD start -> 上行）。
+ * - AI 活跃（thinking/speaking）期间 VAD 触发一律吞掉：不上行、不自动打断。
+ *   动机：① 播放走 WebAudio 通道，浏览器 AEC 参考信号覆盖不到，外放回声必然
+ *   误触发 VAD（P0-4）；② 自动打断路径是实测故障区（打断后紧接轮次 100% 空转写），
+ *   收敛掉整条交互线（1002 定案）。
+ * - 句首始终留在 pre-roll：AI 回 listening 时用户仍在说话则自动接上，不丢句首。
+ * - 想中途打断：UI 手动打断（状态徽章点击）直接发 abort——不经 VAD，
+ *   服务端 handleAbort 机制保留专供手动打断与协议层使用。
  */
 import type { VadMachine, VadOutcome } from './vad.ts';
 import type { AudioPreRollBuffer } from './pre-roll-buffer.ts';
@@ -28,12 +29,8 @@ export interface UtteranceUplinkDeps {
   framer: Pcm16Framer;
   sendJson: (message: Record<string, unknown>) => void;
   sendFrame: (frame: ArrayBuffer) => void;
-  /** AI 处于 thinking/speaking 时返回 true（由服务端 state 帧驱动） */
+  /** AI 处于 thinking/speaking 时返回 true（由服务端 state 帧驱动）——半双工门控 */
   isAiActive: () => boolean;
-  /** AI 处于 speaking（正在出声）时返回 true——回声防护门控用 */
-  isAiSpeaking?: () => boolean;
-  /** 本地 barge-in：先于 abort 帧立即停播 */
-  onLocalBargeIn?: () => void;
   log?: (message: string) => void;
 }
 
@@ -41,10 +38,8 @@ export class UtteranceUplink {
   private mode: UplinkMode = 'vad';
   private muted = false;
   private sending = false;
-  /** 一次 AI 轮次只发一次本地 abort；回 listening 后重新武装 */
-  private bargeInArmed = true;
-  /** 回声防护：speaking 期间吞掉的 VAD start，等回 listening 再决定是否接上 */
-  private suppressedBySpeaking = false;
+  /** AI 活跃期间吞掉的 VAD start，等回 listening 再决定是否接上 */
+  private suppressedByAi = false;
   /** 最近一次 VAD 判定是否处于说话中（suppression 恢复用，与 sending 解耦） */
   private vadSpeech = false;
 
@@ -83,16 +78,15 @@ export class UtteranceUplink {
     }
   }
 
-  /** 服务端 state 帧驱动；回 listening/idle 时重新武装本地 barge-in */
+  /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance */
   onServerState(state: string): void {
     if (state === 'listening' || state === 'idle' || state === 'interrupted') {
-      this.bargeInArmed = true;
-      if (this.suppressedBySpeaking) {
-        this.suppressedBySpeaking = false;
+      if (this.suppressedByAi) {
+        this.suppressedByAi = false;
         if (this.vadSpeech) {
-          // 他说完时你还在说话：现在开始上行，pre-roll 里保留了句首
+          // AI 结束时你还在说话：现在开始上行，pre-roll 里保留了句首
           this.beginSending();
-          this.deps.log?.('回声防护解除：恢复上行（句首来自 pre-roll）');
+          this.deps.log?.('半双工门控解除：恢复上行（句首来自 pre-roll）');
         }
       }
     }
@@ -146,24 +140,19 @@ export class UtteranceUplink {
   /** teardown 时复位 */
   reset(): void {
     this.sending = false;
-    this.bargeInArmed = true;
+    this.suppressedByAi = false;
+    this.vadSpeech = false;
     this.deps.preRoll.clear();
     this.deps.framer.reset();
   }
 
   private handleVadStart(): boolean {
-    // 回声防护（P0-4）：他在出声时 VAD 触发默认视为回声——不 barge-in、不上行
-    if (this.deps.isAiSpeaking?.()) {
-      this.suppressedBySpeaking = true;
-      this.deps.log?.('AI speaking：忽略本次 VAD start（回声防护），句首留在 pre-roll');
+    // 半双工门控：AI 活跃（thinking/speaking）期间不采信 VAD——不上行、不自动打断。
+    // 回声与误触发在这条线上整个消失；句首留在 pre-roll。
+    if (this.deps.isAiActive()) {
+      this.suppressedByAi = true;
+      this.deps.log?.('AI 活跃（半双工）：忽略本次 VAD start，句首留在 pre-roll');
       return false;
-    }
-    // 本地 barge-in（P0-2）：AI 思考中用户重新开口 -> 立即停播 + abort
-    if (this.deps.isAiActive() && this.bargeInArmed) {
-      this.bargeInArmed = false;
-      this.deps.onLocalBargeIn?.();
-      this.deps.sendJson({ t: 'abort' });
-      this.deps.log?.('本地 barge-in：立即停播 + abort（不等服务端往返）');
     }
     if (this.sending) return false; // 已在发送（如上一轮未收尾），当前块正常直发
     this.beginSending();

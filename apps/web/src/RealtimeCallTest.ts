@@ -4,7 +4,7 @@
  * - vad.ts               RMS + 自适应噪声基线
  * - pcm-player.ts        下行连续时间轴播放（jitter buffer + stream 感知 drain）
  * - stream-router.ts     下行流路由（stream_id / sequence / 旧流丢弃）
- * - utterance-uplink.ts  上行编排（pre-roll flush + 本地 barge-in）
+ * - utterance-uplink.ts  上行编排（pre-roll flush + 半双工门控）
  * - uplink-encoder.ts    上行重采样 16k + PCM16 分帧
  */
 export {};
@@ -122,7 +122,7 @@ async function connectSocket(wsUrl: string, token: string): Promise<void> {
     sendJson({
       t: 'ready',
       protocol: PROTOCOL_VERSION,
-      capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+      capabilities: { playback_drain: true, stream_identity: true }
     });
     void setupCapture();
   };
@@ -183,8 +183,6 @@ async function setupCapture(): Promise<void> {
     sendJson: (message) => sendJson(message),
     sendFrame: (frame) => sendFrame(frame),
     isAiActive: () => serverState === 'thinking' || serverState === 'speaking',
-    isAiSpeaking: () => serverState === 'speaking',
-    onLocalBargeIn: () => player?.stopAll(),
     log: (message) => logEvent(message)
   });
   uplink.setMode(ui.modeSelect.value === 'ptt' ? 'ptt' : 'vad');
@@ -193,7 +191,7 @@ async function setupCapture(): Promise<void> {
   logEvent(`采集就绪 rate=${capture.sampleRate} pre-roll=${PRE_ROLL_MS}ms`);
 }
 
-// 采集样本 -> 重采样 16k -> uplink（pre-roll / VAD / barge-in / 分帧上行）
+// 采集样本 -> 重采样 16k -> uplink（pre-roll / VAD / 半双工门控 / 分帧上行）
 function handleCapturedSamples(samples: Float32Array): void {
   if (!resampler || !uplink) return;
   const targetSamples = resampler.push(samples);
@@ -282,7 +280,7 @@ ui.pttBtn.addEventListener('touchend', (event) => {
   uplink?.endPtt();
 });
 
-// Barge-in：说话时点击状态徽章强制打断（手动兜底；VAD 本地打断见 utterance-uplink）
+// 手动打断（唯一打断路径，半双工定案）：AI 活跃时点击状态徽章强制打断
 ui.stateBadge.addEventListener('click', () => {
   if (serverState === 'speaking' || serverState === 'thinking') {
     player?.stopAll();

@@ -1,8 +1,12 @@
 # Siren 实时通话协议（v2）
 
-> 协议版本 2（v1.1 Realtime Hardening）。新增：pre-roll、本地 barge-in、
+> 协议版本 2（v1.1 Realtime Hardening）。新增：pre-roll、打断（abort）、
 > 下行 Stream Identity（stream_id + sequence）、playback_drained、ready 能力协商。
 > 每帧真实采样率始终以 `pcm` 头为准，`ready` 中的 rate 只是期望值。
+>
+> **半双工定案（1002）**：客户端不再做 VAD 自动打断——AI 活跃（thinking/speaking）
+> 期间麦克风判定一律吞掉（回声误触发 + 打断后续轮次空转写故障区收敛），
+> 打断只保留 UI 手动按钮（徽章点击）路径。服务端 abort 机制不变。
 
 ## 建立
 
@@ -32,10 +36,10 @@ GET /ws/call/{call_id}?token={short-lived-token}   (WebSocket)
 
 | 消息 | 说明 |
 |---|---|
-| `{"t":"ready","protocol":2,"capabilities":{...}}` | 连接就绪 + 能力上报（playback_drain / stream_identity / local_barge_in） |
+| `{"t":"ready","protocol":2,"capabilities":{...}}` | 连接就绪 + 能力上报（playback_drain / stream_identity） |
 | `{"t":"start"}` | 开始一次讲话（新建 ASR 会话，建连期间 PCM 由服务端 prebuffer） |
 | `{"t":"end"}` | 结束讲话，等待 final / partial 采纳 |
-| `{"t":"abort"}` | Barge-in：取消当前轮（本地已先停播，此帧用于服务端取消） |
+| `{"t":"abort"}` | 手动打断：取消当前轮（UI 徽章点击触发；本地已先停播，此帧用于服务端取消） |
 | `{"t":"playback_drained","stream_id":"out_..."}` | 该输出流真正播完后 ACK（P0-4） |
 | `{"t":"ping"}` | 保活，回 `pong` |
 
@@ -73,8 +77,8 @@ GET /ws/call/{call_id}?token={short-lived-token}   (WebSocket)
 `pcm_end` 后**保持 speaking**，收到 `playback_drained` 才迁移
 `speaking → listening`；超时（`PLAYBACK_DRAIN_TIMEOUT_MS`，默认 4s）兜底回
 listening，绝不悬挂 session。因此尾音播放期间客户端的
-`isAiActive` 判定仍为 true，本地 barge-in 在尾音阶段照常生效
-（实测 drain 期抢话 <100ms 内 interrupted）。未声明该能力的旧协议客户端
+`isAiActive` 判定仍为 true，半双工门控在尾音阶段继续吞 VAD（不误触发）。
+未声明该能力的旧协议客户端
 `pcm_end` 后立即回 listening（降级行为）。被打断的流不要求 drained。
 
 本轮 turn 的 completed 落库与 `metrics` 帧同样以 drain 的最终结果为准：
@@ -91,11 +95,12 @@ SPEAKING --abort--> INTERRUPTING → LISTENING
 正常说完一句回复是 `speaking → listening` 直达（协议 v2 客户端中间多一段
 drain 等待期，期间状态保持 speaking）；`interrupting` 只用于真实打断。
 
-## Barge-in 语义（三层）
+## 打断语义（三层）
 
-1. **浏览器本地立即停播**（P0-2）：VAD 确认用户重新开口且处于 thinking/speaking
-   时，先 `player.stopAll()` 再发 `{"t":"abort"}`，不等服务端往返；一次 AI 轮次
-   防抖，回 listening 后重新武装。
+1. **浏览器本地立即停播（手动触发）**：用户点击状态徽章（thinking/speaking 时
+   可点）→ `player.stopAll()` + 发 `{"t":"abort"}`，不等服务端往返。
+   VAD 自动打断已移除（半双工定案，见文首）；被吞的句首保留在 pre-roll，
+   回 listening 且用户仍在说话时自动接上。
 2. **Siren server 取消当前轮**：取消 Core 流（core.cancel）、abortTurn、作废旧
    输出流（`interrupted` + stream_id）、清 reply pipeline、回 LISTENING。
 3. **Provider 正式 abort**：turn 级 AbortSignal 立即终止 TTS 上游

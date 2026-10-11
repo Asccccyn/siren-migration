@@ -49,10 +49,6 @@ export class VadMachine {
     return this.lastRms;
   }
 
-  get isSpeaking(): boolean {
-    return this.inSpeech;
-  }
-
   process(samples: Float32Array): VadOutcome {
     let sum = 0;
     for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];

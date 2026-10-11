@@ -353,7 +353,7 @@ export class CallSession {
       this.sendJson({ t: 'pcm_end', stream_id: turn.outputStreamId });
     }
     // drain 门控：pcm_end 只代表服务端发完，客户端还有尾音。v2 客户端等真正
-    // 播完（或超时兜底）才收尾——期间保持 speaking，本地 barge-in 判定仍成立
+    // 播完（或超时兜底）才收尾——期间保持 speaking，半双工门控继续吞 VAD
     if (turn.pcmStarted && this.clientDrainCapable && this.deps.config.playbackDrainTimeoutMs > 0) {
       const drained = await this.armPendingDrain(turn.outputStreamId);
       if (turn.aborted || this.turn !== turn) return; // 尾音被打断：interrupted 流程已接管
