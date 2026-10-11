@@ -214,6 +214,7 @@ export class CallSession {
       outputStreamId: newOutputStreamId(),
       nextSequence: 0,
       userText: '',
+      receivedText: '',
       asrPartials: 0,
       asr: createAsrSession(
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
@@ -301,13 +302,23 @@ export class CallSession {
       // 改为等 end() 落定（其内部有建连/终包限时），失败可见化
       getLatestPartial: () => (this.turn === turn ? this.lastPartialText : '')
     });
-    if (outcome.kind === 'error') {
-      // S1011-004：ASR 失败即终态化——迟到建连/会话不得在 turn 释放后接管
+    if (outcome.kind === 'error' || outcome.kind === 'timeout') {
+      const timedOut = outcome.kind === 'timeout';
+      // S1011-004：ASR 失败/超时即终态化——迟到建连/会话不得在 turn 释放后接管
       turn.asr.abort();
       if (turn.aborted || this.turn !== turn || this.closed) return null; // 已被 abort 接管
-      this.sendJson({ t: 'error', code: 'asr_failed', message: 'speech recognition failed' });
-      this.log.warn('turn_failed', { ...errorFields(outcome.error), stage: 'asr', turn_index: turn.index });
-      this.writeTurn(turn, 'asr_failed');
+      this.sendJson({
+        t: 'error',
+        code: timedOut ? 'asr_timeout' : 'asr_failed',
+        message: timedOut ? 'speech recognition timed out' : 'speech recognition failed'
+      });
+      this.log.warn('turn_failed', {
+        ...(outcome.kind === 'error' ? errorFields(outcome.error) : {}),
+        stage: 'asr',
+        timeout: timedOut,
+        turn_index: turn.index
+      });
+      this.writeTurn(turn, timedOut ? 'asr_timeout' : 'asr_failed');
       this.backToListening();
       return null;
     }
@@ -331,7 +342,13 @@ export class CallSession {
       return;
     }
     if (result.status === 'failed') {
-      // TTS / Core 失败：保留文字，明确降级（规范第 40 节）
+      // TTS / Core 失败：保留文字，明确降级（规范第 40 节）。
+      // S1011-021：Core 中途失败时已收到的原始文本独立保留并下发（含未成句的半句），
+      // 与"已播放正文"（fullText/playedText）语义分离
+      if (result.kind === 'core' && turn.receivedText) {
+        turn.fullText = turn.receivedText;
+        this.sendJson({ t: 'reply', text: turn.receivedText });
+      }
       this.log.warn('turn_failed', {
         ...errorFields(result.error),
         stage: 'reply',

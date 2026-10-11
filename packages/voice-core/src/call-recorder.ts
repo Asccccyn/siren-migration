@@ -5,7 +5,7 @@ import type { CallTurnsRepository } from '@siren/storage';
 import { errorFields, type Logger } from '@siren/telemetry';
 import type { ActiveTurn } from './reply-pipeline.ts';
 
-export type TurnOutcome = 'completed' | 'interrupted' | 'asr_failed';
+export type TurnOutcome = 'completed' | 'interrupted' | 'asr_failed' | 'asr_timeout';
 
 export class CallTurnRecorder {
   constructor(

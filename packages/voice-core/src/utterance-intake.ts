@@ -32,7 +32,15 @@ export function createAsrSession(
 export type TranscriptAdoption =
   | { kind: 'final'; text: string }
   | { kind: 'grace'; text: string }
+  | { kind: 'timeout' }
   | { kind: 'error'; error: unknown };
+
+/**
+ * 端到端 ASR 完成期限（S1011-014）：必须 ≥ Provider 终包窗口（volc 5s）+ 余量。
+ * 此前 450ms 宽限 + 3000ms 二段等待 < 5000ms，会在 Provider 仍在等 final 时
+ * 提前宣判空文本。
+ */
+const ADOPTION_END_TO_END_MS = 5500;
 
 /** 采纳识别结果：end() 与 grace 计时赛跑；失败显式上抛 */
 export async function adoptTranscript(
@@ -41,7 +49,7 @@ export async function adoptTranscript(
     graceMs: number;
     /** F08：grace 到期时读取当前最新 partial——传快照会丢掉等待期间到达的新 partial */
     getLatestPartial: () => string;
-    /** grace 到期且 partial 为空时，继续等 end() 落定的上限（1002 修复：空宽限不再掩盖失败） */
+    /** grace 到期且 partial 为空时，继续等 end() 落定的上限——默认为端到端期限（S1011-014） */
     endWaitMs?: number;
   }
 ): Promise<TranscriptAdoption> {
@@ -61,9 +69,11 @@ export async function adoptTranscript(
   // 建连挂起/火山静音由此变成可见的 error/空 final，而不是被空宽限静默吞掉
   const settled = await Promise.race([
     endPromise,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), options.endWaitMs ?? 3000))
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), options.endWaitMs ?? ADOPTION_END_TO_END_MS))
   ]);
-  if (settled === null) return { kind: 'grace', text: '' };
+  // S1011-014：端到端超时是独立结果（typed），不再伪装成"成功但空文本"——
+  // 只有 Provider 明确给出的空 final 才走 empty（由调用方提示"没听清"）
+  if (settled === null) return { kind: 'timeout' };
   if (settled.kind === 'error') return { kind: 'error', error: settled.error };
   return { kind: 'final', text: settled.result.text.trim() };
 }

@@ -51,7 +51,9 @@ export class HttpCoreBridge implements CoreBridge {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      while (true) {
+      // S1011-024：应用层 done 终态——done 即完成，EOF 与 done 后帧各有明确语义
+      let sawDone = false;
+      outer: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -66,8 +68,12 @@ export class HttpCoreBridge implements CoreBridge {
           } catch {
             continue; // 忽略残行
           }
+          if (sawDone) continue; // done 之后的帧一律忽略（完成态不被后续帧改变）
           if (message.type === 'delta' && typeof message.text === 'string' && message.text.length > 0) {
             yield { text: message.text };
+          } else if (message.type === 'done') {
+            sawDone = true;
+            break outer;
           } else if (message.type === 'error') {
             throw new CoreBridgeError('core_stream_error', message.message ?? 'core stream error');
           }

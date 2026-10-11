@@ -50,6 +50,8 @@ export interface ActiveTurn {
   /** 下行二进制帧序号（在每个 pcm 头中递增） */
   nextSequence: number;
   userText: string;
+  /** Core 已送达的全部原始文本（S1011-021：独立于切句与播放进度，错误时保真） */
+  receivedText: string;
   asr: PrebufferedAsrSession;
   /** 本轮收到的 ASR partial 数（1002 空转写排障：0=火山侧全聋） */
   asrPartials: number;
@@ -113,7 +115,7 @@ export class ReplyPipeline {
     // 生产者：core 句子 -> 预取的 TTS chunk 流（深度 1 的流水线）
     const producer = (async () => {
       try {
-        const deltas = this.mapCoreDeltas(turn);
+        const deltas = this.mapCoreDeltas(turn, ttsSignal);
         for await (const sentence of streamSentences(deltas, splitter)) {
           turn.fullText += sentence;
           turn.metrics.mark('first_sentence_ready');
@@ -147,21 +149,31 @@ export class ReplyPipeline {
       await producer;
     } catch (error) {
       // F07 错误路径必须按序解锁：先关队列（唤醒卡在 waitForDrain 的生产者）、
-      // 再取消在途 TTS、最后才 await 生产者——任何颠倒都会重新互等
+      // 再取消在途 TTS、最后才收敛生产者——任何颠倒都会重新互等。
+      // S1011-017：收敛为有界等待——生产者可能阻塞在 Core 读取（failureAbort 管不到），
+      // 500ms 未落定即 core.cancel 真正终止上游，再等它退出
       sentenceQueue.close();
       failureAbort.abort();
       if (error instanceof TurnAbortedError || turn.aborted) {
         // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发
         return { status: 'aborted' };
       }
-      await producer.catch(() => undefined);
+      let producerDone = false;
+      const joined = producer.catch(() => undefined).then(() => {
+        producerDone = true;
+      });
+      await Promise.race([joined, new Promise((resolve) => setTimeout(resolve, 500))]);
+      if (!producerDone) {
+        void this.deps.core.cancel(turn.turnId).catch(() => undefined);
+        await joined;
+      }
       const isTts = error instanceof ProviderError && error.code === 'tts_failed';
       return { status: 'failed', kind: isTts ? 'tts' : 'core', error };
     }
     return { status: 'ok' };
   }
 
-  private mapCoreDeltas(turn: ActiveTurn): AsyncGenerator<string> {
+  private mapCoreDeltas(turn: ActiveTurn, signal: AbortSignal): AsyncGenerator<string> {
     const core = this.deps.core;
     const input = {
       conversationId: this.deps.conversationId ?? undefined,
@@ -172,11 +184,32 @@ export class ReplyPipeline {
     };
     return (async function* () {
       for await (const delta of core.streamReply(input)) {
-        if (turn.aborted) throw new TurnAbortedError();
+        // S1011-017：TTS 失败/本轮取消同样终止 Core 消费（不只 turn.aborted）
+        if (turn.aborted || signal.aborted) throw new TurnAbortedError();
         turn.metrics.mark('llm_first_token');
+        turn.receivedText += delta.text; // S1011-021：原始正文独立累积
         yield delta.text;
       }
     })();
+  }
+
+  /** S1011-016：批量合成无取消契约——用 signal 赛跑，取消即放弃等待（结果作废，不重放） */
+  private static raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(new TurnAbortedError());
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(new TurnAbortedError());
+      signal.addEventListener('abort', onAbort, { once: true });
+      work.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        }
+      );
+    });
   }
 
   /** 单句合成：流式优先，失败回退批量 PCM（规范第 40 节降级链）。
@@ -210,7 +243,10 @@ export class ReplyPipeline {
       // provider 被 abort 时上游抛错：翻译成本轮取消信号
       if (turn.aborted || signal.aborted) throw new TurnAbortedError();
       if (error instanceof TurnAbortedError) throw error;
-      if (!(error instanceof ProviderError)) throw error;
+      // S1011-018：流式链路的原生异常（网络/超时/解析）在此归属化为 tts_failed，不再落 core 分支
+      if (!(error instanceof ProviderError)) {
+        throw new ProviderError('tts_failed', 'reply-pipeline', `tts stream failed: ${(error as Error).message}`, error);
+      }
       if (emitted) {
         this.log.warn('tts_stream_failed_after_partial_audio', {
           turn_index: turn.index,
@@ -219,9 +255,13 @@ export class ReplyPipeline {
         throw new ProviderError('tts_failed', 'reply-pipeline', 'tts stream failed after partial audio emitted');
       }
     }
-    // 降级：Batch TTS（按 provider 返回的真实采样率）；仅零输出句子可整句重来
+    // 降级：Batch TTS（按 provider 返回的真实采样率）；仅零输出句子可整句重来。
+    // S1011-016：批量合成同样受本轮取消约束；S1011-018：批量链路异常归属化为 tts_failed
     this.log.warn('tts_stream_fallback_batch', { turn_index: turn.index, sentence_len: sentence.length });
-    const result = await this.deps.tts.synthesize(request);
+    const result = await ReplyPipeline.raceAbort(this.deps.tts.synthesize(request), signal).catch((error: unknown) => {
+      if (error instanceof TurnAbortedError) throw error;
+      throw new ProviderError('tts_failed', 'reply-pipeline', `tts batch fallback failed: ${(error as Error).message}`, error);
+    });
     turn.metrics.mark('tts_first_chunk');
     for (const frame of chunkPcm16(result.audio, samplesForDuration(result.sampleRate, 20))) {
       if (turn.aborted) throw new TurnAbortedError();
