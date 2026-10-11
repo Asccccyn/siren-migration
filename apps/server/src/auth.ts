@@ -18,10 +18,9 @@ import type { SirenConfig } from '@siren/voice-core';
  * - /.well-known、/oauth：OAuth 发现与授权端点（MCP 客户端接入用，密码门在 /oauth/authorize）
  * - /v1/assets：签名资源（鉴权在签名层，规范第 36 节）
  * - /v1/web/login：网页密码登录（人类入口，服务端自限速）
- * - /play：语音播放页（id 为不可枚举 UUID，页面即凭证）
  * - /ws：实时通话握手，自带 call token 校验（verifyToken），不经 Bearer
  */
-const OPEN_PREFIXES = ['/', '/health', '/assets', '/.well-known', '/oauth', '/v1/assets', '/v1/web', '/play', '/ws'];
+const OPEN_PREFIXES = ['/', '/health', '/assets', '/.well-known', '/oauth', '/v1/assets', '/v1/web', '/ws'];
 
 /**
  * 把请求 URL 归一化成路由器实际匹配的路径：去 query/fragment、折叠重复斜杠、

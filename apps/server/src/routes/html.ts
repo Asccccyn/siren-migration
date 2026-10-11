@@ -1,4 +1,4 @@
-/** 极简 HTML 转义（play 着陆页与唯一入口页共用） */
+/** 极简 HTML 转义（唯一入口页与 OAuth 授权页共用） */
 export function escapeHtml(input: string): string {
   return input
     .replace(/&/g, '&amp;')

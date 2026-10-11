@@ -182,3 +182,21 @@ describe('F04：multipart 上传流式落盘', () => {
     }
   });
 });
+
+describe('S1011-002 回归：/play 公开播放页已移除（一个网址原则 + message_id 凭证化修复）', () => {
+  it('无凭证一律 401（默认拒绝），带 token 也是 404（路由不存在）', async () => {
+    const siren = await buildTestApp({ SIREN_INTERNAL_TOKEN: 'secret-1' });
+    try {
+      const anon = await siren.app.inject({ method: 'GET', url: '/play/anything' });
+      expect(anon.statusCode).toBe(401);
+      const authed = await siren.app.inject({
+        method: 'GET',
+        url: '/play/anything',
+        headers: { authorization: 'Bearer secret-1' }
+      });
+      expect(authed.statusCode).toBe(404);
+    } finally {
+      await siren.app.close();
+    }
+  });
+});

@@ -37,7 +37,6 @@ import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
 import { registerCallSessionRoutes } from './routes/call-session.ts';
 import { registerAssetsRoute } from './routes/assets.ts';
-import { registerPlayRoute } from './routes/play.ts';
 import { registerWebAuthRoute } from './routes/web-auth.ts';
 import { registerCallWebSocket } from './websocket/call-handler.ts';
 import { registerMcpRoute } from './mcp/server.ts';
@@ -180,7 +179,6 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     config,
     store: providers.store instanceof LocalObjectStore ? providers.store : null
   });
-  registerPlayRoute(app, { voice });
   registerWebAuthRoute(app, { config });
   await oauth.registerRoutes(app);
   registerCallWebSocket(app, { config, logger, callCenter });
