@@ -11,6 +11,7 @@ import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { SqliteDatabase } from '@siren/storage';
+import { deriveFieldCipher } from '@siren/storage';
 import {
   CallSessionsRepository,
   CallTurnsRepository,
@@ -73,6 +74,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     });
 
   const db = options.db ?? openDatabase(config.databasePath);
+  // S1011-013：DB 正文字段静态加密（SIREN_DATA_KEY 优先，否则从签名密钥派生；懒迁移兼容旧行）
+  const fieldCipher = deriveFieldCipher({ dataKey: config.dataKey, signingSecret: config.signingSecret });
   const providers = options.providers ?? buildProviders(config, logger);
   for (const warning of providers.warnings) {
     logger.warn('config_warning', { message: warning });
@@ -124,9 +127,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     options.fillers ??
     new FillerManager(config.fillersDir, config.fillerEnabled, logger.child({ component: 'filler' }));
 
-  const assetsRepo = new VoiceAssetsRepository(db);
+  const assetsRepo = new VoiceAssetsRepository(db, fieldCipher);
   const sessionsRepo = new CallSessionsRepository(db);
-  const turnsRepo = new CallTurnsRepository(db);
+  const turnsRepo = new CallTurnsRepository(db, fieldCipher);
 
   const voice = new VoiceService({
     config,

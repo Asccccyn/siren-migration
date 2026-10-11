@@ -1,6 +1,7 @@
 /**
  * call_turns 仓储（Siren 的通话元数据记录；不是聊天历史真源，规范第 28 节）。
  */
+import type { FieldCipher } from '../field-crypto.ts';
 import type { SqliteDatabase } from '../sqlite.ts';
 
 export interface CallTurnRow {
@@ -19,9 +20,20 @@ export interface CallTurnRow {
 }
 
 export class CallTurnsRepository {
-  constructor(private readonly db: SqliteDatabase) {}
+  constructor(
+    private readonly db: SqliteDatabase,
+    /** S1011-013：通话文本静态加密（null=不加密） */
+    private readonly cipher: FieldCipher | null = null
+  ) {}
 
   insert(row: CallTurnRow): void {
+    const stored: CallTurnRow = this.cipher
+      ? {
+          ...row,
+          user_text: row.user_text !== null ? this.cipher.seal(row.user_text) : null,
+          assistant_text: row.assistant_text !== null ? this.cipher.seal(row.assistant_text) : null
+        }
+      : row;
     this.db
       .prepare(`
         INSERT INTO call_turns (
@@ -32,12 +44,18 @@ export class CallTurnsRepository {
           @interrupted, @asr_latency_ms, @llm_first_token_ms, @tts_first_audio_ms, @created_at
         )
       `)
-      .run(row);
+      .run(stored);
   }
 
   listByCall(callId: string): CallTurnRow[] {
-    return this.db
+    const rows = this.db
       .prepare('SELECT * FROM call_turns WHERE call_id = ? ORDER BY turn_index ASC')
       .all(callId) as CallTurnRow[];
+    if (!this.cipher) return rows;
+    return rows.map((row) => ({
+      ...row,
+      user_text: this.cipher!.open(row.user_text),
+      assistant_text: this.cipher!.open(row.assistant_text)
+    }));
   }
 }

@@ -13,6 +13,8 @@ export interface SirenConfig {
   port: number;
   publicUrl: string;
   internalToken: string | null;
+  /** DB 正文字段加密密钥（S1011-013；缺省从签名密钥派生） */
+  dataKey: string | null;
   /** 网页登录密码（人类可记，由部署者自行设置；web 登录成功后换取 internal token） */
   webPassword: string | null;
   corsOrigins: string[];
@@ -138,6 +140,7 @@ export function loadConfig(env: EnvSource = process.env, cwd = process.cwd()): S
     port: num(env, 'SIREN_PORT', 8790),
     publicUrl: (env.SIREN_PUBLIC_URL ?? 'http://127.0.0.1:8790').replace(/\/$/, ''),
     internalToken,
+    dataKey: env.SIREN_DATA_KEY?.trim() || null,
     webPassword: env.SIREN_WEB_PASSWORD?.trim() || null,
     corsOrigins: parseCorsOrigins(env.CORS_ORIGINS, envName),
     logLevel: (env.SIREN_LOG_LEVEL as SirenConfig['logLevel']) ?? 'info',

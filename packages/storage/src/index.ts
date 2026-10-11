@@ -7,3 +7,4 @@ export { LocalObjectStore, signObjectKey, verifyObjectSignature } from './local-
 export type { LocalObjectStoreOptions } from './local-store.ts';
 export { R2ObjectStore, MemoryObjectStore } from './r2.ts';
 export type { R2StoreOptions } from './r2.ts';
+export { FieldCipher, deriveFieldCipher } from './field-crypto.ts';

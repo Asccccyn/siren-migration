@@ -2,6 +2,7 @@
  * voice_assets 仓储。message_id 支持幂等（规范第 29/47 节）。
  */
 import type { VoiceAssetRecord, VoiceDirection } from '@siren/contracts';
+import type { FieldCipher } from '../field-crypto.ts';
 import type { SqliteDatabase } from '../sqlite.ts';
 
 interface AssetRow {
@@ -25,7 +26,8 @@ interface AssetRow {
   created_at: number;
 }
 
-function rowToRecord(row: AssetRow): VoiceAssetRecord {
+function rowToRecord(row: AssetRow, cipher: FieldCipher | null): VoiceAssetRecord {
+  const open = (value: string | null): string | null => (cipher ? cipher.open(value) : value);
   return {
     id: row.id,
     conversationId: row.conversation_id,
@@ -33,15 +35,15 @@ function rowToRecord(row: AssetRow): VoiceAssetRecord {
     direction: row.direction as VoiceDirection,
     voiceProfile: row.voice_profile,
     provider: row.provider,
-    providerVoiceId: row.provider_voice_id,
+    providerVoiceId: open(row.provider_voice_id),
     audioFormat: row.audio_format,
     sampleRate: row.sample_rate,
     durationMs: row.duration_ms,
     language: row.language,
     emotion: row.emotion,
-    text: row.text,
-    ttsScript: row.tts_script,
-    transcript: row.transcript,
+    text: open(row.text),
+    ttsScript: open(row.tts_script),
+    transcript: open(row.transcript),
     objectKey: row.object_key,
     checksum: row.checksum,
     createdAt: row.created_at
@@ -59,9 +61,22 @@ export interface ListAssetsFilter {
 }
 
 export class VoiceAssetsRepository {
-  constructor(private readonly db: SqliteDatabase) {}
+  constructor(
+    private readonly db: SqliteDatabase,
+    /** S1011-013：正文类字段静态加密（null=不加密，兼容既有测试与数据） */
+    private readonly cipher: FieldCipher | null = null
+  ) {}
 
   insert(record: VoiceAssetRecord): { inserted: boolean; existing?: VoiceAssetRecord } {
+    const stored: VoiceAssetRecord = this.cipher
+      ? {
+          ...record,
+          text: record.text !== null ? this.cipher.seal(record.text) : null,
+          ttsScript: record.ttsScript !== null ? this.cipher.seal(record.ttsScript) : null,
+          transcript: record.transcript !== null ? this.cipher.seal(record.transcript) : null,
+          providerVoiceId: record.providerVoiceId !== null ? this.cipher.seal(record.providerVoiceId) : null
+        }
+      : record;
     const stmt = this.db.prepare(`
       INSERT INTO voice_assets (
         id, conversation_id, message_id, direction, voice_profile, provider, provider_voice_id,
@@ -74,7 +89,7 @@ export class VoiceAssetsRepository {
       )
     `);
     try {
-      stmt.run(record);
+      stmt.run(stored);
       return { inserted: true };
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -88,14 +103,14 @@ export class VoiceAssetsRepository {
 
   findById(id: string): VoiceAssetRecord | undefined {
     const row = this.db.prepare('SELECT * FROM voice_assets WHERE id = ?').get(id) as AssetRow | undefined;
-    return row ? rowToRecord(row) : undefined;
+    return row ? rowToRecord(row, this.cipher) : undefined;
   }
 
   findByMessageId(messageId: string): VoiceAssetRecord | undefined {
     const row = this.db
       .prepare('SELECT * FROM voice_assets WHERE message_id = ? ORDER BY created_at ASC LIMIT 1')
       .get(messageId) as AssetRow | undefined;
-    return row ? rowToRecord(row) : undefined;
+    return row ? rowToRecord(row, this.cipher) : undefined;
   }
 
   list(filter: ListAssetsFilter): VoiceAssetRecord[] {
@@ -127,6 +142,6 @@ export class VoiceAssetsRepository {
     const rows = this.db
       .prepare(`SELECT * FROM voice_assets ${where} ORDER BY created_at DESC LIMIT @limit OFFSET @offset`)
       .all({ ...params, limit, offset }) as AssetRow[];
-    return rows.map(rowToRecord);
+    return rows.map((row) => rowToRecord(row, this.cipher));
   }
 }
