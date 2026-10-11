@@ -138,6 +138,20 @@ export class CallSession {
     if (this.closed || this.closing || pcm.length === 0) return;
     const turn = this.turn;
     if (!turn || !this.stateMachine.is('listening')) return;
+    // S1011-025：单轮音频预算——超限取消本轮（provider 不再消费），防失控计费
+    turn.audioBytes += pcm.length;
+    if (turn.audioBytes > this.deps.config.maxTurnAudioBytes) {
+      this.log.warn('turn_audio_budget_exceeded', {
+        turn_index: turn.index,
+        audio_bytes: turn.audioBytes,
+        limit: this.deps.config.maxTurnAudioBytes
+      });
+      this.sendJson({ t: 'error', code: 'audio_budget_exceeded', message: '本轮语音过长，已停止识别' });
+      turn.asr.abort();
+      this.abortTurn('audio_budget');
+      this.backToListening();
+      return;
+    }
     turn.asr.feed(pcm);
   }
 
@@ -184,7 +198,19 @@ export class CallSession {
       output_rate: this.deps.voice.outputSampleRate,
       format: 'pcm16'
     };
-    this.sendJson({ t: 'ready', protocol: WS_PROTOCOL_VERSION, audio });
+    this.sendJson({
+      t: 'ready',
+      protocol: WS_PROTOCOL_VERSION,
+      audio,
+      // S1011-015：VAD/jitter 服务端配置随 ready 下发，客户端作为默认参数
+      vad: {
+        confirm_ms: this.deps.config.vad.confirmMs,
+        min_speech_ms: this.deps.config.vad.minSpeechMs,
+        end_silence_ms: this.deps.config.vad.endSilenceMs,
+        rms_ratio: this.deps.config.vad.rmsRatio
+      },
+      jitter_ms: this.deps.config.jitterBufferMs
+    });
     if (clientProtocol !== undefined && clientProtocol !== WS_PROTOCOL_VERSION) {
       this.log.warn('ws_protocol_version_mismatch', {
         client_protocol: clientProtocol,
@@ -215,6 +241,7 @@ export class CallSession {
       nextSequence: 0,
       userText: '',
       receivedText: '',
+      audioBytes: 0,
       asrPartials: 0,
       asr: createAsrSession(
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },

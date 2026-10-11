@@ -101,7 +101,14 @@ export interface WsAudioContract {
 }
 
 export type ServerWsMessage =
-  | { t: 'ready'; protocol: number; audio: WsAudioContract }
+  | {
+      t: 'ready';
+      protocol: number;
+      audio: WsAudioContract;
+      /** 服务端调参建议（S1011-015：VAD/jitter 配置的真实下发通道；客户端应用为默认值） */
+      vad?: { confirm_ms: number; min_speech_ms: number; end_silence_ms: number; rms_ratio: number };
+      jitter_ms?: number;
+    }
   | { t: 'partial'; text: string }
   | { t: 'asr'; text: string; language?: string; durationMs?: number }
   | { t: 'state'; state: CallState }

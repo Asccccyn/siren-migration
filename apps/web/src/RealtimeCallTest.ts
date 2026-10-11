@@ -41,18 +41,49 @@ let captureGeneration = 0;
 let serverState = 'idle';
 let serverProtocol = 0;
 let muted = false;
+// S1011-015：服务端 ready 帧下发的 VAD/jitter 建议作为基线；UI 输入仍可覆盖
+let serverVadDefaults: VadParams | null = null;
+let serverJitterMs: number | null = null;
+
+function applyServerTuning(message: Record<string, unknown>): void {
+  const vad = message.vad as Record<string, number> | undefined;
+  if (vad) {
+    serverVadDefaults = {
+      confirmMs: Number(vad.confirm_ms) || 200,
+      minSpeechMs: Number(vad.min_speech_ms) || 400,
+      endSilenceMs: Number(vad.end_silence_ms) || 700,
+      rmsRatio: Number(vad.rms_ratio) || 4
+    };
+    // UI 输入框显示基线值（用户改过则以输入为准）
+    if (!ui.vConfirm.dataset.touched) ui.vConfirm.value = String(serverVadDefaults.confirmMs);
+    if (!ui.vMin.dataset.touched) ui.vMin.value = String(serverVadDefaults.minSpeechMs);
+    if (!ui.vEnd.dataset.touched) ui.vEnd.value = String(serverVadDefaults.endSilenceMs);
+    if (!ui.vRatio.dataset.touched) ui.vRatio.value = String(serverVadDefaults.rmsRatio);
+  }
+  if (typeof message.jitter_ms === 'number') {
+    serverJitterMs = message.jitter_ms;
+    if (!ui.vJitter.dataset.touched) ui.vJitter.value = String(serverJitterMs);
+  }
+}
 
 function vadParams(): VadParams {
+  const base = serverVadDefaults ?? { confirmMs: 200, minSpeechMs: 400, endSilenceMs: 700, rmsRatio: 4 };
   return {
-    confirmMs: Number(ui.vConfirm.value) || 200,
-    minSpeechMs: Number(ui.vMin.value) || 400,
-    endSilenceMs: Number(ui.vEnd.value) || 700,
-    rmsRatio: Number(ui.vRatio.value) || 4
+    confirmMs: Number(ui.vConfirm.value) || base.confirmMs,
+    minSpeechMs: Number(ui.vMin.value) || base.minSpeechMs,
+    endSilenceMs: Number(ui.vEnd.value) || base.endSilenceMs,
+    rmsRatio: Number(ui.vRatio.value) || base.rmsRatio
   };
 }
 
 function jitterBufferMs(): number {
-  return Number(ui.vJitter.value) || 350;
+  return Number(ui.vJitter.value) || serverJitterMs || 350;
+}
+
+for (const input of [ui.vConfirm, ui.vMin, ui.vEnd, ui.vRatio, ui.vJitter]) {
+  input.addEventListener('input', () => {
+    input.dataset.touched = '1';
+  });
 }
 
 function sendJson(message: unknown): void {
@@ -216,6 +247,7 @@ function handleServerMessage(message: Record<string, unknown>): void {
   switch (type) {
     case 'ready':
       serverProtocol = Number(message.protocol ?? 0);
+      applyServerTuning(message);
       logEvent(`协议协商 v${serverProtocol}`);
       break;
     case 'partial':

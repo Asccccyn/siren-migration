@@ -63,7 +63,10 @@ export class VadMachine {
         // 候选语音（确认窗口内）：冻结噪声估计（审计 F05）——
         // 高频回调下继续学习会把噪声底追到语音电平，阈值随之抬到永远确认不了
         if (this.speechStartAt === 0) this.speechStartAt = now;
-        if (now - this.speechStartAt >= params.confirmMs) {
+        // S1011-015：最短有效语音参与 start 门——持续语音须同时越过确认窗与最短语音窗
+        //（句首由 pre-roll 保护，不因起判晚而丢失）
+        const startGateMs = Math.max(params.confirmMs, params.minSpeechMs);
+        if (now - this.speechStartAt >= startGateMs) {
           this.inSpeech = true;
           this.utteranceStartAt = this.speechStartAt;
           this.lastVoiceAt = now;

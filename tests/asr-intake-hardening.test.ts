@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import { PrebufferedAsrSession } from '../packages/voice-core/src/asr-prebuffer.ts';
 import { MockAsrProvider } from '@siren/provider-mock';
-import { buildSessionHarness } from './helpers.ts';
+import { buildSessionHarness, testConfig } from './helpers.ts';
 
 describe('PrebufferedAsrSession：建连超时与喂入计数', () => {
   it('connect 永不落定时 end() 在限时内抛错（不再等宽限赛跑变空文本）', async () => {
@@ -85,6 +85,26 @@ describe('CallSession：空转写可见化', () => {
       expect(states.at(-1)?.state).toBe('listening');
     } finally {
       harness.session.destroy('test-done');
+    }
+  });
+});
+
+describe('S1011-025：单轮音频预算超限即取消', () => {
+  it('超预算帧触发 audio_budget_exceeded 并回 listening，ASR 终态化', async () => {
+    const config = testConfig({ MAX_TURN_AUDIO_MB: '0.01' }); // ~10KB 预算
+    const harness = buildSessionHarness({ config });
+    try {
+      harness.session.handleMessage({ t: 'start' });
+      harness.session.handleBinary(Buffer.alloc(3200, 0));
+      harness.session.handleBinary(Buffer.alloc(3200, 0));
+      harness.session.handleBinary(Buffer.alloc(3200, 0));
+      harness.session.handleBinary(Buffer.alloc(3200, 0)); // 12.8KB > 10KB
+      const errors = harness.texts().filter((m) => m.t === 'error');
+      expect(errors.some((e) => e.code === 'audio_budget_exceeded')).toBe(true);
+      const states = harness.texts().filter((m) => m.t === 'state');
+      expect(states.at(-1)?.state).toBe('listening');
+    } finally {
+      harness.session.destroy('test');
     }
   });
 });

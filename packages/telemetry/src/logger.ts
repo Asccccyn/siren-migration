@@ -78,22 +78,41 @@ export interface Logger {
   child(bindings: Record<string, unknown>): Logger;
 }
 
+/** 递归脱敏（S1011-008）：嵌套对象/数组里的敏感键同样处理，深度上限防循环/超深 */
+function redactValue(value: unknown, logTranscripts: boolean, depth: number): unknown {
+  if (depth > 6) return '[depth-limit]';
+  if (Array.isArray(value)) {
+    return value.map((item) => redactValue(item, logTranscripts, depth + 1));
+  }
+  if (value && typeof value === 'object' && !(value instanceof Error) && !(value instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactEntry(k, v, logTranscripts, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+function redactEntry(key: string, value: unknown, logTranscripts: boolean, depth: number): unknown {
+  if (key === 'text' || key === 'transcript' || key === 'tts_script' || key === 'user_text' || key === 'assistant_text') {
+    return logTranscripts && typeof value === 'string' ? value : `[len:${typeof value === 'string' ? value.length : '?'}]`;
+  }
+  if (isSensitiveKey(key)) {
+    return '[redacted]';
+  }
+  if (value instanceof Error) {
+    // S1011-008：上游错误原文不整段直落日志——截断 200 字符（有界泄漏，保排障价值）
+    const message = value.message.length > 200 ? `${value.message.slice(0, 200)}…[truncated]` : value.message;
+    return { name: value.name, message };
+  }
+  return redactValue(value, logTranscripts, depth);
+}
+
 function redact(fields: Record<string, unknown>, logTranscripts: boolean): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(fields)) {
-    if (key === 'text' || key === 'transcript' || key === 'tts_script' || key === 'user_text' || key === 'assistant_text') {
-      out[key] = logTranscripts && typeof value === 'string' ? value : `[len:${typeof value === 'string' ? value.length : '?'}]`;
-      continue;
-    }
-    if (isSensitiveKey(key)) {
-      out[key] = '[redacted]';
-      continue;
-    }
-    if (value instanceof Error) {
-      out[key] = { name: value.name, message: value.message };
-      continue;
-    }
-    out[key] = value;
+    out[key] = redactEntry(key, value, logTranscripts, 0);
   }
   return out;
 }
@@ -128,11 +147,12 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   const makeLogger = (bindings: Record<string, unknown>): Logger => {
     const emit = (lvl: LogLevel, event: string, fields?: Record<string, unknown>): void => {
       if (LEVEL_ORDER[lvl] < LEVEL_ORDER[level]) return;
+      // S1011-008：bindings 同样过脱敏（此前绕过）
       const payload: Record<string, unknown> = {
         ts: new Date().toISOString(),
         level: lvl,
         event,
-        ...bindings,
+        ...redact(bindings, logTranscripts),
         ...redact(fields ?? {}, logTranscripts)
       };
       write(JSON.stringify(payload));
@@ -149,10 +169,13 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   return makeLogger(options.bindings ?? {});
 }
 
-/** 把任意 unknown 错误压缩成可安全记录的形状 */
+/** 把任意 unknown 错误压缩成可安全记录的形状。
+ * S1011-008：上游 message 不再整段直落日志——截断到 200 字符（错误信息以
+ * 错误码/URL 为主，截断即有界；正文类内容由 LOG_TRANSCRIPTS 开关另行控制）。 */
 export function errorFields(error: unknown): Record<string, unknown> {
   if (error instanceof Error) {
-    return { error_name: error.name, error_message: error.message };
+    const message = error.message.length > 200 ? `${error.message.slice(0, 200)}…[truncated]` : error.message;
+    return { error_name: error.name, error_message: message };
   }
-  return { error: String(error) };
+  return { error: String(error).slice(0, 200) };
 }

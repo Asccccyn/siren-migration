@@ -77,10 +77,16 @@ export interface SirenConfig {
   callTokenTtlS: number;
   /** 客户端 playback_drained ACK 超时（P0-4，0 = 不等待） */
   playbackDrainTimeoutMs: number;
+  /** 客户端 jitter buffer 建议（ready 帧下发） */
+  jitterBufferMs: number;
   signedUrlTtlS: number;
   maxUploadBytes: number;
   wsMaxPayloadBytes: number;
   prebufferMaxBytes: number;
+  /** 单轮上行音频预算（S1011-025） */
+  maxTurnAudioBytes: number;
+  /** 全局并发通话上限（S1011-025） */
+  maxConcurrentCalls: number;
   vad: {
     confirmMs: number;
     minSpeechMs: number;
@@ -235,12 +241,17 @@ function resolveRealtimeTunables(env: EnvSource) {
     maxUploadBytes: num(env, 'MAX_UPLOAD_MB', 25) * 1024 * 1024,
     wsMaxPayloadBytes: num(env, 'WS_MAX_PAYLOAD_MB', 2) * 1024 * 1024,
     prebufferMaxBytes: num(env, 'PREBUFFER_MAX_BYTES', 1024 * 1024),
+    // S1011-025：成本边界——单轮上行音频预算（默认 5 分钟 16k PCM）与全局并发通话上限
+    maxTurnAudioBytes: num(env, 'MAX_TURN_AUDIO_MB', 9.152) * 1024 * 1024,
+    maxConcurrentCalls: num(env, 'MAX_CONCURRENT_CALLS', 8),
     vad: {
       confirmMs: num(env, 'VAD_CONFIRM_MS', 200),
       minSpeechMs: num(env, 'VAD_MIN_SPEECH_MS', 400),
       endSilenceMs: num(env, 'VAD_END_SILENCE_MS', 700),
       rmsRatio: num(env, 'VAD_RMS_RATIO', 4)
     },
+    /** 客户端 jitter buffer 建议（ready 帧下发；S1011-015 消费链补全） */
+    jitterBufferMs: num(env, 'JITTER_BUFFER_MS', 350),
     ws: {
       heartbeatIntervalMs: 30000,
       maxBufferedBytes: 8 * 1024 * 1024

@@ -67,6 +67,10 @@ export class CallCenter {
   }
 
   async createCall(params: { conversationId?: string; voiceProfileId?: string }): Promise<CreateCallResult> {
+    // S1011-025：全局并发通话上限——实时 ASR/TTS 是计费资源，超限拒绝新通话
+    if (this.sessions.size >= this.deps.config.maxConcurrentCalls) {
+      throw new Error('call_capacity_reached');
+    }
     const callId = randomUUID();
     const fallback = this.deps.profiles.defaultProfileId() ?? 'main';
     const profile = this.deps.profiles.get(params.voiceProfileId ?? undefined, fallback);

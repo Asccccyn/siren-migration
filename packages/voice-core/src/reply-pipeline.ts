@@ -52,6 +52,8 @@ export interface ActiveTurn {
   userText: string;
   /** Core 已送达的全部原始文本（S1011-021：独立于切句与播放进度，错误时保真） */
   receivedText: string;
+  /** 本轮已上行音频字节（S1011-025 预算计量） */
+  audioBytes: number;
   asr: PrebufferedAsrSession;
   /** 本轮收到的 ASR partial 数（1002 空转写排障：0=火山侧全聋） */
   asrPartials: number;

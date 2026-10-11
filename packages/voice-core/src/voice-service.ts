@@ -68,6 +68,10 @@ export interface SynthesizeParams {
 }
 
 export class VoiceService {
+  /** S1011-020：同 message_id 的在途任务（speak / storeUserVoice 各一条道）——并发请求共享结果 */
+  private readonly speakInflight = new Map<string, Promise<VoiceAssetWithUrl>>();
+  private readonly userVoiceInflight = new Map<string, Promise<{ transcript: TranscriptResult; asset: VoiceAssetWithUrl }>>();
+
   constructor(protected readonly deps: VoiceServiceDeps) {}
 
   // -------------------------------------------------------------------------
@@ -117,7 +121,18 @@ export class VoiceService {
         this.deps.logger.info('voice_asset_idempotent_hit', { message_id: params.messageId });
         return this.withAudioUrl(existing);
       }
+      // S1011-020：并发同 message_id 共享在途任务——收费副作用（TTS）只发生一次；
+      // DB 唯一索引仍作跨进程兜底
+      const inflight = this.speakInflight.get(params.messageId);
+      if (inflight) return inflight;
+      const job = this.speakNow(params).finally(() => this.speakInflight.delete(params.messageId!));
+      this.speakInflight.set(params.messageId, job);
+      return job;
     }
+    return this.speakNow(params);
+  }
+
+  private async speakNow(params: SpeakParams): Promise<VoiceAssetWithUrl> {
     const profile = this.resolveProfile(params.voiceProfileId);
     const emotion = params.emotion ?? profile.defaultEmotion;
     const style = resolveStyle(profile, { emotion, speed: params.speed });
@@ -213,7 +228,24 @@ export class VoiceService {
           asset: await this.withAudioUrl(existing)
         };
       }
+      // S1011-020：并发同 message_id 共享在途任务——识别/入库只发生一次
+      const inflight = this.userVoiceInflight.get(input.messageId);
+      if (inflight) return inflight;
+      const job = this.storeUserVoiceNow(input).finally(() => this.userVoiceInflight.delete(input.messageId!));
+      this.userVoiceInflight.set(input.messageId, job);
+      return job;
     }
+    return this.storeUserVoiceNow(input);
+  }
+
+  private async storeUserVoiceNow(input: {
+    audio: Buffer;
+    format: string;
+    language?: string;
+    conversationId?: string;
+    messageId?: string;
+    voiceProfileId?: string;
+  }): Promise<{ transcript: TranscriptResult; asset: VoiceAssetWithUrl }> {
     const transcript = await this.transcribe({
       audio: input.audio,
       format: input.format,

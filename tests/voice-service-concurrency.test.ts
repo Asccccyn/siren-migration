@@ -56,7 +56,7 @@ async function buildVoiceWithSharedStore(): Promise<{
 }
 
 describe('message_id 并发幂等（P1-3 immutable object key）', () => {
-  it('并发 speak(同 message_id)：恰好一个 asset，winner 对象完好，落败者只删自己的对象', async () => {
+  it('并发 speak(同 message_id)：共享在途任务——一次合成一个对象，双方拿到同一条（S1011-020）', async () => {
     const { voice, store, assetsRepo } = await buildVoiceWithSharedStore();
     const messageId = 'msg-concurrent-1';
 
@@ -70,21 +70,15 @@ describe('message_id 并发幂等（P1-3 immutable object key）', () => {
     expect(all.length).toBe(1);
     expect(a.id).toBe(b.id);
 
-    // 并发产生了两个不同的物理 key（各含自己的 asset_id）
+    // S1011-020 新合同：在途任务共享——收费副作用只发生一次，只有一个物理 key。
+    // （旧"双方各合成再由 DB 唯一索引裁决"的设计即 S1011-020 要修的重复消耗；
+    //  DB 唯一索引与不可变 object key 清理规则保留作跨进程兜底，语义不变）
     const audioPuts = store.audioPuts();
-    expect(audioPuts.length).toBe(2);
-    expect(new Set(audioPuts.map((put) => put.key)).size).toBe(2);
-
-    // winner 的音频对象仍然存在（没有被 loser 删掉）
+    expect(audioPuts.length).toBe(1);
     const winnerKey = all[0].objectKey;
     expect(await store.exists(winnerKey)).toBe(true);
     const audio = await store.get(winnerKey);
     expect(audio.length).toBeGreaterThan(0);
-
-    // loser 的对象（另一个 key）被清理
-    const loserKey = audioPuts.find((put) => put.key !== winnerKey)?.key;
-    expect(loserKey).toBeTruthy();
-    expect(await store.exists(loserKey as string)).toBe(false);
   });
 
   it('顺序重复 speak(同 message_id)：幂等命中，不新增 asset', async () => {

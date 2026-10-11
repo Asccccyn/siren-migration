@@ -39,7 +39,8 @@
       if (!this.inSpeech) {
         if (rmsValue > threshold) {
           if (this.speechStartAt === 0) this.speechStartAt = now;
-          if (now - this.speechStartAt >= params.confirmMs) {
+          const startGateMs = Math.max(params.confirmMs, params.minSpeechMs);
+          if (now - this.speechStartAt >= startGateMs) {
             this.inSpeech = true;
             this.utteranceStartAt = this.speechStartAt;
             this.lastVoiceAt = now;
@@ -359,11 +360,13 @@
         this.deps.log?.("\u5207\u6362\u6A21\u5F0F\uFF0C\u7ED3\u675F\u5F53\u524D utterance -> end");
       }
       this.mode = mode;
+      this.suppressedByAi = false;
       this.deps.preRoll.clear();
     }
     setMuted(muted2) {
       this.muted = muted2;
       if (muted2) {
+        this.suppressedByAi = false;
         this.deps.preRoll.clear();
         if (this.sending) {
           this.sending = false;
@@ -372,12 +375,13 @@
         }
       }
     }
-    /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance */
+    /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance。
+     * S1011-005：恢复是输入许可的综合判定——仅 VAD 模式、未静音、当前未在发送时才成立 */
     onServerState(state) {
       if (state === "listening" || state === "idle" || state === "interrupted") {
         if (this.suppressedByAi) {
           this.suppressedByAi = false;
-          if (this.vadSpeech) {
+          if (this.vadSpeech && this.mode === "vad" && !this.muted && !this.sending) {
             this.beginSending();
             this.deps.log?.("\u534A\u53CC\u5DE5\u95E8\u63A7\u89E3\u9664\uFF1A\u6062\u590D\u4E0A\u884C\uFF08\u53E5\u9996\u6765\u81EA pre-roll\uFF09");
           }
@@ -841,16 +845,43 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   var serverState = "idle";
   var serverProtocol = 0;
   var muted = false;
+  var serverVadDefaults = null;
+  var serverJitterMs = null;
+  function applyServerTuning(message) {
+    const vad = message.vad;
+    if (vad) {
+      serverVadDefaults = {
+        confirmMs: Number(vad.confirm_ms) || 200,
+        minSpeechMs: Number(vad.min_speech_ms) || 400,
+        endSilenceMs: Number(vad.end_silence_ms) || 700,
+        rmsRatio: Number(vad.rms_ratio) || 4
+      };
+      if (!ui.vConfirm.dataset.touched) ui.vConfirm.value = String(serverVadDefaults.confirmMs);
+      if (!ui.vMin.dataset.touched) ui.vMin.value = String(serverVadDefaults.minSpeechMs);
+      if (!ui.vEnd.dataset.touched) ui.vEnd.value = String(serverVadDefaults.endSilenceMs);
+      if (!ui.vRatio.dataset.touched) ui.vRatio.value = String(serverVadDefaults.rmsRatio);
+    }
+    if (typeof message.jitter_ms === "number") {
+      serverJitterMs = message.jitter_ms;
+      if (!ui.vJitter.dataset.touched) ui.vJitter.value = String(serverJitterMs);
+    }
+  }
   function vadParams() {
+    const base = serverVadDefaults ?? { confirmMs: 200, minSpeechMs: 400, endSilenceMs: 700, rmsRatio: 4 };
     return {
-      confirmMs: Number(ui.vConfirm.value) || 200,
-      minSpeechMs: Number(ui.vMin.value) || 400,
-      endSilenceMs: Number(ui.vEnd.value) || 700,
-      rmsRatio: Number(ui.vRatio.value) || 4
+      confirmMs: Number(ui.vConfirm.value) || base.confirmMs,
+      minSpeechMs: Number(ui.vMin.value) || base.minSpeechMs,
+      endSilenceMs: Number(ui.vEnd.value) || base.endSilenceMs,
+      rmsRatio: Number(ui.vRatio.value) || base.rmsRatio
     };
   }
   function jitterBufferMs() {
-    return Number(ui.vJitter.value) || 350;
+    return Number(ui.vJitter.value) || serverJitterMs || 350;
+  }
+  for (const input of [ui.vConfirm, ui.vMin, ui.vEnd, ui.vRatio, ui.vJitter]) {
+    input.addEventListener("input", () => {
+      input.dataset.touched = "1";
+    });
   }
   function sendJson(message) {
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -993,6 +1024,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     switch (type) {
       case "ready":
         serverProtocol = Number(message.protocol ?? 0);
+        applyServerTuning(message);
         logEvent(`\u534F\u8BAE\u534F\u5546 v${serverProtocol}`);
         break;
       case "partial":

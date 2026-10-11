@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createLogger } from '@siren/telemetry';
+import { createLogger, errorFields } from '@siren/telemetry';
 
 function capture(): { lines: Record<string, unknown>[]; logger: ReturnType<typeof createLogger> } {
   const lines: Record<string, unknown>[] = [];
@@ -106,5 +106,29 @@ describe('Logger 脱敏（规范第 38 节）', () => {
     expect(entry.secret_access_key).toBe('[redacted]');
     expect(entry.session_token).toBe('[redacted]');
     expect(entry.llm_first_token_ms).toBe(1);
+  });
+});
+
+describe('S1011-008：递归脱敏与 bindings 覆盖', () => {
+  it('嵌套对象/数组里的敏感键同样脱敏；bindings 不再绕过', () => {
+    const lines: string[] = [];
+    const logger = createLogger({
+      level: 'info',
+      sink: (line) => lines.push(line),
+      bindings: { component: 'x', access_token: 'secret-binding' }
+    });
+    logger.info('evt', { nested: { api_key: 'secret-nested', list: [{ token: 'secret-list' }] }, text: '正文' });
+    const parsed = JSON.parse(lines.at(-1) ?? '{}') as Record<string, unknown>;
+    expect(parsed.access_token).toBe('[redacted]');
+    const nested = parsed.nested as Record<string, unknown>;
+    expect(nested.api_key).toBe('[redacted]');
+    expect(((nested.list as Record<string, unknown>[])[0]).token).toBe('[redacted]');
+    expect(String(parsed.text)).toMatch(/^\[len:/); // 文本默认不落日志
+  });
+
+  it('超长上游错误信息截断到 200 字符（有界）', () => {
+    const fields = errorFields(new Error('x'.repeat(5000)));
+    expect((fields.error_message as string).length).toBeLessThanOrEqual(220);
+    expect((fields.error_message as string)).toContain('[truncated]');
   });
 });

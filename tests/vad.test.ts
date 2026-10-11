@@ -73,3 +73,21 @@ describe('VadMachine（F05：候选语音冻结噪声底 + 时间归一化）', 
     expect(vad.noiseFloorValue).toBeLessThan(raised);
   });
 });
+
+describe('S1011-015：最短有效语音参与 start 门（max(confirm, minSpeech)）', () => {
+  it('minSpeechMs 大于 confirmMs 时，start 延后到最短语音窗越过（句首由 pre-roll 保护）', () => {
+    let clockMs = 0;
+    const vad = new VadMachine(() => ({ confirmMs: 40, minSpeechMs: 100, endSilenceMs: 40, rmsRatio: 2 }), () => clockMs);
+    const loud = () => new Float32Array(160).fill(0.9);
+    const silent = () => new Float32Array(160);
+    for (let i = 0; i < 6; i++) { clockMs += 10; vad.process(silent()); }
+    let startedAtTick = -1;
+    for (let i = 0; i < 15; i++) {
+      clockMs += 10;
+      const outcome = vad.process(loud());
+      if (outcome.event === 'start') { startedAtTick = i; break; }
+    }
+    // confirm=40ms 在第 4 块即满足，但 minSpeech=100ms 要求语音持续 100ms（第 11 块，索引 10）才 start
+    expect(startedAtTick).toBe(10);
+  });
+});

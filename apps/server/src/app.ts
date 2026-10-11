@@ -104,6 +104,22 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     }
   }
 
+  // S1011-022：profile.provider 与实际装配的供应商一致性——错配会让音色跨供应商
+  // 错用（如 profile 标 volc 而异步链路是 elevenlabs）。生产 fail-closed，开发告警。
+  const activeProviderNames = new Set(
+    [providers.active.asr, providers.active.asyncTts, providers.active.realtimeTts]
+      .map((name) => name.split('(')[0]!.trim())
+  );
+  for (const profile of profiles.list()) {
+    if (profile.provider !== 'mock' && !activeProviderNames.has(profile.provider)) {
+      const message = `音色档案 ${profile.id} 声明 provider=${profile.provider}，与实际装配（${[...activeProviderNames].join('/')}）不符——音色将跨供应商错配`;
+      if (config.env === 'production') {
+        throw new Error(message);
+      }
+      logger.warn('config_warning', { message });
+    }
+  }
+
   const fillers =
     options.fillers ??
     new FillerManager(config.fillersDir, config.fillerEnabled, logger.child({ component: 'filler' }));

@@ -23,10 +23,19 @@ export function registerCallSessionRoutes(app: FastifyInstance, deps: CallSessio
       });
       return;
     }
-    const result = await deps.callCenter.createCall({
-      conversationId: parsed.data.conversation_id,
-      voiceProfileId: parsed.data.voice_profile
-    });
+    let result;
+    try {
+      result = await deps.callCenter.createCall({
+        conversationId: parsed.data.conversation_id,
+        voiceProfileId: parsed.data.voice_profile
+      });
+    } catch (error) {
+      if ((error as Error).message === 'call_capacity_reached') {
+        await reply.code(503).send({ error: 'call_capacity_reached', message: '并发通话已达上限' });
+        return;
+      }
+      throw error;
+    }
     await reply.code(201).send({
       call_id: result.callId,
       ws_url: result.wsUrl,
