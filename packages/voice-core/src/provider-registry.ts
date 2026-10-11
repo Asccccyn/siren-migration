@@ -172,8 +172,9 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
   }
 
   // --- Object Store ---
+  // S1011-023：与 assertProductionReadiness 同一判定——bucket 显式为空即不启用 R2
   const r2Ready = Boolean(
-    config.r2.accountId && config.r2.accessKeyId && config.r2.secretAccessKey
+    config.r2.accountId && config.r2.accessKeyId && config.r2.secretAccessKey && config.r2.bucket
   );
   let store: ObjectStore;
   let storageName: string;

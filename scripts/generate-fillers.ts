@@ -9,8 +9,7 @@ import { join } from 'node:path';
 import { resolve } from 'node:path';
 import { REALTIME_OUTPUT_SAMPLE_RATE, type VoiceStyle } from '@siren/contracts';
 import { MockTtsProvider } from '@siren/provider-mock';
-import { VolcBatchTtsProvider } from '@siren/provider-volc-tts';
-import { loadConfig } from '@siren/voice-core';
+import { buildProviders, loadConfig } from '@siren/voice-core';
 import { createLogger } from '@siren/telemetry';
 
 const FILLER_LINES: Record<string, string[]> = {
@@ -33,28 +32,22 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger({ level: 'info' });
 
-  const volcReady = Boolean(config.volc.appId && config.volc.accessToken);
-  const tts = useMock || !volcReady
-    ? new MockTtsProvider()
-    : new VolcBatchTtsProvider({
-        appId: config.volc.appId,
-        accessToken: config.volc.accessToken,
-        cluster: config.volc.ttsCluster,
-        endpointUrl: config.volc.ttsUrl,
-        timeoutMs: config.volc.httpTimeoutMs
-      });
-  if (useMock || !volcReady) {
-    logger.warn('config_warning', {
-      message: useMock ? '按 --mock 使用 MockTtsProvider' : '火山凭据缺失，使用 MockTtsProvider 生成占位 filler'
-    });
+  // S1011-028：复用统一 Provider 装配（buildProviders）——API-key 账号走双向流式聚合，
+  // 不再绕过注册器直连 v1 批量端点；Mock 只允许显式 --mock 选择
+  const providers = buildProviders(config, logger);
+  const tts = useMock ? new MockTtsProvider() : providers.asyncTts;
+  const providerName = useMock ? 'mock' : providers.active.asyncTts;
+  if (useMock) {
+    logger.warn('config_warning', { message: '按 --mock 使用 MockTtsProvider（产物为占位音频，来源标记 mock）' });
   }
+  logger.info('fillers_provider', { provider: providerName });
 
   const profile = {
     id: profileId,
     displayName: profileId,
     language: 'zh-CN',
-    provider: (useMock || !volcReady ? 'mock' : 'volc') as 'mock' | 'volc',
-    voiceId: useMock || !volcReady ? 'mock' : config.volc.voiceId,
+    provider: (useMock ? 'mock' : 'volc') as 'mock' | 'volc',
+    voiceId: useMock ? 'mock' : config.volc.voiceId,
     defaultEmotion: 'neutral' as const,
     defaultSpeed: 1.0
   };

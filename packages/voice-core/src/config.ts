@@ -203,7 +203,8 @@ function resolveProviderSections(env: EnvSource) {
       accountId: env.R2_ACCOUNT_ID ?? '',
       accessKeyId: env.R2_ACCESS_KEY_ID ?? '',
       secretAccessKey: env.R2_SECRET_ACCESS_KEY ?? '',
-      bucket: env.R2_BUCKET ?? 'siren-voice'
+      // S1011-023：未设用默认；显式设为空白=明确的不完整配置（生产阻断，readiness 不放行）
+      bucket: env.R2_BUCKET !== undefined ? env.R2_BUCKET : 'siren-voice'
     }
   };
 }
@@ -286,9 +287,11 @@ export function assertProductionReadiness(config: SirenConfig): ProductionReadin
     security.push('SIREN_SIGNING_SECRET 未显式配置：资源签名密钥将由内部 token 派生，生产禁止');
   }
   const r2 = config.r2;
-  const r2ConfiguredAny = Boolean(r2.accountId || r2.accessKeyId || r2.secretAccessKey);
-  if (r2ConfiguredAny && !(r2.accountId && r2.accessKeyId && r2.secretAccessKey)) {
-    security.push('R2 配置不完整：account id / access key / secret key 必须配齐，不允许半配置');
+  const r2ConfiguredAny = Boolean(r2.accountId || r2.accessKeyId || r2.secretAccessKey || r2.bucket !== 'siren-voice');
+  // S1011-023：bucket 显式为空同属半配置——readiness 与装配（provider-registry）共用
+  // "四件齐备"判定，空 bucket 不得启用 R2 存储
+  if (r2ConfiguredAny && !(r2.accountId && r2.accessKeyId && r2.secretAccessKey && r2.bucket)) {
+    security.push('R2 配置不完整：account id / access key / secret key / bucket 必须配齐（bucket 不允许显式留空），不允许半配置');
   }
 
   if (config.allowMockInProduction) return { security, mock };

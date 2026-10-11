@@ -33,11 +33,11 @@ CoreBridge 与 conversation 所有权不变。
     （仅多语种 `bigmodel_nostream` 端点携带）。
   - partial 覆盖式更新；`definite=true` 的 final 只提交一次（重复下发不重复拼接）。
   - 协议编解码集中在 `protocol.ts`；上游字段若调整只改该文件。
-- 真实验收：`VOLC_REAL_INTEGRATION=1` + 凭据运行 `tests/volc-real-integration.test.ts`。
+- 真实验收：`VOLC_REAL_INTEGRATION=1` + 凭据（旧双件套或 `VOLC_API_KEY` 单钥任一）运行 `tests/volc-real-integration.test.ts`；正弦 PCM 用例是链路健康探针，不验收识别精度与音色。
 
 ## 火山 TTS（packages/providers/volc-tts）
 
-- **批量**：`POST {VOLC_TTS_URL}`（默认 `https://openspeech.bytedance.com/api/v1/tts`），`app{appid,token,cluster}` + `audio{voice_type,encoding,speed_ratio,emotion...}` + `request{reqid,text,operation:query}`；code=3000 成功。异步链路 `encoding=mp3`；实时兜底 `encoding=pcm` + 真实 sample_rate。
+- **批量**：`POST {VOLC_TTS_URL}`（默认 `https://openspeech.bytedance.com/api/v1/tts`；**API-key 单钥账号无此端点权限——异步链路经双向流式聚合等价实现**，返回容器以响应 content-type 为准，如请求 mp3 实得 wav），`app{appid,token,cluster}` + `audio{voice_type,encoding,speed_ratio,emotion...}` + `request{reqid,text,operation:query}`；code=3000 成功。异步链路 `encoding=mp3`；实时兜底 `encoding=pcm` + 真实 sample_rate。
 - **实时（v1.1 重写为真 provider-level streaming，P0-9）**：v3 双向流式
   `wss://openspeech.bytedance.com/api/v3/tts/bidirection`（事件驱动：
   StartConnection → StartSession(speaker/audio_params) → TaskRequest(text 流式输入)

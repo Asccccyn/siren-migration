@@ -17,7 +17,10 @@ import type { TtsRequest, VoiceProfile, VoiceStyle } from '@siren/contracts';
 const ENABLED = process.env.VOLC_REAL_INTEGRATION === '1';
 const APP_ID = process.env.VOLC_APP_ID ?? '';
 const ACCESS_TOKEN = process.env.VOLC_ACCESS_TOKEN ?? '';
+const API_KEY = process.env.VOLC_API_KEY ?? '';
 const VOICE_ID = process.env.VOLC_VOICE_ID ?? '';
+// S1011-027：新旧两套凭据任一齐备即可验收（与 buildProviders 的 volcReady 同一口径）
+const HAS_CREDS = Boolean((APP_ID && ACCESS_TOKEN) || API_KEY);
 
 const PROFILE: VoiceProfile = {
   id: 'main',
@@ -29,11 +32,12 @@ const PROFILE: VoiceProfile = {
   defaultSpeed: 1.0
 };
 
-describe.skipIf(!ENABLED || !APP_ID || !ACCESS_TOKEN)('真实火山 Provider 集成（VOLC_REAL_INTEGRATION=1）', () => {
-  it('ASR：真实流式识别（大模型 sauc v3，喂入正弦 PCM，期待非空 transcript 或明确空结果）', async () => {
+describe.skipIf(!ENABLED || !HAS_CREDS)('真实火山 Provider 集成（VOLC_REAL_INTEGRATION=1）', () => {
+  it('ASR：真实流式识别（大模型 sauc v3，正弦 PCM=链路健康探针——不验识别精度/音色）', async () => {
     const provider = new VolcStreamAsrProvider({
       appId: APP_ID,
       accessToken: ACCESS_TOKEN,
+      apiKey: API_KEY || undefined,
       resourceId: process.env.VOLC_ASR_RESOURCE_ID ?? 'volc.bigasr.sauc.duration',
       wsUrl: process.env.VOLC_ASR_WS_URL ?? 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel',
       sampleRate: 16000,
@@ -52,6 +56,7 @@ describe.skipIf(!ENABLED || !APP_ID || !ACCESS_TOKEN)('真实火山 Provider 集
     const provider = new VolcBidirectionalTtsProvider({
       appId: APP_ID,
       accessToken: ACCESS_TOKEN,
+      apiKey: API_KEY || undefined,
       resourceId: process.env.VOLC_TTS_RESOURCE_ID ?? 'volc.service_type.10029',
       wsUrl: process.env.VOLC_TTS_WS_URL ?? 'wss://openspeech.bytedance.com/api/v3/tts/bidirection',
       connectTimeoutMs: 8000,

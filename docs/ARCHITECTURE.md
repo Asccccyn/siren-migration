@@ -57,14 +57,14 @@ Cloudflare Tunnel：`voice.example.invalid → http://127.0.0.1:8790`。
 | `packages/providers/mock` | 开发 / 测试 Mock |
 | `packages/voice-core` | VoiceService、CallSession、状态机、切句、Filler、Token、配置、ReplyPipeline、CascadeRealtimeProvider |
 | `apps/server` | Fastify 应用（REST + WS + MCP） |
-| `apps/web` | 唯一入口页客户端（pre-roll / 本地 barge-in / stream router 均在此层） |
+| `apps/web` | 唯一入口页客户端（pre-roll / 半双工门控 / stream router 均在此层） |
 
 ## 4. 关键设计约束
 
 1. **MCP 与 REST 复用同一个 `VoiceService`** —— `apps/server` 的路由与 MCP 工具都只做参数翻译，不写业务逻辑。
 2. **Provider 全部通过 Adapter** —— 业务层只见 `AsrProvider` / `TtsProvider` 接口；火山、ElevenLabs 细节封在各 provider 包内。
 3. **CallSession 显式状态机** —— `IDLE → LISTENING → ENDING → THINKING → SPEAKING → LISTENING`（正常结束 speaking→listening 直达）；`interrupting` 只用于真实打断。
-4. **Barge-in 三层取消** —— ① 浏览器本地立即停播（VAD start + AI 活跃 → stopAll + abort 帧，不等网络往返）；② 服务端取消（core.cancel、作废输出流、清 pipeline、回 LISTENING）；③ Provider 正式 abort（turn 级 AbortSignal 立即终止火山双向流式连接 / ElevenLabs fetch）。保留已真正播出的文本。
+4. **打断三层取消（半双工定案：仅手动触发）** —— ① 浏览器本地立即停播（UI 徽章点击 → stopAll + abort 帧，不等网络往返；VAD 自动打断已移除——AI 活跃期麦克风判定一律吞掉，回声与故障区交互不再存在）；② 服务端取消（core.cancel、作废输出流、清 pipeline、回 LISTENING）；③ Provider 正式 abort（turn 级 AbortSignal：火山 TTS 发会话级 CancelSession——共享连接保活复用、其余 session 不受影响；ElevenLabs fetch 取消；ASR 会话关闭即连接关闭）。保留已真正播出的文本；Core 中途失败时已收到的原始文本独立保留下发（receivedText）。
 5. **双重句首保护** —— 客户端 400ms pre-roll ring（VAD 判定窗口内音频随 start flush）+ 服务端 ASR prebuffer（建连期间补发）。
 6. **聊天历史唯一真源在 Core** —— Siren 的 `call_turns` 只是通话元数据（含延迟指标），不是第二套聊天历史。电话必须绑定网页当前 conversation（POST /v1/calls 必填 conversation_id，token 冻结，callId ≠ conversationId）。
 7. **降级链** —— Streaming TTS 失败 → Batch TTS（PCM，真实采样率）→ 若仍失败保留文字消息（`reply` 帧照发）；ASR 失败明确报错，绝不猜内容。

@@ -55,6 +55,7 @@ GET /ws/call/{call_id}?token={short-lived-token}   (WebSocket)
 | `{"t":"pcm","stream_id":"out_x","sequence":0,"rate":24000,"bytes":1920}` | **每个**二进制帧前的 JSON 头（P0-3） |
 | `{"t":"pcm_end","stream_id":"out_x"}` | 本轮 PCM 结束（流粒度） |
 | `{"t":"interrupted","stream_id":"out_x"}` | 打断完成；该输出流永久失效 |
+| `{"t":"notice","code":"empty_transcript","message":"..."}` | 提示性通知（如空转写"没听清"）——非错误，通话继续 |
 | `{"t":"metrics",...}` | 本轮延迟指标 |
 | `{"t":"pong"}` / `{"t":"error",...}` | 心跳 / 错误（asr_failed / tts_failed / core_failed / invalid_state） |
 
@@ -103,8 +104,10 @@ drain 等待期，期间状态保持 speaking）；`interrupting` 只用于真�
    回 listening 且用户仍在说话时自动接上。
 2. **Siren server 取消当前轮**：取消 Core 流（core.cancel）、abortTurn、作废旧
    输出流（`interrupted` + stream_id）、清 reply pipeline、回 LISTENING。
-3. **Provider 正式 abort**：turn 级 AbortSignal 立即终止 TTS 上游
-   （火山双向流式连接 terminate / ElevenLabs fetch 取消），ASR 会话关闭。
+3. **Provider 正式 abort**：turn 级 AbortSignal 终止 TTS 上游——火山为**会话级
+   CancelSession(101)**（共享连接保活复用，其他通话 session 不受影响；连接级
+   终止只发生在 dispose/致命错误），ElevenLabs 为 fetch 取消；ASR 会话关闭即其
+   专属连接关闭。
 
 服务端 `interrupted` 帧保留用于最终确认 / 清理 / 调试。
 
