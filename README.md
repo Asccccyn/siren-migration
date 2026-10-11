@@ -164,17 +164,28 @@ TTS 事件流（连接复用/并发 session/abort/SessionFailed）、ElevenLabs 
   （Qwen Realtime / OpenAI / Gemini）为 v1.5 方向；本轮只留了 `RealtimeVoiceProvider`
   边界与协议能力位，未实现。
 
+## 维护处置记录（1011 审计 P3 裁量）
+
+- **超长文件/函数保留理由（S1011-033）**：`call-session.ts`（状态机单文件=状态
+  转移原子可读，拆分反而模糊 abort/adopt 竞态全景）与 OAuth `createOAuth`
+  （授权服务器内部状态闭包）按审计"不为拆而拆"口径有理由保留；测试 describe
+  回调超长属分组语义。复核工具：`node scripts/audit-coupling.mjs`（AST 版）。
+- **部署运维（S1011-031）**：服务当前 nohup 启动（launchd 常驻为待办）；
+  重启后隧道偶发 530，`launchctl kickstart -k gui/$(id -u)/com.charstarearth.siren-tunnel`
+  即恢复；脱敏前回滚副本 `~/Projects/siren-pre-scrub.bundle` 待她确认稳定后删除。
+
 ## 基线与批次索引
 
 README 永远是最新基线入口；每批一句话 + 提交号（她的基线维护规矩）。
 
 | 批次 | 提交 | 一句话 |
 |---|---|---|
+| 1011 审计返修全批 | `be36cb5..4ce372e`（8 commits） | P1×5 + P2×25 + P3×7 全清：OAuth 规范化/轮换/容量、DNS 钉住、ASR 孤儿会话终态化、半双工恢复闸门、/play 移除（一个网址+票据模型）、实时链路预算统一与文本保真、幂等前移、音色一致性、VAD 参数链、递归脱敏、字段级静态加密、复现脚本处置、AST 审计脚本、lint 归零——全量 278 绿送复审 |
 | 1011 半双工定案 | `fdd0b69` + `3179da9` | 移除 VAD 自动打断整条路径（纯半双工，打断仅手动），死代码清除，协议文档改写，资产 ?v=3，冻结送审 |
 | 1011 音色资源文档 | `2dc3044` | 复刻音色 seed-icl 资源匹配说明（另一批次，纯文档） |
 | 1002 排障加固 | `374dd9b` | 空宽限不再掩盖 ASR 失败 + asr_session_ready/asr_empty 观测日志 + 客户端 no-cache 防缓存 |
 | 1002 通话实测修复 | `7d03971` | iPhone 实测两故障：speaking 回声门控 + 空转写 notice 可见化 + prebuffer 建连限时 |
 | 1002 MCP OAuth | `1e0472d` | OAuth 2.1 全流程（发现/DCR/授权码 PKCE/refresh），与静态 token 同权共存，Claude 存量无需重连 |
 | 1002 唯一入口 | `c95dd5d` | /playground 全部旧路径与页面删除，apps/web + /assets，公网只剩裸域名 |
-| 0929~0930 | `92da0a2` | 全历史脱敏重写 + 语音档案移出 git（历史详见 git log） |
-| v1.0/v1.1 | `38ab16c` 起 | 语音能力层完整实现 + Realtime Hardening（历史详见 git log） |
+| 0929~0930 | `92da0a2` | 全历史脱敏重写 + 语音档案移出 git（现行可见历史自 92da0a2 起，更早哈希已随重写失效） |
+| v1.0/v1.1 | （现行历史起点 `92da0a2^..` 之前） | 语音能力层完整实现 + Realtime Hardening（实现期提交已被 0930 脱敏重写收拢，不再可引用；规格见 git log 与 docs） |

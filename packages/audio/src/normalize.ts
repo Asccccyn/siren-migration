@@ -7,10 +7,6 @@ export function rms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
-export function dbfs(rmsValue: number): number {
-  if (rmsValue <= 0) return -96;
-  return 20 * Math.log10(rmsValue);
-}
 
 /** 把 PCM16 峰值归一化到 targetPeak（0~1），返回缩放后的新 Buffer */
 export function normalizePcm16(input: Buffer, targetPeak = 0.9): Buffer {

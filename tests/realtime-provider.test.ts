@@ -40,7 +40,7 @@ describe('CascadeRealtimeProvider（P1-1 Provider 边界）', () => {
     harness.session.handleMessage({
       t: 'ready',
       protocol: 2,
-      capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+      capabilities: { playback_drain: true, stream_identity: true }
     });
     const ready = harness.texts().find((m) => m.t === 'ready');
     expect(ready).toMatchObject({

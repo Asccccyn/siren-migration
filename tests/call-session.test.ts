@@ -362,7 +362,7 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     session.handleMessage({
       t: 'ready',
       protocol: 2,
-      capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+      capabilities: { playback_drain: true, stream_identity: true }
     });
     session.handleMessage({ t: 'start' });
     session.handleBinary(Buffer.alloc(3200, 1));

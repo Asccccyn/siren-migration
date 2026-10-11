@@ -31,10 +31,5 @@ export interface RealtimeVoiceProvider extends StreamAsrProvider {
   readonly tts: TtsProvider;
 }
 
-/** 便捷类型：cascade 组合件的输入 */
-export interface CascadeVoiceComponents {
-  asr: StreamAsrProvider;
-  tts: TtsProvider;
-}
 
 export type { AsrStream, AsrStreamHandlers, PcmChunk, StreamAsrOptions, TtsProvider, TtsRequest };

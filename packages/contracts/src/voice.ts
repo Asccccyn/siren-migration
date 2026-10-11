@@ -49,7 +49,6 @@ export type AudioFormat = 'mp3' | 'wav' | 'pcm';
 /** 实时链路统一音频约束（规范第 16/17 节） */
 export const REALTIME_INPUT_SAMPLE_RATE = 16000;
 export const REALTIME_OUTPUT_SAMPLE_RATE = 24000;
-export const PCM_BITS = 16;
 export const PCM_CHANNELS = 1;
 
 // ---------------------------------------------------------------------------

@@ -19,7 +19,6 @@ export const voiceSpeakInputSchema = z.object({
   speed: z.number().min(0.5).max(2.0).optional()
 });
 
-export type VoiceSpeakInput = z.infer<typeof voiceSpeakInputSchema>;
 
 export interface VoiceSpeakOutput {
   voice_message_id: string;

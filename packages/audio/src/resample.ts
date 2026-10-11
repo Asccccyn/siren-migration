@@ -1,5 +1,3 @@
-import { float32ToPcm16, pcm16ToFloat32 } from './pcm.ts';
-
 /** 线性插值重采样（质量足够语音链路使用，且无外部依赖） */
 
 export function resampleFloat32(input: Float32Array, fromRate: number, toRate: number): Float32Array {
@@ -17,6 +15,3 @@ export function resampleFloat32(input: Float32Array, fromRate: number, toRate: n
   return out;
 }
 
-export function resamplePcm16(input: Buffer, fromRate: number, toRate: number): Buffer {
-  return float32ToPcm16(resampleFloat32(pcm16ToFloat32(input), fromRate, toRate));
-}

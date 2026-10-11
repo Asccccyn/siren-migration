@@ -52,7 +52,7 @@ socket.on('open', () => {
     JSON.stringify({
       t: 'ready',
       protocol: 2,
-      capabilities: { playback_drain: true, stream_identity: true, local_barge_in: true }
+      capabilities: { playback_drain: true, stream_identity: true }
     })
   );
   socket.send(JSON.stringify({ t: 'start' }));

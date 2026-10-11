@@ -23,16 +23,6 @@ export type CallState =
   | 'ended'
   | 'error';
 
-export const CALL_STATES: readonly CallState[] = [
-  'idle',
-  'listening',
-  'ending',
-  'thinking',
-  'speaking',
-  'interrupting',
-  'ended',
-  'error'
-];
 
 /** 当前协议版本 */
 export const WS_PROTOCOL_VERSION = 2;
@@ -45,7 +35,6 @@ export const WS_PROTOCOL_VERSION = 2;
 export interface ClientWsCapabilities {
   playback_drain?: boolean;
   stream_identity?: boolean;
-  local_barge_in?: boolean;
 }
 
 export type ClientWsMessage =
@@ -65,7 +54,6 @@ const clientCapabilitiesSchema = z
   .object({
     playback_drain: z.boolean().optional(),
     stream_identity: z.boolean().optional(),
-    local_barge_in: z.boolean().optional()
   })
   .passthrough();
 

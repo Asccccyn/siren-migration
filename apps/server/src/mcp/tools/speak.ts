@@ -45,12 +45,13 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           language: parsed.data.language
         });
         deps.logger.info('mcp_tool_called', { tool: 'voice_speak', voice_message_id: asset.id });
+        // S1011-035：不回显 text/tts_script——调用方刚发过它们，回显只消耗其对端
+        // 模型上下文 token；audio_url 短时效，消费即取（voice_message_id 可长期引用回读）
         const payload = {
           voice_message_id: asset.id,
           audio_url: asset.audioUrl,
           duration_ms: asset.durationMs,
-          format: asset.audioFormat,
-          text: asset.text ?? parsed.data.text
+          format: asset.audioFormat
         };
         return {
           structuredContent: payload,
