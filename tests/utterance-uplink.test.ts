@@ -187,6 +187,32 @@ describe('UtteranceUplink（半双工：AI 活跃期间 VAD 一律不触发上�
     expect(h.json.filter((m) => m.t === 'end').length).toBe(1);
   });
 
+  it('S1011-005：静音撤销待恢复意图——静音中回 listening 不上行', () => {
+    let aiActive = true;
+    const h = buildHarness({ aiActive: () => aiActive });
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 8; i++) h.tick(loud(i)); // start 被吞
+    h.uplink.setMuted(true); // 等待期间静音
+    aiActive = false;
+    h.uplink.onServerState('listening');
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
+    expect(h.frames.length).toBe(0);
+  });
+
+  it('S1011-005：切 PTT 撤销待恢复意图——不按键不得上传麦克风', () => {
+    let aiActive = true;
+    const h = buildHarness({ aiActive: () => aiActive });
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 8; i++) h.tick(loud(i)); // start 被吞
+    h.uplink.setMode('ptt'); // 等待期间切到按住说话
+    aiActive = false;
+    h.uplink.onServerState('listening');
+    // PTT 模式下持续有声但不按键：不上行
+    for (let i = 0; i < 8; i++) h.tick(loud(i));
+    expect(h.json.filter((m) => m.t === 'start').length).toBe(0);
+    expect(h.frames.length).toBe(0);
+  });
+
   it('AI 结束前用户已停下：回 listening 不自动开启新 utterance', () => {
     let aiActive = true;
     const h = buildHarness({ aiActive: () => aiActive });

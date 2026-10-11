@@ -6,6 +6,10 @@
  *   再按实际累计字节在中途取消，不允许先 arrayBuffer 全量入内存
  */
 import { lookup } from 'node:dns/promises';
+import type { LookupAddress } from 'node:dns';
+import { request as httpRequest } from 'node:http';
+import type { IncomingMessage, RequestOptions } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
 
 export type AudioFetchErrorCode = 'blocked_url' | 'too_large' | 'download_failed';
@@ -156,12 +160,19 @@ function intToDottedQuad(value: bigint): string {
   return `${a}.${b}.${c}.${d}`;
 }
 
+/** 出站目标：url + 已校验的 DNS 地址（字面 IP 时为 null——连接本身即绑定） */
+interface OutboundTarget {
+  url: URL;
+  pinned: LookupAddress[] | null;
+}
+
 /**
- * 出站校验：协议限 http/https；主机名先做字面 IP 判定，
- * 否则 DNS 解析全部地址——任一解析结果落在禁止段即整体拒绝
- * （避免 happy-eyeballs 落到私网地址的窗口）。
+ * 出站校验与解析钉住（S1011-003 修复）：协议限 http/https；主机名先做字面 IP 判定，
+ * 否则 DNS 解析全部地址——任一解析结果落在禁止段即整体拒绝。
+ * 校验通过的解析列表作为 pinned 随目标返回，实际连接用同一列表做自定义 lookup，
+ * 消除"校验时解析一次、连接时再解析一次"的 DNS 重绑定窗口。
  */
-export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
+async function resolveOutbound(rawUrl: string): Promise<OutboundTarget> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -176,9 +187,9 @@ export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
     if (isBlockedAddress(hostname)) {
       throw new AudioFetchError('blocked_url', `non-public address blocked: ${hostname}`);
     }
-    return url;
+    return { url, pinned: null };
   }
-  let addresses: { address: string }[];
+  let addresses: LookupAddress[];
   try {
     addresses = await lookup(hostname, { all: true });
   } catch {
@@ -187,7 +198,69 @@ export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
   if (addresses.length === 0 || addresses.some((entry) => isBlockedAddress(entry.address))) {
     throw new AudioFetchError('blocked_url', `host resolves to non-public address: ${hostname}`);
   }
-  return url;
+  return { url, pinned: addresses };
+}
+
+/** 对外保持原签名：只做校验并返回 URL（pinned 语义由 downloadWithLimits 内部使用） */
+export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
+  return (await resolveOutbound(rawUrl)).url;
+}
+
+/** 已校验地址的连接器 lookup：连接阶段不再独立解析（DNS 重绑定防护的落点） */
+function pinnedLookup(addresses: LookupAddress[]): NonNullable<RequestOptions['lookup']> {
+  return ((_hostname: string, _options: unknown, callback: (err: Error | null, addrs: LookupAddress[]) => void) => {
+    callback(null, addresses);
+  }) as unknown as NonNullable<RequestOptions['lookup']>;
+}
+
+interface PinnedResponse {
+  res: IncomingMessage;
+  /** 调用方读完/放弃 body 后必须调用（解除超时计时器对 socket 的持有） */
+  settled: () => void;
+}
+
+/** 发起到已校验目标的请求；超时覆盖建连+响应头+body（body 结束须调 settled） */
+function sendPinned(target: OutboundTarget, timeoutMs: number): Promise<PinnedResponse> {
+  return new Promise((resolve, reject) => {
+    const doRequest = target.url.protocol === 'https:' ? httpsRequest : httpRequest;
+    const options: RequestOptions = {
+      headers: { 'user-agent': 'siren-audio-fetch', accept: '*/*' }
+    };
+    if (target.pinned) options.lookup = pinnedLookup(target.pinned);
+    const req = doRequest(target.url, options);
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      req.destroy(new Error(`audio fetch timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const settle = (fn: () => void) => {
+      if (done) return;
+      done = true;
+      fn();
+    };
+    req.on('response', (res) => {
+      settle(() => {
+        resolve({
+          res,
+          settled: () => {
+            clearTimeout(timer);
+          }
+        });
+      });
+      // body 结束/中断同样解除计时器（超时不再作用于已完结的响应）
+      res.on('end', () => clearTimeout(timer));
+      res.on('close', () => clearTimeout(timer));
+    });
+    req.on('error', (error) => {
+      settle(() => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      clearTimeout(timer);
+    });
+    req.end();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -196,64 +269,63 @@ export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
 
 export async function downloadWithLimits(rawUrl: string, options: AudioDownloadOptions): Promise<AudioDownload> {
   const maxRedirects = options.maxRedirects ?? 3;
-  let current = await assertPublicHttpUrl(rawUrl);
-  let response: Response;
+  let current = await resolveOutbound(rawUrl);
+  let response: PinnedResponse;
   for (let hop = 0; ; hop++) {
-    response = await fetch(current, {
-      redirect: 'manual',
-      signal: AbortSignal.timeout(options.timeoutMs)
-    });
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      await response.body?.cancel().catch(() => undefined);
+    response = await sendPinned(current, options.timeoutMs);
+    const status = response.res.statusCode ?? 0;
+    if (status >= 300 && status < 400) {
+      const location = response.res.headers.location;
+      response.res.destroy();
+      response.settled();
       if (!location) {
-        throw new AudioFetchError('download_failed', `redirect without location: ${response.status}`);
+        throw new AudioFetchError('download_failed', `redirect without location: ${status}`);
       }
       if (hop >= maxRedirects) {
         throw new AudioFetchError('download_failed', 'too many redirects');
       }
       // 每一跳重定向都重新做出站校验（F03：不校验重定向目标等于没有校验）
-      current = await assertPublicHttpUrl(new URL(location, current).toString());
+      current = await resolveOutbound(new URL(location, current.url).toString());
       continue;
     }
     break;
   }
-  if (!response.ok) {
-    throw new AudioFetchError('download_failed', `audio download failed: ${response.status}`);
+  const status = response.res.statusCode ?? 0;
+  if (status < 200 || status >= 300) {
+    response.res.destroy();
+    response.settled();
+    throw new AudioFetchError('download_failed', `audio download failed: ${status}`);
   }
 
   // F21：Content-Length 提前拒绝（声明即拒绝，不等分配）
-  const declaredLength = Number(response.headers.get('content-length') ?? '0');
+  const declaredLength = Number(response.res.headers['content-length'] ?? '0');
   if (Number.isFinite(declaredLength) && declaredLength > options.maxBytes) {
-    await response.body?.cancel().catch(() => undefined);
+    response.res.destroy();
+    response.settled();
     throw new AudioFetchError('too_large', `audio too large: declared ${declaredLength} bytes`);
-  }
-  if (!response.body) {
-    throw new AudioFetchError('download_failed', 'download body missing');
   }
 
   // F21：流式累计，越界立即取消读——没有"先全量 arrayBuffer 再检查"的窗口
-  const reader = response.body.getReader();
   const chunks: Buffer[] = [];
   let total = 0;
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
+    for await (const chunk of response.res) {
+      total += chunk.length;
       if (total > options.maxBytes) {
         throw new AudioFetchError('too_large', `audio too large: exceeded ${options.maxBytes} bytes`);
       }
-      chunks.push(Buffer.from(value));
+      chunks.push(chunk);
     }
   } catch (error) {
-    await reader.cancel().catch(() => undefined);
+    response.res.destroy();
     if (error instanceof AudioFetchError) throw error;
     throw new AudioFetchError('download_failed', `audio download interrupted: ${(error as Error).message}`);
+  } finally {
+    response.settled();
   }
   return {
     audio: Buffer.concat(chunks),
-    contentType: response.headers.get('content-type') ?? '',
+    contentType: response.res.headers['content-type'] ?? '',
     bytes: total
   };
 }

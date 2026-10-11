@@ -108,18 +108,23 @@ export class PrebufferedAsrSession implements AsrStream {
   }
 
   async end(): Promise<{ text: string; language: string; durationMs: number }> {
-    // 建连就绪限时：防止 connect 永不落定导致上层宽限赛跑拿到空 partial 而"静默空转写"
+    // 建连就绪限时：防止 connect 永不落定导致上层宽限赛跑拿到空 partial 而"静默空转写"。
+    // S1011-004：所有失败路径先终态化（abort）——迟到落定的建连按 F09 立即丢弃，
+    // 不得接管会话成为无人收尾的孤儿连接
     const timeout = new Promise<'timeout'>((resolve) => {
       setTimeout(() => resolve('timeout'), this.readyTimeoutMs);
     });
     const ready = await Promise.race([this.ready().then(() => 'ready' as const), timeout]);
     if (ready === 'timeout' && !this.session) {
+      this.abort();
       throw new Error(`asr connect not ready within ${this.readyTimeoutMs}ms`);
     }
     if (this.sessionError) {
+      this.abort();
       throw this.sessionError;
     }
     if (!this.session) {
+      this.abort();
       throw new Error('asr session unavailable');
     }
     return this.session.end();

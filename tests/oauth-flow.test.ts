@@ -244,6 +244,21 @@ describe('OAuth：令牌签名单元', () => {
     revoked.add(createHash('sha256').update(at).digest('hex'));
     expect(verifyToken(secret, at, 'at', revoked)).toBeNull();
   });
+
+  it('S1011-001：等价签名编码变体一律拒收——吊销不可被尾缀绕过', () => {
+    const secret = 'test-secret';
+    const revoked = new Set<string>();
+    const at = signToken(secret, 'at', 'client-a', 60);
+    expect(verifyToken(secret, at, 'at', revoked)?.c).toBe('client-a');
+    // 同一令牌的等价字符串变体（尾缀字符、'=' 填充、附加字符）不得通过验签
+    expect(verifyToken(secret, `${at}x`, 'at', new Set())).toBeNull();
+    expect(verifyToken(secret, `${at}=`, 'at', new Set())).toBeNull();
+    expect(verifyToken(secret, `${at.slice(0, -1)}.${at.split('.')[2]}${at.split('.')[2] ? '' : ''}`, 'at', new Set())).toBeNull();
+    // 吊销登记规范原文后：变体本就过不了验签，原文也进不来
+    revoked.add(createHash('sha256').update(at).digest('hex'));
+    expect(verifyToken(secret, `${at}x`, 'at', revoked)).toBeNull();
+    expect(verifyToken(secret, at, 'at', revoked)).toBeNull();
+  });
 });
 
 /** authorize 的 POST body：隐藏字段 + 密码 */

@@ -2,6 +2,10 @@
  * OAuth 无状态令牌（HMAC 签名，密钥复用 SirenConfig.signingSecret）。
  * 格式：<random>.<payload-b64url>.<hmac-b64url>，payload = { t, e, c }（类型/过期/客户端）。
  * 不落库：重启不失效；吊销走进程内 denylist（best-effort，重启后旧 denylist 清空）。
+ *
+ * 规范形态（S1011-001 修复）：验证只接受严格规范编码——三段均为无填充、
+ * 可逆往返一致的 base64url。等价编码变体（尾缀字符、'=' 填充等）一律拒绝，
+ * 由此每个令牌只有唯一合法字符串表示，denylist 按原文哈希即为稳定吊销身份。
  */
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
@@ -18,6 +22,21 @@ export interface TokenClaims {
 
 function mac(secret: string, random: string, payload: string): Buffer {
   return createHmac('sha256', secret).update(`${random}.${payload}`).digest();
+}
+
+/** 严格 base64url 规范形态：非空、字符集合内、无 '='、解码再编码与原文一致（挡尾缀比特变体） */
+function isCanonicalBase64Url(part: string): boolean {
+  if (part.length === 0) return false;
+  if (!/^[A-Za-z0-9_-]+$/.test(part)) return false;
+  return Buffer.from(part, 'base64url').toString('base64url') === part;
+}
+
+/** 令牌是否为规范形态（吊销登记用：非规范形态永远过不了验签，无需登记） */
+export function isCanonicalToken(token: unknown): token is string {
+  if (typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  return parts.every((part) => isCanonicalBase64Url(part));
 }
 
 export function signToken(secret: string, type: TokenType, clientId: string, ttlSec: number, now = Date.now()): string {
@@ -38,6 +57,8 @@ export function verifyToken(
 ): TokenClaims | null {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
+  // 规范形态先行：非规范编码（含一切等价签名变体）不进入验签与吊销查询
+  if (!parts.every((part) => isCanonicalBase64Url(part))) return null;
   const [random, payload, digest] = parts as [string, string, string];
   let expected: Buffer;
   let actual: Buffer;

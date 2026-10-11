@@ -302,6 +302,8 @@ export class CallSession {
       getLatestPartial: () => (this.turn === turn ? this.lastPartialText : '')
     });
     if (outcome.kind === 'error') {
+      // S1011-004：ASR 失败即终态化——迟到建连/会话不得在 turn 释放后接管
+      turn.asr.abort();
       if (turn.aborted || this.turn !== turn || this.closed) return null; // 已被 abort 接管
       this.sendJson({ t: 'error', code: 'asr_failed', message: 'speech recognition failed' });
       this.log.warn('turn_failed', { ...errorFields(outcome.error), stage: 'asr', turn_index: turn.index });

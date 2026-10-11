@@ -25,6 +25,33 @@ describe('PrebufferedAsrSession：建连超时与喂入计数', () => {
     await expect(session.end()).rejects.toThrow(/not ready/);
   });
 
+  it('S1011-004：建连超时终态化——迟到的连接被立即 abort，不得接管成孤儿', async () => {
+    let resolveCreate!: (session: unknown) => void;
+    const provider = {
+      createStream: () =>
+        new Promise<unknown>((resolve) => {
+          resolveCreate = resolve;
+        })
+    } as unknown as ConstructorParameters<typeof PrebufferedAsrSession>[0];
+    const session = new PrebufferedAsrSession(provider, {} as never, {}, 64_000, 30);
+    void session.connect();
+    session.feed(Buffer.alloc(3200));
+    await expect(session.end()).rejects.toThrow(/not ready/);
+    // 迟到建连落定：必须走 F09 路径立即 abort，不 flush、不接管
+    let lateAborted = false;
+    resolveCreate({
+      abort: () => {
+        lateAborted = true;
+      },
+      feed: () => undefined,
+      end: async () => ({ text: '', language: 'zh-CN', durationMs: 0 })
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lateAborted).toBe(true);
+    expect(session.isReady).toBe(false);
+    expect(session.fedBytes).toBe(3200);
+  });
+
   it('fedBytes 统计含 pre-buffer 部分', async () => {
     const provider = new MockAsrProvider({ final: '你好', finalDelayMs: 5 });
     const session = new PrebufferedAsrSession(

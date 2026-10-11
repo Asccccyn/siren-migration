@@ -14,6 +14,7 @@ import { escapeHtml } from '../routes/html.ts';
 import { OAuthClientStore, type OAuthClient } from './client-store.ts';
 import {
   constantTimeEqualString,
+  isCanonicalToken,
   pkceS256,
   signToken,
   tokenHash,
@@ -285,8 +286,9 @@ ${opts.hidden}
 
     app.post('/oauth/revoke', async (request, reply) => {
       const form = (request.body ?? {}) as Record<string, unknown>;
-      const token = typeof form.token === 'string' ? form.token : '';
-      if (token) revoked.add(tokenHash(token));
+      const token = form.token;
+      // S1011-001：只登记规范形态——非规范变体本就过不了验签，登记无意义
+      if (isCanonicalToken(token)) revoked.add(tokenHash(token));
       await reply.send({});
     });
   }

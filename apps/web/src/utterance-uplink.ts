@@ -63,12 +63,16 @@ export class UtteranceUplink {
       this.deps.log?.('切换模式，结束当前 utterance -> end');
     }
     this.mode = mode;
+    // S1011-005：被吞的输入意图不跨模式存活——切 PTT 后未按键不得恢复上行
+    this.suppressedByAi = false;
     this.deps.preRoll.clear();
   }
 
   setMuted(muted: boolean): void {
     this.muted = muted;
     if (muted) {
+      // S1011-005：静音撤销一切待恢复的输入意图
+      this.suppressedByAi = false;
       this.deps.preRoll.clear(); // 静音期间不积累，避免解除静音后送出旧音频
       if (this.sending) {
         this.sending = false;
@@ -78,12 +82,13 @@ export class UtteranceUplink {
     }
   }
 
-  /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance */
+  /** 服务端 state 帧驱动；回 listening/idle 时若用户仍在说话则接上被吞的 utterance。
+   * S1011-005：恢复是输入许可的综合判定——仅 VAD 模式、未静音、当前未在发送时才成立 */
   onServerState(state: string): void {
     if (state === 'listening' || state === 'idle' || state === 'interrupted') {
       if (this.suppressedByAi) {
         this.suppressedByAi = false;
-        if (this.vadSpeech) {
+        if (this.vadSpeech && this.mode === 'vad' && !this.muted && !this.sending) {
           // AI 结束时你还在说话：现在开始上行，pre-roll 里保留了句首
           this.beginSending();
           this.deps.log?.('半双工门控解除：恢复上行（句首来自 pre-roll）');
