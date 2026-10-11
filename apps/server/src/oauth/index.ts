@@ -12,9 +12,11 @@ import type { SirenConfig } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { escapeHtml } from '../routes/html.ts';
 import { OAuthClientStore, type OAuthClient } from './client-store.ts';
+import { RevocationList } from './revocation.ts';
 import {
   constantTimeEqualString,
   isCanonicalToken,
+  peekTokenClaims,
   pkceS256,
   signToken,
   tokenHash,
@@ -44,12 +46,19 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
   const issuer = config.publicUrl;
   const store = new OAuthClientStore(config.dataDir);
   const storeReady = store.load();
+  const revocation = new RevocationList(config.dataDir);
+  const revocationReady = revocation.load();
   const codes = new Map<string, AuthCodeEntry>();
-  const revoked = new Set<string>();
   const attempts = new Map<string, { count: number; resetAt: number }>();
 
   function rateLimited(ip: string): boolean {
     const now = Date.now();
+    // S1011-007：限速表定期清扫，无节制的 IP 集不再长期滞留
+    if (attempts.size > 1000) {
+      for (const [key, entry] of attempts) {
+        if (now > entry.resetAt) attempts.delete(key);
+      }
+    }
     const entry = attempts.get(ip);
     if (!entry || now > entry.resetAt) {
       attempts.set(ip, { count: 1, resetAt: now + WINDOW_MS });
@@ -57,6 +66,17 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
     }
     entry.count += 1;
     return entry.count > MAX_ATTEMPTS;
+  }
+
+  function rememberCode(code: string, entry: AuthCodeEntry): void {
+    // S1011-007：授权码表按过期时间回收
+    if (codes.size > 100) {
+      const now = Date.now();
+      for (const [key, value] of codes) {
+        if (value.expiresAt <= now) codes.delete(key);
+      }
+    }
+    codes.set(code, entry);
   }
 
   function clientOf(formData: Record<string, unknown>): OAuthClient | null {
@@ -73,7 +93,7 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
     app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
       done(null, Object.fromEntries(new URLSearchParams(String(body))));
     });
-    await storeReady;
+    await Promise.all([storeReady, revocationReady]);
 
     app.get('/.well-known/oauth-protected-resource', async (_req, reply) => {
       await reply
@@ -104,6 +124,28 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
         : [];
       if (redirectUris.length === 0) {
         await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: 'redirect_uris 必填' });
+        return;
+      }
+      // S1011-010：结构校验——可解析、http(s)、无 fragment（存储仍按原文精确匹配）
+      for (const uri of redirectUris) {
+        let parsed: URL;
+        try {
+          parsed = new URL(uri);
+        } catch {
+          await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: `无法解析: ${uri.slice(0, 80)}` });
+          return;
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+          await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '仅允许 http/https' });
+          return;
+        }
+        if (parsed.hash) {
+          await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '不允许携带 fragment' });
+          return;
+        }
+      }
+      if (store.size >= 200) {
+        await reply.code(503).send({ error: 'registration_capacity_reached', error_description: '注册容量已满' });
         return;
       }
       const method = body.token_endpoint_auth_method === 'client_secret_post' ? 'client_secret_post' : 'none';
@@ -205,15 +247,18 @@ ${opts.hidden}
       }
       attempts.delete(ip);
       const code = randomBytes(24).toString('base64url');
-      codes.set(code, {
+      rememberCode(code, {
         clientId: v.client.clientId,
         redirectUri: v.redirectUri,
         codeChallenge: v.codeChallenge,
         expiresAt: Date.now() + CODE_TTL_MS
       });
       logger.info('oauth_code_issued', { client_id: v.client.clientId });
-      const stateQuery = v.state ? `&state=${encodeURIComponent(v.state)}` : '';
-      await reply.redirect(`${v.redirectUri}?code=${encodeURIComponent(code)}${stateQuery}`, 302);
+      // S1011-010：经 URL 对象追加参数——保留合法回调地址自身的 query，不做裸字符串拼接
+      const redirect = new URL(v.redirectUri);
+      redirect.searchParams.set('code', code);
+      if (v.state) redirect.searchParams.set('state', v.state);
+      await reply.redirect(redirect.toString(), 302);
     });
 
     app.post('/oauth/token', async (request, reply) => {
@@ -264,18 +309,22 @@ ${opts.hidden}
           return;
         }
         const token = typeof form.refresh_token === 'string' ? form.refresh_token : '';
-        const claims = verifyToken(config.signingSecret, token, 'rt', revoked);
+        const claims = verifyToken(config.signingSecret, token, 'rt', revocation);
         if (!claims || claims.c !== client.clientId) {
           await reply.code(400).send({ error: 'invalid_grant' });
           return;
         }
+        // S1011-011：刷新令牌一次性轮换——旧 RT 立即入吊销名单（按其到期时间回收），
+        // 重放旧 RT 按无效拒绝；新 RT 随本次响应发放
+        revocation.add(tokenHash(token), claims.e * 1000);
         const accessToken = signToken(config.signingSecret, 'at', client.clientId, ACCESS_TTL_SEC);
-        logger.info('oauth_token_refreshed', { client_id: client.clientId });
+        const refreshToken = signToken(config.signingSecret, 'rt', client.clientId, REFRESH_TTL_SEC);
+        logger.info('oauth_token_refreshed', { client_id: client.clientId, rotated: true });
         await reply.send({
           access_token: accessToken,
           token_type: 'Bearer',
           expires_in: ACCESS_TTL_SEC,
-          refresh_token: token,
+          refresh_token: refreshToken,
           scope: 'voice'
         });
         return;
@@ -287,14 +336,17 @@ ${opts.hidden}
     app.post('/oauth/revoke', async (request, reply) => {
       const form = (request.body ?? {}) as Record<string, unknown>;
       const token = form.token;
-      // S1011-001：只登记规范形态——非规范变体本就过不了验签，登记无意义
-      if (isCanonicalToken(token)) revoked.add(tokenHash(token));
+      // S1011-001/007/011：只登记验签通过且未过期的规范令牌，按到期时间入持久名单
+      if (isCanonicalToken(token)) {
+        const claims = peekTokenClaims(config.signingSecret, token);
+        if (claims) revocation.add(tokenHash(token), claims.e * 1000);
+      }
       await reply.send({});
     });
   }
 
   return {
     registerRoutes,
-    acceptBearer: (token) => verifyToken(config.signingSecret, token, 'at', revoked) !== null
+    acceptBearer: (token) => verifyToken(config.signingSecret, token, 'at', revocation) !== null
   };
 }

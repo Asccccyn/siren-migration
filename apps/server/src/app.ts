@@ -182,7 +182,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   registerWebAuthRoute(app, { config });
   await oauth.registerRoutes(app);
   registerCallWebSocket(app, { config, logger, callCenter });
-  registerMcpRoute(app, { voice, store: providers.store, logger, version: SIREN_VERSION });
+  registerMcpRoute(app, {
+    voice,
+    store: providers.store,
+    logger,
+    version: SIREN_VERSION,
+    corsOrigins: config.corsOrigins
+  });
 
   // 根路径 = 唯一入口（一个网址，页内三标签）：注入显示名（身份映射，真实称呼在 .env）
   const voiceboxHtml = join(config.webDir, 'voicebox.html');
@@ -198,15 +204,20 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     await reply.code(404).send({ error: 'web_not_built', hint: 'apps/web/public/voicebox.html 缺失' });
   });
 
-  // 唯一入口页的静态资源（css / 客户端 js），无独立页面；no-cache 保证修复及时送达
+  // 唯一入口页的静态资源（css / 客户端 js），无独立页面。
+  // S1011-009：fastifyStatic 的 setHeaders 会被插件自身回复头逻辑覆盖——
+  // 缓存策略在 onSend（最终响应头层）统一落实，并用真实响应断言
   if (existsSync(config.webDir)) {
     await app.register(fastifyStatic, {
       root: config.webDir,
       prefix: '/assets/',
-      index: false,
-      setHeaders: (res) => {
-        res.setHeader('cache-control', 'no-cache');
+      index: false
+    });
+    app.addHook('onSend', async (request, reply, payload) => {
+      if (request.url.split('?')[0]!.startsWith('/assets/')) {
+        reply.header('cache-control', 'no-cache');
       }
+      return payload;
     });
   }
 

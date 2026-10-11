@@ -225,6 +225,164 @@ describe('OAuth：授权码 + PKCE 全链路', () => {
   });
 });
 
+describe('OAuth 返修补强（S1011-010/011）', () => {
+  it('S1011-010：带 query 的回调地址完整保留，code/state 以参数追加', async () => {
+    const siren = await buildOauthApp();
+    try {
+      const redirectUri = 'https://client.example/cb?src=ios&x=1';
+      const reg = await siren.app.inject({
+        method: 'POST',
+        url: '/oauth/register',
+        headers: { 'content-type': 'application/json' },
+        payload: { redirect_uris: [redirectUri] }
+      });
+      expect(reg.statusCode).toBe(201);
+      const clientId = (reg.json() as { client_id: string }).client_id;
+      const challenge = pkceS256('verifier-abc');
+      const ok = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/authorize',
+        payload: form({
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          response_type: 'code',
+          state: 'st-9',
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+          password: PASSWORD
+        })
+      });
+      expect(ok.statusCode).toBe(302);
+      const location = new URL(ok.headers.location ?? '');
+      expect(location.searchParams.get('src')).toBe('ios');
+      expect(location.searchParams.get('x')).toBe('1');
+      expect(location.searchParams.get('state')).toBe('st-9');
+      expect(location.searchParams.get('code')).toBeTruthy();
+    } finally {
+      await siren.app.close();
+    }
+  });
+
+  it('S1011-010：fragment 与非 http(s) scheme 的重定向 URI 注册被拒', async () => {
+    const siren = await buildOauthApp();
+    try {
+      for (const bad of ['https://c.example/cb#frag', 'ftp://c.example/cb', 'not a url']) {
+        const res = await siren.app.inject({
+          method: 'POST',
+          url: '/oauth/register',
+          headers: { 'content-type': 'application/json' },
+          payload: { redirect_uris: [bad] }
+        });
+        expect(res.statusCode).toBe(400);
+        expect((res.json() as { error: string }).error).toBe('invalid_redirect_uri');
+      }
+    } finally {
+      await siren.app.close();
+    }
+  });
+
+  it('S1011-011：刷新令牌一次性轮换——旧 RT 重放被拒，新 RT 可继续刷新', async () => {
+    const siren = await buildOauthApp();
+    try {
+      const reg = await siren.app.inject({
+        method: 'POST',
+        url: '/oauth/register',
+        headers: { 'content-type': 'application/json' },
+        payload: { redirect_uris: ['https://client.example/cb'] }
+      });
+      const clientId = (reg.json() as { client_id: string }).client_id;
+      const redirectUri = 'https://client.example/cb';
+      const verifier = randomBytes(32).toString('base64url');
+      const ok = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/authorize',
+        payload: form({
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          response_type: 'code',
+          code_challenge: pkceS256(verifier),
+          code_challenge_method: 'S256',
+          password: PASSWORD
+        })
+      });
+      const code = new URLSearchParams((ok.headers.location ?? '').split('?')[1] ?? '').get('code') ?? '';
+      const token = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/token',
+        payload: form({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: clientId, code_verifier: verifier })
+      });
+      const rt1 = (token.json() as { refresh_token: string }).refresh_token;
+      // 第一次刷新：拿到新 RT（轮换）
+      const r1 = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/token',
+        payload: form({ grant_type: 'refresh_token', refresh_token: rt1, client_id: clientId })
+      });
+      expect(r1.statusCode).toBe(200);
+      const rt2 = (r1.json() as { refresh_token: string }).refresh_token;
+      expect(rt2).not.toBe(rt1);
+      // 旧 RT 重放：拒绝
+      const replay = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/token',
+        payload: form({ grant_type: 'refresh_token', refresh_token: rt1, client_id: clientId })
+      });
+      expect(replay.statusCode).toBe(400);
+      // 新 RT 继续可用
+      const r2 = await siren.app.inject({
+        ...formPost,
+        url: '/oauth/token',
+        payload: form({ grant_type: 'refresh_token', refresh_token: rt2, client_id: clientId })
+      });
+      expect(r2.statusCode).toBe(200);
+    } finally {
+      await siren.app.close();
+    }
+  });
+});
+
+describe('S1011-009/012：静态缓存与 MCP CORS 落到真实响应', () => {
+  it('/assets 实际响应带 cache-control: no-cache', async () => {
+    const siren = await buildTestApp();
+    try {
+      const res = await siren.app.inject({ method: 'GET', url: '/assets/siren.css' });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cache-control']).toBe('no-cache');
+    } finally {
+      await siren.app.close();
+    }
+  });
+
+  it('MCP 成功响应在白名单 Origin 下带 CORS 允许头（hijack 后不丢）', async () => {
+    const siren = await buildTestApp({
+      SIREN_INTERNAL_TOKEN: 'secret-1',
+      CORS_ORIGINS: 'https://chat.example'
+    });
+    try {
+      const res = await siren.app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: {
+          authorization: 'Bearer secret-1',
+          origin: 'https://chat.example',
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream'
+        },
+        payload: {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cors-probe', version: '0' } }
+        }
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['access-control-allow-origin']).toBe('https://chat.example');
+    } finally {
+      await siren.app.close();
+    }
+  });
+});
+
 describe('OAuth：令牌签名单元', () => {
   it('签名可验、过期拒、篡改拒、类型混用拒、吊销拒', () => {
     const secret = 'test-secret';

@@ -48,11 +48,16 @@ export function signToken(secret: string, type: TokenType, clientId: string, ttl
   return `${random}.${payload}.${mac(secret, random, payload).toString('base64url')}`;
 }
 
+/** 吊销查询接口：Set<string> 与 RevocationList 均满足 */
+export interface RevocationLookup {
+  has(hash: string): boolean;
+}
+
 export function verifyToken(
   secret: string,
   token: string,
   expectType: TokenType,
-  revoked: Set<string>,
+  revoked: RevocationLookup,
   now = Date.now()
 ): TokenClaims | null {
   const parts = token.split('.');
@@ -79,6 +84,28 @@ export function verifyToken(
   if (typeof claims.e !== 'number' || claims.e * 1000 <= now) return null;
   if (revoked.has(tokenHash(token))) return null;
   return claims;
+}
+
+/** 校验签名并读 claims，但忽略过期（吊销登记用：已过期令牌无需入册，未过期令牌按其到期时间回收） */
+export function peekTokenClaims(secret: string, token: string): TokenClaims | null {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  if (!parts.every((part) => isCanonicalBase64Url(part))) return null;
+  const [random, payload, digest] = parts as [string, string, string];
+  let expected: Buffer;
+  let actual: Buffer;
+  try {
+    expected = mac(secret, random, payload);
+    actual = Buffer.from(digest, 'base64url');
+  } catch {
+    return null;
+  }
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+  try {
+    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as TokenClaims;
+  } catch {
+    return null;
+  }
 }
 
 export function tokenHash(token: string): string {

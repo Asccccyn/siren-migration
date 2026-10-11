@@ -20,6 +20,8 @@ export interface McpDeps {
   store: ObjectStore;
   logger: Logger;
   version: string;
+  /** CORS 白名单（S1011-012：hijack 后 Fastify 不再写头，须在 raw 上补） */
+  corsOrigins?: string[];
 }
 
 export function createSirenMcpServer(deps: McpDeps): McpServer {
@@ -48,6 +50,13 @@ export function registerMcpRoute(app: FastifyInstance, deps: McpDeps): void {
       }
       logMcpEnvelope(deps.logger, request.body, request.headers['user-agent']);
       reply.hijack();
+      // S1011-012：hijack 后响应所有权在 transport——CORS 等必要头必须在 raw 上写入，
+      // 否则浏览器跨域客户端拿到的是无允许头的裸响应
+      const origin = request.headers.origin;
+      if (origin && deps.corsOrigins && (deps.corsOrigins.includes('*') || deps.corsOrigins.includes(origin))) {
+        reply.raw.setHeader('access-control-allow-origin', origin);
+        reply.raw.setHeader('vary', 'Origin');
+      }
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true
