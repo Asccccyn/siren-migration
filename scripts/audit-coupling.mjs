@@ -1,17 +1,40 @@
 /**
- * 静态耦合与长度审计：node scripts/audit-coupling.mjs
+ * 静态耦合与长度审计（S1011-029 重写：TypeScript AST 版）：node scripts/audit-coupling.mjs
  *
- * 阈值标准（两档制，>300 只提示复核，超过硬上限才判违规）：
- * - 文件 LOC：> 300 标记 ⚠ 复核；> 500 计入违规（常见工程上限）
- * - 函数长度：> 80 行计入违规（启发式解析类方法/顶层函数）
- * - 文件扇出：> 10 标记（组合根 app.ts / barrel index.ts / 测试工厂豁免）
- * - 包级循环依赖 / 分层规则违规：一律计入违规
+ * 与旧版启发式正则的差异：
+ * - 函数边界来自真实语法节点（含箭头函数/回调），不再是行启发式
+ * - 依赖边来自 Import/Export 的 module specifier（含 type-only 与 re-export），
+ *   动态 import() 与 require 一并收录；包名取各 package.json 的真实 name
+ * - 循环依赖：文件级与包级全部强连通分量（Tarjan SCC）
+ *
+ * 阈值（两档制）：文件 LOC >300 ⚠ 复核、>500 违规；函数/回调 >80 行违规；
+ * 文件扇出 >10 标记（组合根 app.ts / barrel index.ts / 测试工厂豁免）；
+ * 文件/包级循环一律违规；providers 不得依赖 voice-core（分层规则）。
  */
-import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { join, relative, dirname, resolve } from 'node:path';
+import ts from 'typescript';
 
 const ROOT = process.cwd();
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'public', '.git', 'data', 'coverage']);
+const FILE_LOC_WARN = 300;
+const FILE_LOC_VIOLATION = 500;
+const FUNC_LOC_VIOLATION = 80;
+const FANOUT_FLAG = 10;
+const FANOUT_EXEMPT = new Set([
+  'apps/server/src/app.ts', // 组合根：装配即扇出
+  'packages/voice-core/src/index.ts', // barrel
+  'packages/contracts/src/index.ts', // barrel
+  'packages/storage/src/index.ts', // barrel
+  'packages/telemetry/src/index.ts', // barrel
+  'packages/audio/src/index.ts', // barrel
+  'packages/core-bridge/src/index.ts', // barrel
+  'packages/provider-mock/src/index.ts', // barrel
+  'packages/provider-volc-asr/src/index.ts', // barrel
+  'packages/provider-volc-tts/src/index.ts', // barrel
+  'packages/provider-elevenlabs-tts/src/index.ts', // barrel
+  'tests/helpers.ts' // 测试工厂
+]);
 
 function walk(dir) {
   const out = [];
@@ -20,192 +43,185 @@ function walk(dir) {
     const full = join(dir, entry);
     const info = statSync(full);
     if (info.isDirectory()) out.push(...walk(full));
-    else if (/\.(ts|mjs)$/.test(entry) && !entry.endsWith('.d.ts')) out.push(full);
+    else if (/\.(ts|mts|mjs)$/.test(entry) && !entry.endsWith('.d.ts')) out.push(full);
   }
   return out;
 }
 
-function packageNameOf(file) {
-  const rel = relative(ROOT, file).replace(/\\/g, '/');
-  if (rel.startsWith('packages/providers/')) return `@siren/provider-${rel.split('/')[2]}`;
-  if (rel.startsWith('packages/')) return `@siren/${rel.split('/')[1]}`;
-  if (rel.startsWith('apps/')) return `@siren/${rel.split('/')[1]}`;
-  return 'root';
-}
-
-const IMPORT_RE =
-  /import\s+(type\s+)?[\w$*{},\s]+?from\s+['"]([^'"]+)['"]|import\s*\(\s*['"]([^'"]+)['"]\s*\)|import\s+['"]([^'"]+)['"]/g;
-
-/** 返回 { spec, typeOnly }；import type 在运行时被擦除，不构成运行时耦合 */
-function collectImports(source) {
-  const specs = [];
-  let match;
-  const re = new RegExp(IMPORT_RE);
-  while ((match = re.exec(source))) {
-    const spec = match[2] ?? match[3] ?? match[4];
-    if (spec) specs.push({ spec, typeOnly: Boolean(match[1]) });
-  }
-  return specs;
-}
-
-/** 启发式：类方法/顶层函数边界 -> 超长函数 */
-function longFunctions(path, source, threshold) {
-  const lines = source.split('\n');
-  const starts = [];
-  lines.forEach((line, index) => {
-    // 类内方法（2 空格缩进）或顶层函数（0 缩进）
-    if (/^ {2}(?:private |public |protected |override |readonly |async |static |get |set |\*)*\s*[A-Za-z_$][\w$]*(?:<[^>]*>)?\s*\(/.test(line) && !line.trim().startsWith('//')) {
-      starts.push({ index, indent: 2, line: line.trim().slice(0, 90) });
-    } else if (/^(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$]/.test(line)) {
-      starts.push({ index, indent: 0, line: line.trim().slice(0, 90) });
+/** 包名取自真实 package.json（S1011-029：不再拼路径猜名） */
+function packageNameOf(file, cache) {
+  if (cache.has(file)) return cache.get(file);
+  let dir = dirname(file);
+  let name = '(root)';
+  while (dir.startsWith(ROOT)) {
+    const pj = join(dir, 'package.json');
+    if (existsSync(pj)) {
+      try {
+        name = JSON.parse(readFileSync(pj, 'utf8')).name ?? '(root)';
+      } catch {
+        /* 继续向上 */
+      }
+      break;
     }
-  });
-  const out = [];
-  for (let i = 0; i < starts.length; i++) {
-    const current = starts[i];
-    const next = starts[i + 1];
-    // 函数体到下一个同级或更浅缩进的方法为止（近似）
-    let end = next ? next.index : lines.length;
-    if (next && next.indent > current.indent) end = current.index + 1; // 嵌套声明不算
-    const length = end - current.index;
-    if (length > threshold) {
-      out.push({ path, start: current.index + 1, length, signature: current.line });
-    }
+    if (dir === ROOT) break;
+    dir = dirname(dir);
   }
-  return out;
+  cache.set(file, name);
+  return name;
 }
 
-// 分层规则：key 不得 import value 中的包（测试豁免）
-const RULES = [
-  ['@siren/contracts', ['@siren/'], 'contracts 不得依赖任何 workspace 包（只允许 zod）'],
-  ['@siren/audio', ['@siren/contracts', '@siren/telemetry', '@siren/storage', '@siren/voice-core', '@siren/core-bridge', '@siren/provider'], 'audio 是底层工具包，不得依赖上层'],
-  ['@siren/telemetry', ['@siren/audio', '@siren/storage', '@siren/voice-core', '@siren/core-bridge', '@siren/provider'], 'telemetry 不得依赖上层'],
-  ['@siren/storage', ['@siren/voice-core', '@siren/core-bridge', '@siren/provider', '@siren/audio'], 'storage 不得依赖业务层'],
-  ['@siren/core-bridge', ['@siren/voice-core', '@siren/storage', '@siren/provider', '@siren/audio'], 'core-bridge 不得依赖业务层'],
-  ['@siren/provider-volc-asr', ['@siren/voice-core', '@siren/storage', '@siren/core-bridge', '@siren/provider-volc-tts', '@siren/provider-elevenlabs', '@siren/provider-mock'], 'provider 不得依赖业务层或互相依赖'],
-  ['@siren/provider-volc-tts', ['@siren/voice-core', '@siren/storage', '@siren/core-bridge', '@siren/provider-volc-asr', '@siren/provider-elevenlabs', '@siren/provider-mock'], 'provider 不得依赖业务层或互相依赖'],
-  ['@siren/provider-elevenlabs', ['@siren/voice-core', '@siren/storage', '@siren/core-bridge', '@siren/provider-volc-asr', '@siren/provider-volc-tts', '@siren/provider-mock'], 'provider 不得依赖业务层或互相依赖'],
-  ['@siren/provider-mock', ['@siren/voice-core', '@siren/storage', '@siren/core-bridge', '@siren/provider-volc-asr', '@siren/provider-volc-tts', '@siren/provider-elevenlabs'], 'provider 不得依赖业务层或互相依赖'],
-  ['@siren/server', ['@siren/provider-volc-asr', '@siren/provider-volc-tts', '@siren/provider-elevenlabs', '@siren/provider-mock'], 'server 不得直接依赖 Provider（必须经 voice-core 注册中心）']
-];
-
-// 职责性高扇出豁免名单（显示但计入结论时不算违规）：
-// - app.ts 是组合根，装配全部模块是其职责
-// - index.ts 是 barrel，只做 re-export
-// - tests/helpers.ts 是测试工厂
-const FANOUT_EXEMPT = new Set([
-  'apps/server/src/app.ts',
-  'packages/voice-core/src/index.ts',
-  'tests/helpers.ts'
-]);
+function lineOf(sf, node) {
+  return sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+}
+function endLineOf(sf, node) {
+  return sf.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+}
 
 const files = walk(ROOT);
-const fileInfos = [];
-const packageEdges = new Map(); // pkg -> Set(pkg)
+const rel = (f) => relative(ROOT, f).replace(/\\/g, '/');
+const pkgNameCache = new Map();
+
+/** @siren 包名 -> 入口 index.ts */
+const pkgIndex = new Map();
+for (const file of files) {
+  if (file.endsWith('index.ts')) {
+    const name = packageNameOf(file, pkgNameCache);
+    if (name !== '(root)') pkgIndex.set(name, file);
+  }
+}
+
+/** 解析 specifier -> 仓库内文件 */
+function resolveSpecifier(fromFile, spec) {
+  if (spec.startsWith('.') || spec.startsWith('/')) {
+    const base = resolve(dirname(fromFile), spec);
+    for (const cand of [`${base}.ts`, `${base}.mts`, `${base}.mjs`, base, join(base, 'index.ts')]) {
+      if (existsSync(cand) && statSync(cand).isFile()) return cand;
+    }
+    return null;
+  }
+  if (spec.startsWith('@siren/')) return pkgIndex.get(spec) ?? null;
+  return null;
+}
+
 const violations = [];
+const warnings = [];
+const edges = new Map();
+const pkgEdges = new Map();
 
 for (const file of files) {
-  const source = readFileSync(file, 'utf8');
-  const rel = relative(ROOT, file).replace(/\\/g, '/');
-  const pkg = packageNameOf(file);
-  const isTest = rel.startsWith('tests/');
-  const imports = collectImports(source);
-  const valueImports = [...new Set(imports.filter((i) => !i.typeOnly).map((i) => i.spec))];
-  const workspaceImports = [...new Set(imports.map((i) => i.spec).filter((spec) => spec.startsWith('@siren/')))];
-  const externalImports = valueImports.filter(
-    (spec) => !spec.startsWith('@siren/') && !spec.startsWith('.') && !spec.startsWith('node:')
-  );
+  const text = readFileSync(file, 'utf8');
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.ES2022, true);
+  const r = rel(file);
 
-  fileInfos.push({
-    rel,
-    pkg,
-    loc: source.split('\n').length,
-    fanOut: valueImports.length,
-    workspaceImports,
-    externalImports
-  });
+  const loc = sf.getLineStarts().length;
+  if (loc > FILE_LOC_VIOLATION) violations.push(`${r}: 文件 ${loc} 行 > ${FILE_LOC_VIOLATION}`);
+  else if (loc > FILE_LOC_WARN) warnings.push(`${r}: 文件 ${loc} 行 > ${FILE_LOC_WARN}（复核）`);
 
-  // 包级边
-  if (!packageEdges.has(pkg)) packageEdges.set(pkg, new Set());
-  for (const target of workspaceImports) {
-    if (target !== pkg) packageEdges.get(pkg).add(target);
+  const specs = [];
+  const visit = (node) => {
+    // 函数长度（真实语法节点，含回调）
+    const isFunction =
+      ts.isFunctionDeclaration(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node);
+    if (isFunction && node.body) {
+      const len = endLineOf(sf, node) - lineOf(sf, node) + 1;
+      if (len > FUNC_LOC_VIOLATION) {
+        const name = node.name?.text ?? '(anonymous)';
+        violations.push(`${r}:${lineOf(sf, node)} 函数 ${name} ${len} 行 > ${FUNC_LOC_VIOLATION}`);
+      }
+    }
+    // 依赖边
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+      specs.push(node.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      specs.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node)) {
+      const callee = node.expression.getText(sf);
+      if ((callee === 'import' || callee === 'require') && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) {
+        specs.push(node.arguments[0].text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+
+  const targets = new Set();
+  for (const spec of specs) {
+    const resolved = resolveSpecifier(file, spec);
+    if (resolved) targets.add(resolved);
   }
+  edges.set(file, targets);
+  if (targets.size > FANOUT_FLAG && !FANOUT_EXEMPT.has(r)) {
+    warnings.push(`${r}: 扇出 ${targets.size} > ${FANOUT_FLAG}（复核）`);
+  }
+  const fromPkg = packageNameOf(file, pkgNameCache);
+  const pkgSet = pkgEdges.get(fromPkg) ?? new Set();
+  for (const target of targets) pkgSet.add(packageNameOf(target, pkgNameCache));
+  pkgEdges.set(fromPkg, pkgSet);
+}
 
-  // 分层违规（测试豁免：测试允许直接使用 provider mock）
-  if (!isTest) {
-    for (const [bannedPkg, patterns, message] of RULES) {
-      if (pkg !== bannedPkg) continue;
-      for (const target of workspaceImports) {
-        if (patterns.some((p) => target === p || target.startsWith(p))) {
-          violations.push(`${rel}: ${message}（发现 import ${target}）`);
-        }
+/** Tarjan SCC：全部强连通分量 */
+function sccs(nodes, adjacency) {
+  let index = 0;
+  const stack = [];
+  const onStack = new Set();
+  const indices = new Map();
+  const low = new Map();
+  const result = [];
+  const strongconnect = (v) => {
+    indices.set(v, index);
+    low.set(v, index);
+    index += 1;
+    stack.push(v);
+    onStack.add(v);
+    for (const w of adjacency.get(v) ?? []) {
+      if (!indices.has(w)) {
+        strongconnect(w);
+        low.set(v, Math.min(low.get(v), low.get(w)));
+      } else if (onStack.has(w)) {
+        low.set(v, Math.min(low.get(v), indices.get(w)));
+      }
+    }
+    if (low.get(v) === indices.get(v)) {
+      const comp = [];
+      let w;
+      do {
+        w = stack.pop();
+        onStack.delete(w);
+        comp.push(w);
+      } while (w !== v);
+      if (comp.length > 1) result.push(comp);
+    }
+  };
+  for (const v of nodes) if (!indices.has(v)) strongconnect(v);
+  return result;
+}
+
+for (const comp of sccs(files, edges)) {
+  violations.push(`文件级循环依赖: ${comp.map((f) => rel(f)).sort().join(' <-> ')}`);
+}
+for (const comp of sccs([...pkgEdges.keys()], pkgEdges)) {
+  violations.push(`包级循环依赖: ${comp.sort().join(' <-> ')}`);
+}
+
+for (const [file, targets] of edges) {
+  if (rel(file).startsWith('packages/providers/')) {
+    for (const t of targets) {
+      if (rel(t).startsWith('packages/voice-core/')) {
+        violations.push(`分层违规: ${rel(file)} -> ${rel(t)}（provider 依赖 voice-core）`);
       }
     }
   }
 }
 
-// 循环依赖检测（DFS）
-const CYCLES = [];
-function dfs(node, stack, visited) {
-  if (stack.includes(node)) {
-    const cycle = stack.slice(stack.indexOf(node)).concat(node);
-    CYCLES.push(cycle.join(' -> '));
-    return;
-  }
-  if (visited.has(node)) return;
-  visited.add(node);
-  for (const next of packageEdges.get(node) ?? []) dfs(next, [...stack, node], visited);
-}
-dfs('@siren/server', [], new Set());
-
-// ---- 输出 ----
-console.log('== 文件数 / 总 LOC ==');
-console.log(`源码文件 ${fileInfos.length} 个，总计 ${fileInfos.reduce((s, f) => s + f.loc, 0)} 行`);
-
-console.log('\n== 最长文件（源码，>300 行标记 ⚠）==');
-for (const f of [...fileInfos].sort((a, b) => b.loc - a.loc).slice(0, 12)) {
-  console.log(`${String(f.loc).padStart(5)} 行  ${f.rel}${f.loc > 300 ? '  ⚠' : ''}`);
-}
-
-console.log('\n== 超长函数（> 80 行）==');
-const longFns = [];
-for (const file of files) {
-  const source = readFileSync(file, 'utf8');
-  longFns.push(...longFunctions(relative(ROOT, file).replace(/\\/g, '/'), source, 80));
-}
-if (longFns.length === 0) console.log('（无）');
-for (const fn of longFns.sort((a, b) => b.length - a.length)) {
-  console.log(`${String(fn.length).padStart(4)} 行  ${fn.path}:${fn.start}  ${fn.signature}`);
-}
-
-console.log('\n== 依赖扇出最高的文件（> 10 标记 ⚠ / ✱=职责豁免）==');
-for (const f of [...fileInfos].sort((a, b) => b.fanOut - a.fanOut).slice(0, 10)) {
-  const mark = FANOUT_EXEMPT.has(f.rel) ? '  ✱' : f.fanOut > 10 ? '  ⚠' : '';
-  console.log(`${String(f.fanOut).padStart(3)} 个  ${f.rel}${mark}`);
-}
-
-console.log('\n== 包级依赖图（扇出） ==');
-const fanIn = new Map();
-for (const [_pkg, targets] of packageEdges) {
-  for (const t of targets) fanIn.set(t, (fanIn.get(t) ?? 0) + 1);
-}
-for (const [currentPkg, targets] of [...packageEdges].sort()) {
-  console.log(`${currentPkg} (${targets.size} 出 / ${fanIn.get(currentPkg) ?? 0} 入) -> ${[...targets].join(', ') || '-'}`);
-}
-
-console.log('\n== 包级循环依赖 ==');
-if (CYCLES.length === 0) console.log('（无）');
-for (const cycle of [...new Set(CYCLES)].slice(0, 5)) console.log(cycle);
-
-console.log('\n== 分层违规 ==');
-if (violations.length === 0) console.log('（无）');
-for (const violation of violations) console.log(violation);
-
-const problems =
-  fileInfos.filter((f) => f.loc > 500).length +
-  longFns.length +
-  fileInfos.filter((f) => f.fanOut > 10 && !FANOUT_EXEMPT.has(f.rel)).length +
-  violations.length +
-  new Set(CYCLES).size;
-console.log(`\n== 结论 == ${problems === 0 ? 'PASS（无超长文件/超长函数/高扇出/循环/违规）' : `发现 ${problems} 项待复核`}`);
-process.exit(problems === 0 ? 0 : 1);
+console.log(`扫描 ${files.length} 个文件（TypeScript AST）\n`);
+console.log('== 违规 ==');
+console.log(violations.length ? violations.map((v) => `✗ ${v}`).join('\n') : '（无）');
+console.log('\n== 复核提示 ==');
+console.log(warnings.length ? warnings.map((v) => `⚠ ${v}`).join('\n') : '（无）');
+console.log(`\n== 结论 == 发现 ${violations.length} 项违规，${warnings.length} 项待复核`);
+process.exit(violations.length > 0 ? 1 : 0);

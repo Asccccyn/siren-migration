@@ -38,8 +38,9 @@ class ScriptedCore implements CoreBridge {
 
 function failingTts(options: { batchHangs?: boolean } = {}): TtsProvider {
   return {
+    // eslint-disable-next-line require-yield -- 立即抛错的流式桩（模拟网络原生异常）
     synthesizeStream: async function* (): AsyncGenerator<{ audio: Buffer; sampleRate: number }> {
-      throw new Error('fetch network down'); // 原生异常（非 ProviderError）
+      throw new Error('fetch network down');
     },
     synthesize: () =>
       options.batchHangs

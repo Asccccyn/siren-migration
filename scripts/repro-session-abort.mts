@@ -1,8 +1,9 @@
 /**
- * 复现脚本（会话层）：真实火山 ASR + 可控 mock Core/TTS，重放通话故障序列。
- * 核心场景：turn1 正常完成（thinking→speaking→listening）→ turn2 进 thinking
- * → 3ms 内 abort+start turn3 → turn3 是否拿到转写。
- * 用法：pnpm exec tsx scripts/repro-session-abort.mts
+ * 复现脚本（会话层，1011 半双工基线版）：真实火山 ASR + 可控 mock Core/TTS。
+ * 场景：turn1 正常完成 → turn2 进 thinking → 3ms 内 abort+start turn3
+ * （半双工下 abort 只能由手动打断触发，此处直接注入消息模拟）→ turn3 是否拿到转写。
+ * 逐 turn 断言（S1011-019 整改：不再用整场累计计数下结论）。
+ * 用法：pnpm exec tsx scripts/repro-session-abort.mts（消耗少量真实 ASR 额度）
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -29,6 +30,12 @@ class ControllableCore implements CoreBridge {
     return new Promise((resolve) => {
       this.resolveReply = resolve;
     });
+  }
+  async *streamReply(): AsyncGenerator<{ text: string }> {
+    const text = await this.ask();
+    for (const seg of text.match(/[^。！？]+[。！？]?/g) ?? [text]) {
+      yield { text: seg };
+    }
   }
   release(text: string): void {
     this.resolveReply?.(text);
