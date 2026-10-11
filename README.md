@@ -1,9 +1,12 @@
-# Siren v1.1.1（Realtime Hardening · 审计修复轮）
+# Siren v1.1.1（Realtime Hardening + 1011 实测与半双工定案）
 
 > Siren 是耳朵和嘴巴，不是第二个大脑。
-> 独立语音能力层：ASR / TTS / 异步语音消息 / 实时通话 / MCP。
-> v1.1：实时通话链路强化（pre-roll 首音保护 / 本地 barge-in / 下行流标识 /
-> playback_drained / 共享 conversation / 火山 v3 双向流式协议 / 幂等与 fail-closed）。
+> 独立语音能力层：ASR / TTS / 异步语音消息 / 实时通话 / MCP（含 OAuth 2.1 接入）。
+> v1.1：实时通话链路强化（pre-roll 首音保护 / 下行流标识 / playback_drained /
+> 共享 conversation / 火山 v3 双向流式协议 / 幂等与 fail-closed）。
+> 1002~1011 实测轮：火山全链真实验证 + 复刻音色上线（seed-icl）、公网唯一入口
+> （playground 路径全删）、MCP OAuth（与静态 Bearer 同权共存）、iPhone 实测
+> 修复两故障、**纯半双工定案**（VAD 自动打断移除，打断仅手动）。
 
 ## 快速开始
 
@@ -17,7 +20,7 @@ pnpm install
 # 2) 配置（可选：无凭据时自动使用 Mock，开箱即用）
 copy .env.example .env   # Windows；Linux/macOS 用 cp
 
-# 3) 构建（server bundle + playground 页面）
+# 3) 构建（server bundle + web 唯一入口页）
 pnpm build
 
 # 4) 开发模式（热重载）
@@ -27,10 +30,10 @@ pnpm dev
 pnpm start
 ```
 
-打开 <http://127.0.0.1:8790/playground/> 即可测试异步语音（录音转写 / 文字合成）与实时通话。
+打开 <http://127.0.0.1:8790/> 即唯一入口（密码登录后页内三标签：语音信箱 / 实时通话 / 异步语音；公网即裸域名，无任何路径后缀）。
 
 - 健康检查：`GET http://127.0.0.1:8790/health`
-- MCP 端点：`POST http://127.0.0.1:8790/mcp`（Streamable HTTP，stateless JSON）
+- MCP 端点：`POST http://127.0.0.1:8790/mcp`（Streamable HTTP，stateless JSON；OAuth 或静态 Bearer 二选一）
 - 实时通话 WS：`POST /v1/calls` 换 token → `GET /ws/call/:callId?token=...`
 
 ## 常用命令
@@ -38,9 +41,9 @@ pnpm start
 | 命令 | 说明 |
 |---|---|
 | `pnpm dev` | tsx 热重载启动服务 |
-| `pnpm build` | 构建 server（esbuild bundle）与 playground 页面 |
+| `pnpm build` | 构建 server（esbuild bundle）与 web 客户端 |
 | `pnpm start` | 运行构建产物 `apps/server/dist/index.js` |
-| `pnpm test` | Vitest 全量测试（28 个文件 / 162 个用例，含协议/并发/背压/审计回归专项） |
+| `pnpm test` | Vitest 全量测试（38 个文件 / 253 个用例，含协议/并发/背压/审计/OAuth/半双工回归专项） |
 | `pnpm typecheck` | TypeScript 严格类型检查 |
 | `pnpm lint` | ESLint |
 | `pnpm fillers` | 预生成 filler 音频（`--mock` 用 Mock 音色） |
@@ -67,7 +70,8 @@ VOLC_VOICE_ID=你的音色ID                             # 也可配在 config/v
 - 实时合成 = v3 双向流式 `wss://openspeech.bytedance.com/api/v3/tts/bidirection`（文本流式输入、音频流式输出、连接复用多 session）。
 - 批量识别默认走大模型录音文件极速版 v3 flash（one-shot，`volc.bigasr.auc_turbo`，`VOLC_ASR_BATCH_RESOURCE_ID` 可覆盖）。
 - 端点可用 `VOLC_ASR_WS_URL` / `VOLC_ASR_BATCH_URL` / `VOLC_TTS_URL` / `VOLC_TTS_WS_URL` 覆盖；协议编解码集中在各 provider 的 `protocol.ts` / `bidirectional-protocol.ts` / `batch.ts`。
-- 音色配置的唯一来源是 `config/voices/main.json`（`voiceId` 留空回退环境变量），业务代码没有写死的 Voice ID。
+- 音色配置的唯一来源是 `data/voices/*.json`（gitignore，个人档案不入库；`voiceId` 留空回退环境变量），业务代码没有写死的 Voice ID。
+- 复刻音色必须配 `VOLC_TTS_RESOURCE_ID=seed-icl-*` 资源，与系统音色资源互斥（见 `docs/PROVIDERS.md`）；现行生产音色即复刻音色。
 - 真实验收（可选）：`VOLC_REAL_INTEGRATION=1` + 凭据运行 `tests/volc-real-integration.test.ts`。
 
 ## 配置 Cloudflare R2
@@ -109,14 +113,18 @@ POST {CORE_BASE_URL}/v1/chat/stream
 
 1. **发语音消息**：浏览器 MediaRecorder（WebM/Opus）→ `POST /v1/voice/transcribe`（multipart，`store=true` 可存为 user 资产）→ 拿 transcript 走 Core 文字链路。
 2. **收语音消息**：Agent 调 MCP `voice_speak`（或 REST）→ 返回 `audio_url`（签名 URL）+ `duration_ms` → 前端渲染语音气泡（transcript 折叠显示）。
-3. **实时通话**：`POST /v1/calls`（`conversation_id` 必填：电话与网页文字共享同一 conversation）→ 用返回的 `ws_url + token` 建 WebSocket；上行 PCM16/16k，下行 PCM16/24k（每 chunk 真实 rate 在 `pcm` 头中）；协议 v2 细节见 `docs/REALTIME_PROTOCOL.md`（pre-roll、本地 barge-in、stream_id/sequence、playback_drained、ready 协商、VAD 参数、jitter buffer）。
-4. 配置 `SIREN_INTERNAL_TOKEN` 后，`/v1/*`（除签名资源）与 `/mcp` 需要 `Authorization: Bearer <token>`。
+3. **实时通话**：`POST /v1/calls`（`conversation_id` 必填：电话与网页文字共享同一 conversation）→ 用返回的 `ws_url + token`（token 需自拼 `?token=`）建 WebSocket；上行 PCM16/16k，下行 PCM16/24k（每 chunk 真实 rate 在 `pcm` 头中）；协议 v2 细节见 `docs/REALTIME_PROTOCOL.md`（pre-roll、**半双工**、stream_id/sequence、playback_drained、ready 协商、VAD 参数、jitter buffer）。
+4. 鉴权双轨：`SIREN_INTERNAL_TOKEN` 静态 Bearer（机器直连，存量客户端）**或** MCP OAuth 2.1（发现端点 → DCR → 授权码 PKCE；人类授权页复用 `SIREN_WEB_PASSWORD`）。OAuth access token 与静态 token 同权，两者共存互不干扰（详见 `docs/MCP.md`）。
+5. 实时通话为**纯半双工**（对讲机模型）：AI 活跃（thinking/speaking）期间客户端不采信 VAD；打断仅 UI 手动（状态徽章点击）。
 
-## Playground
+## Web 唯一入口（apps/web）
 
-- **Async 页**：录音 → ASR → transcript；文字 + 情绪 + 语速 → TTS → 播放。
-- **Realtime 页**：Call / Mute / Hang up，VAD 自动断句或按住说话，partial 字幕、final transcript、assistant 文本、PCM 连续时间轴播放（350ms 抖动缓冲可调）、状态徽章、延迟指标表、事件日志。
-- 状态徽章可点击，在 thinking/speaking 时触发 barge-in。
+单页三标签（语音信箱 / 实时通话 / 异步语音），密码登录换 token 后使用：
+
+- **异步语音**：录音 → ASR → transcript；文字 + 情绪 + 语速 → TTS → 播放。
+- **实时通话**：Call / Mute / Hang up，VAD 自动断句或按住说话（PTT），partial 字幕、final transcript、assistant 文本、PCM 连续时间轴播放（350ms 抖动缓冲可调）、状态徽章、延迟指标表、事件日志。
+- 状态徽章可点击，在 thinking/speaking 时**手动打断**（半双工定案下唯一打断路径）。
+- 入口页与 `/assets/*` 均为 no-cache，资源引用带版本参数，杜绝手机浏览器旧缓存。
 
 ## 测试
 
@@ -140,14 +148,33 @@ TTS 事件流（连接复用/并发 session/abort/SessionFailed）、ElevenLabs 
 见 `docs/ARCHITECTURE.md`（模块职责、状态机、barge-in 语义、数据模型、安全模型）。
 其他文档：`docs/MCP.md`、`docs/REALTIME_PROTOCOL.md`、`docs/PROVIDERS.md`。
 
-## 已知限制（v1.1）
+## 已知限制与如实声明（1011 冻结，送审基线）
 
-- 火山 Provider 已按 2026-09 官方协议实现（v3 sauc bigmodel / v3 tts bidirection），
-  Mock 全绿但**未用真实火山凭据验证**——真实验收前只能视为
-  `implementation complete / real-provider verification pending`。
+- **半双工是规避不是修复（如实）**：① WebAudio 通道播放不经浏览器 AEC 参考信号，
+  外放回声会误触发 VAD；② 实测存在"打断后紧接轮次 100% 空转写"故障（四层复现 +
+  公网实弹均未复现，指向手机浏览器旧缓存，留待前端集成时验证）。移除 VAD 自动
+  打断后该交互不复存在，但上游根因未定案——审计需知悉。
+- 火山 Provider 已真实验证（识别/合成/双向流式/复刻音色 seed-icl，1002 起生产在用）。
 - Call token 为进程内存存储（单进程 v1 设计；多实例部署时换 Redis）。
+- OAuth 客户端注册表落盘 `data/oauth-clients.json`；授权码与吊销 denylist 为进程内
+  存储（重启失效=客户端需重新授权一次，刷新令牌不受影响）。
 - 实时 PCM 不落存储（只存 transcript 与指标），完整通话录音留给后续 Recording 模块。
 - Mock 的 MP3 以 WAV 容器承载（开发环境占位；生产必须配置真实 Provider）。
 - 重连恢复（Reconnect/Resume Lease）、后台 Agent 并行、speech-to-speech 模型接入
   （Qwen Realtime / OpenAI / Gemini）为 v1.5 方向；本轮只留了 `RealtimeVoiceProvider`
   边界与协议能力位，未实现。
+
+## 基线与批次索引
+
+README 永远是最新基线入口；每批一句话 + 提交号（她的基线维护规矩）。
+
+| 批次 | 提交 | 一句话 |
+|---|---|---|
+| 1011 半双工定案 | `fdd0b69` + `3179da9` | 移除 VAD 自动打断整条路径（纯半双工，打断仅手动），死代码清除，协议文档改写，资产 ?v=3，冻结送审 |
+| 1011 音色资源文档 | `2dc3044` | 复刻音色 seed-icl 资源匹配说明（另一批次，纯文档） |
+| 1002 排障加固 | `374dd9b` | 空宽限不再掩盖 ASR 失败 + asr_session_ready/asr_empty 观测日志 + 客户端 no-cache 防缓存 |
+| 1002 通话实测修复 | `7d03971` | iPhone 实测两故障：speaking 回声门控 + 空转写 notice 可见化 + prebuffer 建连限时 |
+| 1002 MCP OAuth | `1e0472d` | OAuth 2.1 全流程（发现/DCR/授权码 PKCE/refresh），与静态 token 同权共存，Claude 存量无需重连 |
+| 1002 唯一入口 | `c95dd5d` | /playground 全部旧路径与页面删除，apps/web + /assets，公网只剩裸域名 |
+| 0929~0930 | `92da0a2` | 全历史脱敏重写 + 语音档案移出 git（历史详见 git log） |
+| v1.0/v1.1 | `38ab16c` 起 | 语音能力层完整实现 + Realtime Hardening（历史详见 git log） |
