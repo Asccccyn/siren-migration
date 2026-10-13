@@ -7,6 +7,21 @@
 
 **能力口径**：本地逻辑、合成回声、假Provider及回环协议已验证；iPhone外放、真实供应商的后继轮识别和真实Core中断语义本批未执行。实现代码不等于已经达到GPT语音的设备体验。详见 [交接记录](docs/HANDOFF_1012.md)。
 
+## 当前基线与接手摘要
+
+2026-10-13 更新交接说明；本次仅维护文档，未重跑代码测试。
+
+| 项目 | 当前记录 |
+|---|---|
+| 已交付代码 | `7dff481` 已合入本地 `main`，主仓本地构建已完成 |
+| 上一份冻结记录 | `2849129`（1012 交接与协议文档）；本次文档提交见 `git log` |
+| 已做改动 | 可语音打断与轮次隔离、取消/连接清理、OAuth 状态可靠提交、字段加密及错误语义、日志脱敏、Provider 配置边界 |
+| 本地验证 | 2026-10-12 对上述代码：352 通过、2 跳过；typecheck / lint / build 通过 |
+| 仍未全绿 | AST 未检出循环/跨层违规，但 42 条长度超限、10 条提示，退出码 1 |
+| 部署与实机 | 本轮及上一实施轮未推送远端、未执行生产重启；现役版本未核实。iPhone 外放与真实 ASR / TTS / Core 验收未执行 |
+
+接手先读 [实施交接](docs/HANDOFF_1012.md) 与 [实时协议](docs/REALTIME_PROTOCOL.md)，核对客户端 `client=1012-interrupt` 和服务端 `ready.capabilities.voice_interrupt`。配置、备份及部署窗口确认后，再按交接中的顺序申请生产与实机验证；仓库已更新不等于现役进程已加载新代码。
+
 ## 快速开始
 
 Node >=20，pnpm >=9。先安装依赖，再复制模板；不要把配置模板中的空值当成可用登录配置。
@@ -15,6 +30,7 @@ Node >=20，pnpm >=9。先安装依赖，再复制模板；不要把配置模板
 pnpm install
 cp .env.example .env
 # 编辑 .env：填写自己的 SIREN_INTERNAL_TOKEN 与 SIREN_WEB_PASSWORD。
+# 本地启动还需改为 SIREN_PUBLIC_URL=http://127.0.0.1:8790；不要保留模板占位域名。
 # 本地开发可使用mock；生产还必须设置NODE_ENV=production、显式签名密钥、真实Provider与Core。
 pnpm build
 pnpm dev
@@ -37,7 +53,7 @@ pnpm dev
 | `pnpm build` | server bundle与web客户端 |
 | `pnpm typecheck` | TS严格检查，含保留的mts诊断脚本 |
 | `pnpm lint` | ESLint |
-| `VOLC_REAL_INTEGRATION=0 pnpm test` | 本地测试；真实供应商两例默认跳过，本批352通过/2跳过，总354例、54文件；实机例不计通过 |
+| `VOLC_REAL_INTEGRATION=0 pnpm test` | 本地测试；真实供应商两例默认跳过，2026-10-12记录为352通过/2跳过，总354例、54文件；实机例不计通过 |
 | `node scripts/audit-coupling.mjs` | AST依赖/循环/分层/长度；超长仍如实报错，不为绿灯改阈值 |
 | `pnpm fillers -- --mock` | 明确生成mock filler；真实生成另行批准 |
 | `node scripts/ws-smoke.mjs` | 会调用目标运行中服务；执行前确认批准与配额 |
@@ -95,6 +111,7 @@ README是当前基线入口。旧提交可由git log检索，不改写历史或�
 
 | 批次 | 提交 | 范围 |
 |---|---|---|
+| 1012 文档冻结 | `2849129` | 交接、协议和能力边界；代码已合入本地 main，未执行生产重启 |
 | 1012 根因修复与可语音打断 | `7dff481` | 关联轮次交接、真实取消/reader清理、候选首音、浏览器生命周期/回声参考、OAuth可靠提交、字段加密与错误语义、配置边界和本地回归；设备/生产未验收 |
 | 1011 第一轮返修 | `a6333e5..694ecee`（9 commits） | 复审基线；当时278通过/2跳过，但仍有未闭合与新增风险，不沿用“全清”结论 |
 | 1011 半双工规避 | `fdd0b69` + `3179da9` | 历史临时规避；本批按用户要求恢复可语音打断目标 |
