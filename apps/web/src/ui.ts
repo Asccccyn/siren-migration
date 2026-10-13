@@ -10,6 +10,7 @@ export const ui = {
   metricsBody: document.getElementById('metricsBody') as HTMLTableSectionElement,
   eventLog: document.getElementById('eventLog') as HTMLPreElement,
   noiseFloor: document.getElementById('noiseFloor') as HTMLSpanElement,
+  voiceModeStatus: document.getElementById('voiceModeStatus') as HTMLSpanElement,
   callBtn: document.getElementById('callBtn') as HTMLButtonElement,
   muteBtn: document.getElementById('muteBtn') as HTMLButtonElement,
   hangupBtn: document.getElementById('hangupBtn') as HTMLButtonElement,

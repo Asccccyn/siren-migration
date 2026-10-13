@@ -10,7 +10,7 @@
  * - 采样率全链路保留（P0-7）：rate 取每个 chunk 的真实值
  */
 import { randomUUID } from 'node:crypto';
-import type { CoreBridge } from '@siren/core-bridge';
+import type { CoreBridge, CoreInterruption } from '@siren/core-bridge';
 import type {
   PcmChunk,
   ServerWsMessage,
@@ -46,6 +46,8 @@ export function newOutputStreamId(): string {
 export interface ActiveTurn {
   index: number;
   turnId: string;
+  inputId: string;
+  interruptedTurn?: CoreInterruption;
   outputStreamId: string;
   /** 下行二进制帧序号（在每个 pcm 头中递增） */
   nextSequence: number;
@@ -65,8 +67,8 @@ export interface ActiveTurn {
   ttsAbort: AbortController;
   /** LLM 已输出的完整文本 */
   fullText: string;
-  /** 已真正完成下发音频的句子 */
-  playedText: string;
+  /** 完整下发的句子，不代表客户端已播放，更不代表用户已听。 */
+  sentText: string;
   pcmStarted: boolean;
   written: boolean;
 }
@@ -78,10 +80,10 @@ export type ReplyResult =
 
 /** 会话层提供给流水线的输出通道 */
 export interface ReplyPipelinePort {
-  sendJson(message: ServerWsMessage): void;
-  sendRaw(frame: Buffer): void;
+  sendJson(message: ServerWsMessage, turn: ActiveTurn): void;
+  sendRaw(frame: Buffer, turn: ActiveTurn): void;
   /** 第一帧音频即将下发（会话层完成 thinking -> speaking 迁移） */
-  onFirstAudio(): void;
+  onFirstAudio(turn: ActiveTurn): void;
 }
 
 export interface ReplyPipelineDeps {
@@ -146,7 +148,7 @@ export class ReplyPipeline {
         for await (const chunk of item.eager) {
           this.sendAudioChunk(turn, chunk);
         }
-        turn.playedText += item.sentence;
+        turn.sentText += item.sentence;
       }
       await producer;
     } catch (error) {
@@ -182,7 +184,8 @@ export class ReplyPipeline {
       callId: this.deps.callId,
       turnId: turn.turnId,
       text: turn.userText,
-      modality: 'voice_call' as const
+      modality: 'voice_call' as const,
+      ...(turn.interruptedTurn ? { interruptedTurn: turn.interruptedTurn } : {})
     };
     return (async function* () {
       for await (const delta of core.streamReply(input)) {
@@ -193,25 +196,6 @@ export class ReplyPipeline {
         yield delta.text;
       }
     })();
-  }
-
-  /** S1011-016：批量合成无取消契约——用 signal 赛跑，取消即放弃等待（结果作废，不重放） */
-  private static raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-    if (signal.aborted) return Promise.reject(new TurnAbortedError());
-    return new Promise<T>((resolve, reject) => {
-      const onAbort = () => reject(new TurnAbortedError());
-      signal.addEventListener('abort', onAbort, { once: true });
-      work.then(
-        (value) => {
-          signal.removeEventListener('abort', onAbort);
-          resolve(value);
-        },
-        (error) => {
-          signal.removeEventListener('abort', onAbort);
-          reject(error);
-        }
-      );
-    });
   }
 
   /** 单句合成：流式优先，失败回退批量 PCM（规范第 40 节降级链）。
@@ -260,8 +244,8 @@ export class ReplyPipeline {
     // 降级：Batch TTS（按 provider 返回的真实采样率）；仅零输出句子可整句重来。
     // S1011-016：批量合成同样受本轮取消约束；S1011-018：批量链路异常归属化为 tts_failed
     this.log.warn('tts_stream_fallback_batch', { turn_index: turn.index, sentence_len: sentence.length });
-    const result = await ReplyPipeline.raceAbort(this.deps.tts.synthesize(request), signal).catch((error: unknown) => {
-      if (error instanceof TurnAbortedError) throw error;
+    const result = await this.deps.tts.synthesize(request, signal).catch((error: unknown) => {
+      if (turn.aborted || signal.aborted || error instanceof TurnAbortedError) throw new TurnAbortedError();
       throw new ProviderError('tts_failed', 'reply-pipeline', `tts batch fallback failed: ${(error as Error).message}`, error);
     });
     turn.metrics.mark('tts_first_chunk');
@@ -291,7 +275,7 @@ export class ReplyPipeline {
     if (turn.aborted) throw new TurnAbortedError();
     const first = !turn.pcmStarted;
     turn.pcmStarted = true;
-    if (first) this.port.onFirstAudio();
+    if (first) this.port.onFirstAudio(turn);
     turn.metrics.mark('audio_play_request');
     this.port.sendJson({
       t: 'pcm',
@@ -299,7 +283,7 @@ export class ReplyPipeline {
       sequence: turn.nextSequence++,
       rate: chunk.sampleRate,
       bytes: chunk.audio.length
-    });
-    this.port.sendRaw(chunk.audio);
+    }, turn);
+    this.port.sendRaw(chunk.audio, turn);
   }
 }

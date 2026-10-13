@@ -14,6 +14,7 @@ import { contentTypeFor } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { errorFields } from '@siren/telemetry';
 import { ProviderError } from '@siren/contracts';
+import { FieldDecryptionError } from '@siren/storage';
 import { removeTmpFile, savePartStreamToTmp } from '../tmp-files.ts';
 
 const synthesizeBodySchema = z.object({
@@ -117,6 +118,7 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
         ...(output.asset ? { voice_message_id: output.asset.id } : {})
       });
     } catch (error) {
+      if (error instanceof FieldDecryptionError) throw error;
       if (error instanceof ProviderError && error.code === 'asr_failed') {
         await reply.code(502).send({ error: 'asr_failed', message: error.message });
         return;

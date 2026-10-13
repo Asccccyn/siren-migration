@@ -5,9 +5,11 @@ import {
   buildProviders,
   loadConfig,
   assertProductionReadiness,
-  packageBidirectionalPcmForBatch
+  packageBidirectionalPcmForBatch,
+  assertTtsProfileCompatible,
+  VoiceService
 } from '@siren/voice-core';
-import { silentLogger } from './helpers.ts';
+import { buildTestVoice, silentLogger, testConfig, testProfiles, TEST_PROFILE } from './helpers.ts';
 
 describe('Provider 注册与生产守卫（规范第 47 节）', () => {
   it('开发环境缺少火山凭据时回退 Mock 并给出警告', () => {
@@ -128,5 +130,45 @@ describe('Provider 注册与生产守卫（规范第 47 节）', () => {
     expect(requestedPcm.format).toBe('pcm');
     expect(requestedPcm.durationMs).toBe(1000);
     expect(requestedPcm.audio.equals(pcm)).toBe(true);
+  });
+});
+
+describe('Provider/配置近邻回归', () => {
+  it.each(['', ' ', '\t\n'])('生产拒绝空或空白R2 bucket %j，装配共享同一判定', (bucket) => {
+    const config = loadConfig({ NODE_ENV: 'production', SIREN_ALLOW_MOCK_IN_PRODUCTION: 'true',
+      SIREN_INTERNAL_TOKEN: 'synthetic', SIREN_SIGNING_SECRET: 'synthetic',
+      R2_ACCOUNT_ID: 'a', R2_ACCESS_KEY_ID: 'k', R2_SECRET_ACCESS_KEY: 's', R2_BUCKET: bucket });
+    expect(config.r2.bucket).toBe('');
+    expect(assertProductionReadiness(config).security.some((message) => message.includes('R2'))).toBe(true);
+    const bundle = buildProviders(config, silentLogger);
+    try { expect(bundle.active.storage).toBe('local'); } finally { bundle.dispose?.(); }
+  });
+
+  it('R2配置统一去除边缘空格，正常值仍使用R2（不进行请求）', () => {
+    const config = loadConfig({ R2_ACCOUNT_ID: ' a ', R2_ACCESS_KEY_ID: ' k ', R2_SECRET_ACCESS_KEY: ' s ', R2_BUCKET: ' example-bucket ' });
+    expect(config.r2).toEqual({ accountId: 'a', accessKeyId: 'k', secretAccessKey: 's', bucket: 'example-bucket' });
+    const bundle = buildProviders(config, silentLogger);
+    try { expect(bundle.active.storage).toBe('r2:example-bucket'); } finally { bundle.dispose?.(); }
+  });
+
+  it('voice profile按本次TTS供应商匹配，支持bidi别名和mock占位', () => {
+    expect(() => assertTtsProfileCompatible(TEST_PROFILE, 'volc(seed-2.0-bidi)')).not.toThrow();
+    expect(() => assertTtsProfileCompatible(TEST_PROFILE, 'mock(dev-fallback)')).not.toThrow();
+    expect(() => assertTtsProfileCompatible(TEST_PROFILE, 'elevenlabs')).toThrow(/incompatible/);
+    expect(() => assertTtsProfileCompatible({ ...TEST_PROFILE, provider: 'mock' }, 'volc')).toThrow(/incompatible/);
+  });
+
+  it('ASR/实时选择volc也不能使异步ElevenLabs接受volc音色；合成前拒绝', async () => {
+    const base = buildTestVoice();
+    const voice = new VoiceService({ config: testConfig(), logger: silentLogger, asr: base.asr,
+      asyncTts: base.tts, core: base.core, store: base.store, assetsRepo: base.assetsRepo,
+      sessionsRepo: base.sessionsRepo, turnsRepo: base.turnsRepo, profiles: testProfiles(),
+      asrName: 'volc', asyncTtsName: 'elevenlabs' });
+    try {
+      await expect(voice.speak({ text: '不该合成', messageId: 'wrong-vendor' })).rejects.toThrow(/incompatible/);
+      await expect(voice.synthesizeAudio({ text: '不该合成' })).rejects.toThrow(/incompatible/);
+      expect(base.tts.calls.batchCount).toBe(0);
+      expect(base.assetsRepo.list({}).length).toBe(0);
+    } finally { base.db.close(); }
   });
 });

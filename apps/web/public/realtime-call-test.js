@@ -12,15 +12,31 @@
       this.getParams = getParams;
       this.now = now;
       __publicField(this, "noiseFloor", INITIAL_NOISE_FLOOR);
-      __publicField(this, "speechStartAt", 0);
+      __publicField(this, "speechStartAt", null);
       __publicField(this, "utteranceStartAt", 0);
       __publicField(this, "lastVoiceAt", 0);
       __publicField(this, "inSpeech", false);
       __publicField(this, "lastRms", 0);
       __publicField(this, "lastNoiseUpdateAt", 0);
+      __publicField(this, "candidateParams", null);
     }
     get threshold() {
-      return this.noiseFloor * this.getParams().rmsRatio;
+      return Math.max(3e-3, this.noiseFloor * this.params().rmsRatio);
+    }
+    /** Candidate settings freeze until end; reserve a trigger block as well. */
+    get requiredPreRollSamples() {
+      return Math.ceil(Math.max(400, this.params().confirmMs + 80) * 16e3 / 1e3);
+    }
+    params() {
+      if (this.candidateParams) return this.candidateParams;
+      const raw = this.getParams();
+      const bounded = (n, fallback, max) => Number.isFinite(n) ? Math.min(max, Math.max(0, n)) : fallback;
+      return {
+        confirmMs: bounded(raw.confirmMs, 200, 2e3),
+        minSpeechMs: bounded(raw.minSpeechMs, 400, 1e4),
+        endSilenceMs: bounded(raw.endSilenceMs, 700, 5e3),
+        rmsRatio: Math.max(1, bounded(raw.rmsRatio, 4, 20))
+      };
     }
     get noiseFloorValue() {
       return this.noiseFloor;
@@ -33,21 +49,24 @@
       for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
       const rmsValue = Math.sqrt(sum / samples.length);
       this.lastRms = rmsValue;
-      const params = this.getParams();
-      const threshold = this.noiseFloor * params.rmsRatio;
+      const params = this.params();
+      const threshold = Math.max(3e-3, this.noiseFloor * params.rmsRatio);
       const now = this.now();
       if (!this.inSpeech) {
         if (rmsValue > threshold) {
-          if (this.speechStartAt === 0) this.speechStartAt = now;
-          const startGateMs = Math.max(params.confirmMs, params.minSpeechMs);
-          if (now - this.speechStartAt >= startGateMs) {
+          if (this.speechStartAt === null) {
+            this.speechStartAt = now;
+            this.candidateParams = params;
+          }
+          if (now - this.speechStartAt >= params.confirmMs) {
             this.inSpeech = true;
             this.utteranceStartAt = this.speechStartAt;
             this.lastVoiceAt = now;
             return { event: "start" };
           }
         } else {
-          this.speechStartAt = 0;
+          this.speechStartAt = null;
+          this.candidateParams = null;
           const dt = this.lastNoiseUpdateAt === 0 ? 0 : Math.max(0, now - this.lastNoiseUpdateAt);
           this.lastNoiseUpdateAt = now;
           const alpha = dt > 0 ? 1 - Math.exp(-dt / NOISE_TAU_MS) : 0;
@@ -62,27 +81,30 @@
       const spokenMs = this.lastVoiceAt - this.utteranceStartAt;
       if (silenceMs >= params.endSilenceMs) {
         this.inSpeech = false;
-        this.speechStartAt = 0;
-        return { event: "end", spokenMs };
+        this.speechStartAt = null;
+        this.candidateParams = null;
+        return { event: "end", spokenMs, valid: spokenMs >= params.minSpeechMs };
       }
       return { event: "none" };
     }
     reset() {
       this.noiseFloor = INITIAL_NOISE_FLOOR;
-      this.speechStartAt = 0;
+      this.speechStartAt = null;
       this.utteranceStartAt = 0;
       this.lastVoiceAt = 0;
       this.inSpeech = false;
       this.lastNoiseUpdateAt = 0;
+      this.candidateParams = null;
     }
   };
 
   // src/pcm-player.ts
   var JitteredPcmPlayer = class {
-    constructor(ctx, getJitterMs, onStreamIdle) {
+    constructor(ctx, getJitterMs, onStreamIdle, output = ctx.destination) {
       this.ctx = ctx;
       this.getJitterMs = getJitterMs;
       this.onStreamIdle = onStreamIdle;
+      this.output = output;
       __publicField(this, "nextAt", 0);
       __publicField(this, "streams", /* @__PURE__ */ new Map());
       __publicField(this, "order", []);
@@ -101,16 +123,21 @@
       }
       const source = this.ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(this.ctx.destination);
+      source.connect(this.output);
       const now = this.ctx.currentTime;
       if (this.nextAt < now) {
         this.nextAt = now + this.getJitterMs() / 1e3;
       }
+      const span = { start: this.nextAt, duration: audioBuffer.duration };
+      state.spans.push(span);
       source.start(this.nextAt);
       this.nextAt += audioBuffer.duration;
       state.sources.add(source);
       source.onended = () => {
         state.sources.delete(source);
+        state.completedSeconds += Math.max(0, Math.min(span.duration, (state.stoppedAt ?? this.ctx.currentTime) - span.start));
+        const index = state.spans.indexOf(span);
+        if (index >= 0) state.spans.splice(index, 1);
         this.maybeIdle(streamId, state);
       };
     }
@@ -131,6 +158,7 @@
       for (const id of targets) {
         const state = this.streams.get(id);
         if (!state) continue;
+        state.stoppedAt ?? (state.stoppedAt = this.ctx.currentTime);
         state.cancelled = true;
         state.ended = false;
         this.stopSources(state);
@@ -146,10 +174,16 @@
       for (const state of this.streams.values()) total += state.sources.size;
       return total;
     }
+    /** Client-observed rendered duration only; never derive a text prefix from it. */
+    playedMs(streamId) {
+      const state = this.streams.get(streamId);
+      if (!state) return 0;
+      return state.spans.reduce((sum, span) => sum + Math.max(0, Math.min(span.duration, (state.stoppedAt ?? this.ctx.currentTime) - span.start)), state.completedSeconds) * 1e3;
+    }
     stateOf(streamId) {
       let state = this.streams.get(streamId);
       if (!state) {
-        state = { sources: /* @__PURE__ */ new Set(), ended: false, cancelled: false, drainedNotified: false };
+        state = { sources: /* @__PURE__ */ new Set(), ended: false, cancelled: false, drainedNotified: false, spans: [], completedSeconds: 0 };
         this.streams.set(streamId, state);
         this.order.push(streamId);
         if (this.order.length > 8) {
@@ -194,6 +228,14 @@
     }
     get activeStream() {
       return this.activeStreamId;
+    }
+    /** Local interrupt must tombstone the current output before stopping playback. */
+    invalidateActive() {
+      this.cancelStream(this.activeStreamId ?? void 0);
+      this.pendingHeader = null;
+    }
+    discardPendingBinary() {
+      this.pendingHeader = null;
     }
     /** 服务端文本帧中与下行流相关的部分；返回是否被本路由消费 */
     handleJson(message) {
@@ -356,22 +398,26 @@
       if (this.sending) {
         this.sending = false;
         this.flushFramerTail();
-        this.deps.sendJson({ t: "end" });
+        this.finishInput(true);
         this.deps.log?.("\u5207\u6362\u6A21\u5F0F\uFF0C\u7ED3\u675F\u5F53\u524D utterance -> end");
       }
       this.mode = mode;
       this.suppressedByAi = false;
+      this.vadSpeech = false;
+      this.deps.vad.reset();
       this.deps.preRoll.clear();
     }
     setMuted(muted2) {
       this.muted = muted2;
       if (muted2) {
         this.suppressedByAi = false;
+        this.vadSpeech = false;
+        this.deps.vad.reset();
         this.deps.preRoll.clear();
         if (this.sending) {
           this.sending = false;
           this.flushFramerTail();
-          this.deps.sendJson({ t: "end" });
+          this.finishInput(true);
         }
       }
     }
@@ -389,16 +435,17 @@
       }
     }
     /** 16kHz Float32 采样块入口（已重采样） */
-    handleSamples(samples) {
+    handleSamples(samples, detectionSamples = samples) {
       if (this.muted || samples.length === 0) return;
       if (this.mode === "ptt") {
         if (this.sending) this.sendFrames(samples);
         return;
       }
       if (!this.sending) {
+        this.deps.preRoll.ensureCapacity(this.deps.vad.requiredPreRollSamples + samples.length);
         this.deps.preRoll.push(samples);
       }
-      const outcome = this.deps.vad.process(samples);
+      const outcome = this.deps.vad.process(detectionSamples);
       if (outcome.event === "start") {
         this.vadSpeech = true;
       } else if (outcome.event === "end") {
@@ -416,17 +463,18 @@
     }
     // --- PTT 入口 ---
     startPtt() {
-      if (this.sending) return;
+      if (this.sending || this.muted || this.mode !== "ptt") return;
+      if (this.deps.isAiActive() && !this.deps.canInterrupt?.()) return;
       this.sending = true;
       this.deps.preRoll.clear();
-      this.deps.sendJson({ t: "start" });
+      this.startInput();
       this.deps.log?.("PTT: start");
     }
     endPtt() {
       if (!this.sending) return;
       this.sending = false;
       this.flushFramerTail();
-      this.deps.sendJson({ t: "end" });
+      this.finishInput(true);
       this.deps.log?.("PTT: end");
     }
     /** teardown 时复位 */
@@ -436,9 +484,10 @@
       this.vadSpeech = false;
       this.deps.preRoll.clear();
       this.deps.framer.reset();
+      this.deps.vad.reset();
     }
     handleVadStart() {
-      if (this.deps.isAiActive()) {
+      if (this.deps.isAiActive() && !this.deps.canInterrupt?.()) {
         this.suppressedByAi = true;
         this.deps.log?.("AI \u6D3B\u8DC3\uFF08\u534A\u53CC\u5DE5\uFF09\uFF1A\u5FFD\u7565\u672C\u6B21 VAD start\uFF0C\u53E5\u9996\u7559\u5728 pre-roll");
         return false;
@@ -450,7 +499,7 @@
     /** 开始一次上行 utterance：start + flush pre-roll（句首保护） */
     beginSending() {
       this.sending = true;
-      this.deps.sendJson({ t: "start" });
+      this.startInput();
       this.deps.log?.(`VAD: \u8BF4\u8BDD\u5F00\u59CB -> start\uFF08pre-roll ${Math.round(this.deps.preRoll.bufferedMs)}ms\uFF09`);
       this.sendFrames(this.deps.preRoll.drain());
     }
@@ -459,8 +508,16 @@
       if (!this.sending) return;
       this.sending = false;
       this.flushFramerTail();
-      this.deps.sendJson({ t: "end" });
+      this.finishInput(outcome.valid);
       this.deps.log?.(`VAD: \u9759\u97F3\u65AD\u53E5 -> end\uFF08spoken ${Math.round(outcome.spokenMs)}ms\uFF09`);
+    }
+    startInput() {
+      if (this.deps.startInput) this.deps.startInput();
+      else this.deps.sendJson({ t: "start" });
+    }
+    finishInput(valid) {
+      if (this.deps.finishInput) this.deps.finishInput(valid);
+      else this.deps.sendJson({ t: valid ? "end" : "abort" });
     }
     sendFrames(samples) {
       if (samples.length === 0) return;
@@ -489,6 +546,15 @@
     }
     get capacity() {
       return this.ring.length;
+    }
+    /** Grow before accepting a candidate block; preserve samples already retained. */
+    ensureCapacity(capacitySamples) {
+      const capacity = Math.ceil(capacitySamples);
+      if (!Number.isFinite(capacity) || capacity <= this.ring.length) return;
+      if (capacity > 16e3 * 3) throw new Error("pre-roll window exceeds 3 seconds");
+      const kept = this.drain();
+      this.ring = new Float32Array(capacity);
+      this.push(kept);
     }
     /** 已缓冲样本数 */
     get length() {
@@ -740,6 +806,7 @@
     metricsBody: document.getElementById("metricsBody"),
     eventLog: document.getElementById("eventLog"),
     noiseFloor: document.getElementById("noiseFloor"),
+    voiceModeStatus: document.getElementById("voiceModeStatus"),
     callBtn: document.getElementById("callBtn"),
     muteBtn: document.getElementById("muteBtn"),
     hangupBtn: document.getElementById("hangupBtn"),
@@ -777,55 +844,290 @@ ${ui.eventLog.textContent ?? ""}`.split("\n").slice(0, 200).join("\n");
   // src/capture-worklet.ts
   var WORKLET_CODE = `
 class SirenCaptureProcessor extends AudioWorkletProcessor {
-  process(inputs) {
+  process(inputs, outputs) {
     const input = inputs[0];
     if (input && input[0]) {
-      this.port.postMessage(new Float32Array(input[0]));
+      const microphone = new Float32Array(input[0]);
+      const reference = new Float32Array(inputs[1]?.[0] ?? microphone.length);
+      this.port.postMessage({ microphone, reference }, [microphone.buffer, reference.buffer]);
     }
+    for (const channel of outputs[0] ?? []) channel.fill(0);
     return true;
   }
 }
 registerProcessor('siren-capture', SirenCaptureProcessor);
 `;
-  async function setupCapture(onSamples) {
+  async function setupCapture(onSamples, preparedContext) {
     const mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
-    let context = null;
+    let context = preparedContext ?? null;
     let worklet = null;
+    let playbackInput = null;
     try {
-      context = new AudioContext();
+      context ?? (context = new AudioContext());
       const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
       await context.audioWorklet.addModule(blobUrl);
       URL.revokeObjectURL(blobUrl);
-      worklet = new AudioWorkletNode(context, "siren-capture");
+      worklet = new AudioWorkletNode(context, "siren-capture", { numberOfInputs: 2, outputChannelCount: [1] });
       worklet.port.onmessage = (event) => {
-        onSamples(event.data);
+        onSamples(event.data.microphone, event.data.reference);
       };
+      playbackInput = context.createGain();
+      playbackInput.connect(context.destination);
+      playbackInput.connect(worklet, 0, 1);
+      worklet.connect(context.destination);
       context.createMediaStreamSource(mediaStream).connect(worklet);
     } catch (error) {
       worklet?.disconnect();
+      playbackInput?.disconnect();
       await context?.close().catch(() => void 0);
       mediaStream.getTracks().forEach((track) => track.stop());
       throw error;
     }
     const boundContext = context;
     const boundWorklet = worklet;
+    const boundPlayback = playbackInput;
     let disposed = false;
     return {
       context: boundContext,
       worklet: boundWorklet,
       sampleRate: boundContext.sampleRate,
+      playbackInput: boundPlayback,
+      echoCancellation: mediaStream.getAudioTracks()[0]?.getSettings().echoCancellation,
       dispose: async () => {
         if (disposed) return;
         disposed = true;
         boundWorklet.port.onmessage = null;
         boundWorklet.disconnect();
+        boundPlayback.disconnect();
         mediaStream.getTracks().forEach((track) => track.stop());
         await boundContext.close().catch(() => void 0);
       }
     };
   }
+
+  // src/voice-turn-coordinator.ts
+  var VoiceTurnCoordinator = class {
+    constructor(deps) {
+      this.deps = deps;
+      __publicField(this, "sequence", 0);
+      __publicField(this, "current", null);
+      __publicField(this, "outputAllowed", false);
+      __publicField(this, "acknowledged", false);
+      __publicField(this, "pending", []);
+      __publicField(this, "pendingBytes", 0);
+      __publicField(this, "pendingEnd", false);
+      __publicField(this, "timer");
+      __publicField(this, "negotiated", null);
+      __publicField(this, "prefix");
+      this.prefix = deps.idPrefix ?? `in_${Math.random().toString(36).slice(2, 12)}`;
+    }
+    get supported() {
+      return this.negotiated === true;
+    }
+    get inputId() {
+      return this.current;
+    }
+    negotiate(supported) {
+      if (this.negotiated !== true) this.negotiated = supported;
+    }
+    begin() {
+      if (this.negotiated === null) {
+        this.deps.onFailure("capability_not_ready");
+        return;
+      }
+      if (!this.negotiated) {
+        this.deps.sendJson({ t: "start" });
+        return;
+      }
+      const previous = this.current;
+      const next = `${this.prefix}_${++this.sequence}`;
+      this.clearPending();
+      this.current = next;
+      this.outputAllowed = true;
+      this.acknowledged = false;
+      const playback = this.deps.invalidateOutput();
+      this.timer = setTimeout(() => this.fail("input_ack_timeout"), this.deps.ackTimeoutMs ?? 5e3);
+      this.deps.sendJson(previous ? { t: "interrupt", target_input_id: previous, new_input_id: next, ...playback ? { playback } : {} } : { t: "start", input_id: next });
+    }
+    sendFrame(frame) {
+      if (this.negotiated === null) return;
+      if (!this.negotiated) {
+        this.deps.sendFrame(frame);
+        return;
+      }
+      if (!this.current || !this.outputAllowed || this.pendingEnd) return;
+      if (this.acknowledged) {
+        this.deps.sendFrame(frame);
+        return;
+      }
+      if (this.pendingBytes + frame.byteLength > (this.deps.maxPendingBytes ?? 256 * 1024)) {
+        this.fail("input_buffer_overflow");
+        return;
+      }
+      this.pending.push(frame.slice(0));
+      this.pendingBytes += frame.byteLength;
+    }
+    finish(valid = true) {
+      if (this.negotiated === null) return;
+      if (!valid) {
+        this.abort();
+        return;
+      }
+      if (!this.negotiated) {
+        this.deps.sendJson({ t: "end" });
+        return;
+      }
+      if (!this.current || !this.outputAllowed) return;
+      if (this.pendingEnd) return;
+      this.pendingEnd = true;
+      if (this.acknowledged) this.deps.sendJson({ t: "end", input_id: this.current });
+    }
+    abort() {
+      this.outputAllowed = false;
+      const playback = this.deps.invalidateOutput();
+      this.clearPending();
+      if (this.negotiated === null) return;
+      if (!this.negotiated) {
+        this.deps.sendJson({ t: "abort" });
+        return;
+      }
+      if (this.current) this.deps.sendJson({ t: "abort", input_id: this.current, ...playback ? { playback } : {} });
+    }
+    /** Filter every turn frame, not just PCM: old final/state cannot overwrite new input. */
+    accept(message) {
+      if (!this.negotiated || message.t === "ready" || message.t === "pong") return true;
+      const id = typeof message.input_id === "string" ? message.input_id : null;
+      if (message.t === "input_started") {
+        if (id !== this.current || !this.outputAllowed || this.acknowledged) return false;
+        clearTimeout(this.timer);
+        this.timer = void 0;
+        this.acknowledged = true;
+        const pending = this.pending;
+        this.pending = [];
+        this.pendingBytes = 0;
+        for (const frame of pending) this.deps.sendFrame(frame);
+        if (this.pendingEnd) this.deps.sendJson({ t: "end", input_id: id });
+        return true;
+      }
+      if (id !== this.current) {
+        return !id && message.t === "error";
+      }
+      if (message.t === "error" && !this.acknowledged && this.outputAllowed) {
+        this.fail(String(message.code ?? "input_rejected"));
+        return true;
+      }
+      if (!this.outputAllowed) {
+        return message.t === "interrupted" || message.t === "metrics" || message.t === "notice" || message.t === "error" || message.t === "state" && message.state === "listening";
+      }
+      return true;
+    }
+    reset() {
+      this.clearPending();
+      this.current = null;
+      this.outputAllowed = false;
+      this.negotiated = null;
+    }
+    fail(reason) {
+      this.abort();
+      this.deps.onFailure(reason);
+    }
+    clearPending() {
+      clearTimeout(this.timer);
+      this.timer = void 0;
+      this.pending = [];
+      this.pendingBytes = 0;
+      this.pendingEnd = false;
+      this.acknowledged = false;
+    }
+  };
+
+  // src/playback-echo-guard.ts
+  var PlaybackEchoGuard = class {
+    constructor() {
+      __publicField(this, "reference", new Float32Array(2048));
+      // 512ms at 4kHz
+      __publicField(this, "microphone", new Float32Array(128));
+      // 32ms matching window
+      __publicField(this, "fullReference", new Float32Array(8192));
+      __publicField(this, "fullHead", 0);
+      __publicField(this, "match", null);
+      __publicField(this, "refHead", 0);
+      __publicField(this, "micHead", 0);
+      __publicField(this, "refCount", 0);
+      __publicField(this, "micCount", 0);
+      __publicField(this, "phase", 0);
+      __publicField(this, "echo", false);
+      __publicField(this, "analysisSamples", 0);
+    }
+    get suppressingEcho() {
+      return this.echo;
+    }
+    /** Both inputs are synchronous 16kHz samples from the same AudioContext. */
+    process(mic, rendered) {
+      for (let i = 0; i < mic.length; i++) {
+        this.fullReference[this.fullHead] = rendered[i] ?? 0;
+        this.fullHead = (this.fullHead + 1) % this.fullReference.length;
+        if (this.phase++ % 4 !== 0) continue;
+        this.reference[this.refHead] = rendered[i] ?? 0;
+        this.refHead = (this.refHead + 1) % this.reference.length;
+        this.refCount = Math.min(this.refCount + 1, this.reference.length);
+        this.microphone[this.micHead] = mic[i];
+        this.micHead = (this.micHead + 1) % this.microphone.length;
+        this.micCount = Math.min(this.micCount + 1, this.microphone.length);
+      }
+      this.analysisSamples += mic.length;
+      if (this.analysisSamples >= 320) {
+        this.analysisSamples %= 320;
+        this.match = this.estimateEcho();
+        this.echo = this.match !== null;
+      }
+      if (!this.match) return mic;
+      const { lag, gain } = this.match;
+      return Float32Array.from(mic, (sample, i) => {
+        const index = (this.fullHead - mic.length + i - lag * 4 + this.fullReference.length * 2) % this.fullReference.length;
+        const residual = sample - gain * this.fullReference[index];
+        return Math.abs(residual) < 1e-6 ? 0 : residual;
+      });
+    }
+    reset() {
+      this.reference.fill(0);
+      this.microphone.fill(0);
+      this.fullReference.fill(0);
+      this.fullHead = 0;
+      this.match = null;
+      this.refHead = this.micHead = this.refCount = this.micCount = this.phase = 0;
+      this.echo = false;
+      this.analysisSamples = 0;
+    }
+    estimateEcho() {
+      const n = this.microphone.length;
+      if (this.micCount < n || this.refCount < n) return null;
+      let micEnergy = 0;
+      for (let i = 0; i < n; i++) micEnergy += this.microphone[i] ** 2;
+      if (micEnergy < 1e-7) return null;
+      let bestScore = 0.9;
+      let best = null;
+      const maxLag = Math.min(1400, this.refCount - n);
+      for (let lag = 0; lag <= maxLag; lag += 2) {
+        let cross = 0;
+        let refEnergy = 0;
+        for (let i = 0; i < n; i++) {
+          const r = this.reference[(this.refHead - n - lag + i + this.reference.length) % this.reference.length];
+          const m = this.microphone[(this.micHead + i) % n];
+          cross += r * m;
+          refEnergy += r * r;
+        }
+        const score = refEnergy > 1e-6 ? cross * cross / (micEnergy * refEnergy) : 0;
+        if (score > bestScore && Math.abs(cross / refEnergy) <= 8) {
+          bestScore = score;
+          best = { lag, gain: cross / refEnergy };
+        }
+      }
+      return best;
+    }
+  };
 
   // src/RealtimeCallTest.ts
   requireToken();
@@ -837,24 +1139,36 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   }
   var ws = null;
   var capture = null;
+  var pendingAudioContext = null;
+  var captureRequested = false;
+  var readyTimer;
+  var callRequest = null;
   var player = null;
   var router = null;
   var uplink = null;
   var resampler = null;
+  var referenceResampler = null;
+  var turns = null;
+  var echoGuard = new PlaybackEchoGuard();
   var captureGeneration = 0;
   var serverState = "idle";
   var serverProtocol = 0;
   var muted = false;
   var serverVadDefaults = null;
   var serverJitterMs = null;
+  function setting(value, fallback) {
+    if (value === void 0 || value === null || String(value).trim() === "") return fallback;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
   function applyServerTuning(message) {
     const vad = message.vad;
     if (vad) {
       serverVadDefaults = {
-        confirmMs: Number(vad.confirm_ms) || 200,
-        minSpeechMs: Number(vad.min_speech_ms) || 400,
-        endSilenceMs: Number(vad.end_silence_ms) || 700,
-        rmsRatio: Number(vad.rms_ratio) || 4
+        confirmMs: setting(vad.confirm_ms, 200),
+        minSpeechMs: setting(vad.min_speech_ms, 400),
+        endSilenceMs: setting(vad.end_silence_ms, 700),
+        rmsRatio: setting(vad.rms_ratio, 4)
       };
       if (!ui.vConfirm.dataset.touched) ui.vConfirm.value = String(serverVadDefaults.confirmMs);
       if (!ui.vMin.dataset.touched) ui.vMin.value = String(serverVadDefaults.minSpeechMs);
@@ -869,14 +1183,14 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   function vadParams() {
     const base = serverVadDefaults ?? { confirmMs: 200, minSpeechMs: 400, endSilenceMs: 700, rmsRatio: 4 };
     return {
-      confirmMs: Number(ui.vConfirm.value) || base.confirmMs,
-      minSpeechMs: Number(ui.vMin.value) || base.minSpeechMs,
-      endSilenceMs: Number(ui.vEnd.value) || base.endSilenceMs,
-      rmsRatio: Number(ui.vRatio.value) || base.rmsRatio
+      confirmMs: setting(ui.vConfirm.value, base.confirmMs),
+      minSpeechMs: setting(ui.vMin.value, base.minSpeechMs),
+      endSilenceMs: setting(ui.vEnd.value, base.endSilenceMs),
+      rmsRatio: setting(ui.vRatio.value, base.rmsRatio)
     };
   }
   function jitterBufferMs() {
-    return Number(ui.vJitter.value) || serverJitterMs || 350;
+    return Math.min(2e3, Math.max(0, setting(ui.vJitter.value, serverJitterMs ?? 350)));
   }
   for (const input of [ui.vConfirm, ui.vMin, ui.vEnd, ui.vRatio, ui.vJitter]) {
     input.addEventListener("input", () => {
@@ -901,11 +1215,23 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     return generated;
   }
   ui.callBtn.addEventListener("click", async () => {
+    const generation = ++captureGeneration;
     ui.callBtn.disabled = true;
+    ui.hangupBtn.disabled = false;
+    const request = new AbortController();
+    callRequest = request;
     setBadge("connecting");
     try {
+      pendingAudioContext = new AudioContext();
+      const context = pendingAudioContext;
+      await context.resume();
+      if (generation !== captureGeneration) {
+        void context.close().catch(() => void 0);
+        return;
+      }
       const response = await fetch("/v1/calls", {
         method: "POST",
+        signal: request.signal,
         headers: { "content-type": "application/json", ...authHeaders() },
         body: JSON.stringify({
           // 电话必须绑定网页当前 conversation（P0-4.5）；未填则本地生成并回填输入框
@@ -914,10 +1240,17 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       });
       if (!response.ok) throw new Error(`\u521B\u5EFA\u901A\u8BDD\u5931\u8D25 HTTP ${response.status}`);
       const payload = await response.json();
+      if (generation !== captureGeneration) {
+        void context.close().catch(() => void 0);
+        return;
+      }
+      if (callRequest === request) callRequest = null;
       await connectSocket(payload.ws_url, payload.token);
       ui.muteBtn.disabled = false;
       ui.hangupBtn.disabled = false;
     } catch (error) {
+      if (generation !== captureGeneration) return;
+      teardown();
       setBadge("error");
       logEvent(`\u547C\u53EB\u5931\u8D25\uFF1A${error.message}`);
       ui.callBtn.disabled = false;
@@ -928,47 +1261,75 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     if (url.protocol === "https:") url.protocol = "wss:";
     if (url.protocol === "http:") url.protocol = "ws:";
     url.searchParams.set("token", token);
-    ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
+    const socket = new WebSocket(url);
+    ws = socket;
+    socket.binaryType = "arraybuffer";
+    turns = new VoiceTurnCoordinator({
+      sendJson,
+      sendFrame,
+      invalidateOutput: () => {
+        const streamId = router?.activeStream;
+        const playback = streamId ? { stream_id: streamId, played_ms: player?.playedMs(streamId) ?? 0 } : void 0;
+        router?.invalidateActive();
+        player?.stopAll();
+        return playback;
+      },
+      onFailure: (reason) => {
+        logEvent(`\u8F93\u5165\u4EA4\u63A5\u5931\u8D25\uFF1A${reason}\uFF0C\u8BF7\u91CD\u65B0\u547C\u53EB`);
+        uplink?.reset();
+        ws?.close(4004, "input handoff failed");
+      }
+    });
+    socket.onopen = () => {
+      if (ws !== socket) return;
       setBadge("idle");
       logEvent("WebSocket \u5DF2\u8FDE\u63A5");
       sendJson({
         t: "ready",
         protocol: PROTOCOL_VERSION,
-        capabilities: { playback_drain: true, stream_identity: true }
+        capabilities: { playback_drain: true, stream_identity: true, voice_interrupt: true }
       });
-      void setupCapture2();
+      readyTimer = setTimeout(() => {
+        if (ws === socket) socket.close(4004, "capability negotiation timeout");
+      }, 5e3);
     };
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (ws !== socket) return;
       if (typeof event.data === "string") {
         handleServerMessage(JSON.parse(event.data));
       } else {
         router?.handleBinary(event.data);
       }
     };
-    ws.onclose = (event) => {
+    socket.onclose = (event) => {
+      if (ws !== socket) return;
       logEvent(`WebSocket \u5173\u95ED code=${event.code}`);
       teardown();
       setBadge("ended");
       ui.callBtn.disabled = false;
     };
-    ws.onerror = () => {
+    socket.onerror = () => {
+      if (ws !== socket) return;
       logEvent("WebSocket \u9519\u8BEF");
     };
   }
   async function setupCapture2() {
     const generation = captureGeneration;
-    const pipeline = await setupCapture((samples) => handleCapturedSamples(samples));
+    const prepared = pendingAudioContext ?? void 0;
+    const pipeline = await setupCapture((samples, reference) => {
+      if (generation === captureGeneration) handleCapturedSamples(samples, reference);
+    }, prepared);
     if (generation !== captureGeneration) {
       await pipeline.dispose().catch(() => void 0);
       return;
     }
+    if (pendingAudioContext === prepared) pendingAudioContext = null;
     capture = pipeline;
     player = new JitteredPcmPlayer(
       capture.context,
       jitterBufferMs,
-      (streamId) => router?.notifyStreamIdle(streamId)
+      (streamId) => router?.notifyStreamIdle(streamId),
+      capture.playbackInput
     );
     router = new StreamRouter({
       onChunk: (buffer, header) => player?.feed(buffer, header.rate, header.stream_id),
@@ -993,25 +1354,39 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       framer: new Pcm16Framer(320),
       // 20ms @16k
       sendJson: (message) => sendJson(message),
-      sendFrame: (frame) => sendFrame(frame),
-      isAiActive: () => serverState === "thinking" || serverState === "speaking",
+      sendFrame: (frame) => turns?.sendFrame(frame),
+      startInput: () => turns?.begin(),
+      finishInput: (valid) => turns?.finish(valid),
+      canInterrupt: () => turns?.supported ?? false,
+      isAiActive: hasResponse,
       log: (message) => logEvent(message)
     });
     uplink.setMode(ui.modeSelect.value === "ptt" ? "ptt" : "vad");
     if (muted) uplink.setMuted(true);
     resampler = new Float32Resampler(capture.sampleRate, 16e3);
+    referenceResampler = new Float32Resampler(capture.sampleRate, 16e3);
+    echoGuard.reset();
     logEvent(`\u91C7\u96C6\u5C31\u7EEA rate=${capture.sampleRate} pre-roll=${PRE_ROLL_MS}ms`);
+    if (capture.echoCancellation === false) {
+      logEvent("\u8BBE\u5907\u672A\u542F\u7528\u7CFB\u7EDF\u56DE\u58F0\u6D88\u9664\uFF0C\u5EFA\u8BAE\u4F7F\u7528\u8033\u673A\u6216\u6309\u4F4F\u8BF4\u8BDD");
+    }
   }
-  function handleCapturedSamples(samples) {
-    if (!resampler || !uplink) return;
+  function handleCapturedSamples(samples, reference) {
+    if (!resampler || !referenceResampler || !uplink) return;
     const targetSamples = resampler.push(samples);
+    const rendered = referenceResampler.push(reference);
     if (targetSamples.length === 0) return;
+    const nearEnd = echoGuard.process(targetSamples, rendered);
     if (ui.modeSelect.value === "vad") {
       ui.noiseFloor.textContent = uplink.vadStatus;
     }
-    uplink.handleSamples(targetSamples);
+    uplink.handleSamples(targetSamples, nearEnd);
   }
   function handleServerMessage(message) {
+    if (turns && !turns.accept(message)) {
+      if (message.t === "pcm") router?.discardPendingBinary();
+      return;
+    }
     if (router?.handleJson(message)) {
       if (message.t === "interrupted") {
         const streamId = typeof message.stream_id === "string" ? message.stream_id : null;
@@ -1023,9 +1398,26 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     const type = message.t;
     switch (type) {
       case "ready":
+        clearTimeout(readyTimer);
+        readyTimer = void 0;
         serverProtocol = Number(message.protocol ?? 0);
+        turns?.negotiate(message.capabilities?.voice_interrupt === true);
         applyServerTuning(message);
-        logEvent(`\u534F\u8BAE\u534F\u5546 v${serverProtocol}`);
+        ui.voiceModeStatus.textContent = turns?.supported ? "\u5F00\u53E3\u53EF\u6253\u65AD" : "\u670D\u52A1\u7AEF\u4EC5\u652F\u6301\u624B\u52A8\u6253\u65AD";
+        logEvent(`\u534F\u8BAE\u534F\u5546 v${serverProtocol}\uFF0Cclient=1012-interrupt`);
+        if (!captureRequested && ws) {
+          captureRequested = true;
+          const socket = ws;
+          void setupCapture2().catch((error) => {
+            if (ws !== socket) return;
+            logEvent(`\u65E0\u6CD5\u542F\u52A8\u9EA6\u514B\u98CE\uFF1A${error.message}`);
+            socket.close(4004, "capture unavailable");
+          });
+        }
+        break;
+      case "input_started":
+        serverState = "listening";
+        setBadge(serverState);
         break;
       case "partial":
         ui.partial.textContent = String(message.text ?? "");
@@ -1066,7 +1458,11 @@ ${ui.asrLog.textContent ?? ""}`;
     logEvent(muted ? "\u5DF2\u9759\u97F3\uFF08\u505C\u6B62\u4E0A\u884C\uFF09" : "\u53D6\u6D88\u9759\u97F3");
   });
   ui.hangupBtn.addEventListener("click", () => {
-    ws?.close(1e3, "hangup");
+    const socket = ws;
+    teardown();
+    socket?.close(1e3, "hangup");
+    setBadge("ended");
+    ui.callBtn.disabled = false;
   });
   ui.modeSelect.addEventListener("change", () => {
     const ptt = ui.modeSelect.value === "ptt";
@@ -1084,25 +1480,41 @@ ${ui.asrLog.textContent ?? ""}`;
     event.preventDefault();
     uplink?.endPtt();
   });
+  function hasResponse() {
+    return ["ending", "thinking", "speaking"].includes(serverState) || (player?.scheduledCount ?? 0) > 0;
+  }
   ui.stateBadge.addEventListener("click", () => {
-    if (serverState === "speaking" || serverState === "thinking") {
-      player?.stopAll();
-      sendJson({ t: "abort" });
+    if (hasResponse()) {
+      turns?.abort();
+      uplink?.reset();
       logEvent("\u624B\u52A8 barge-in \u2192 abort");
     }
   });
   function teardown() {
     captureGeneration++;
+    callRequest?.abort();
+    callRequest = null;
+    clearTimeout(readyTimer);
+    readyTimer = void 0;
+    captureRequested = false;
+    ws = null;
     uplink?.reset();
+    turns?.reset();
     router?.reset();
     player?.stopAll();
     player = null;
     router = null;
     uplink = null;
+    turns = null;
     resampler = null;
+    referenceResampler = null;
+    echoGuard.reset();
     void capture?.dispose().catch(() => void 0);
     capture = null;
+    void pendingAudioContext?.close().catch(() => void 0);
+    pendingAudioContext = null;
     serverState = "idle";
+    ui.voiceModeStatus.textContent = "\u672A\u8FDE\u63A5";
     ui.muteBtn.disabled = true;
     ui.hangupBtn.disabled = true;
   }

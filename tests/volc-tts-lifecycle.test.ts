@@ -13,6 +13,35 @@ afterAll(async () => {
 });
 
 describe('VolcBidirectionalTtsProvider 连接生命周期（v1.1.1 审计修复）', () => {
+  it('queued cancellation returns promptly without letting successors overlap the active session', async () => {
+    const server = await startFakeServer({ audioChunks: 60, chunkDelayMs: 15 });
+    servers.push(server);
+    const tts = makeProvider(server.port, { sessionTimeoutMs: 3000 });
+    const active = new AbortController();
+    const queued = new AbortController();
+    const next = new AbortController();
+    const consume = async (text: string, signal: AbortSignal) => {
+      for await (const chunk of tts.synthesizeStream(request(text), signal)) void chunk;
+    };
+    const first = consume('active', active.signal).catch(() => undefined);
+    try {
+      await waitForSeen(() => server.seen.taskRequests.length === 1);
+      const second = consume('queued', queued.signal);
+      const rejected = expect(second).rejects.toThrow(/abort/i);
+      queued.abort();
+      await rejected;
+      const third = consume('next', next.signal).catch(() => undefined);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 35));
+        expect(server.seen.taskRequests.map((item) => item.text)).toEqual(['active']);
+        active.abort();
+        await first;
+        await waitForSeen(() => server.seen.taskRequests.length === 2);
+        expect(server.seen.taskRequests.map((item) => item.text)).toEqual(['active', 'next']);
+      } finally { next.abort(); await third; }
+    } finally { active.abort(); await first; tts.dispose(); }
+  });
+
   it('审计回归：StartConnection 未收到 ConnectionStarted 前不发 StartSession（门控）', async () => {
     const server = await startFakeServer({ audioChunks: 1, noStartAck: true });
     servers.push(server);

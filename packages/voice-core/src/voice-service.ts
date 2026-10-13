@@ -27,6 +27,7 @@ import type { Logger } from '@siren/telemetry';
 import type { SirenConfig } from './config.ts';
 import { parseEmotion, resolveStyle } from './emotion.ts';
 import type { VoiceProfileRegistry } from './voice-profile.ts';
+import { assertTtsProfileCompatible } from './voice-profile.ts';
 import { buildAssetMeta, buildObjectKey, contentTypeFor, metaObjectKey, normalizeContainer } from './asset-keys.ts';
 
 export interface VoiceServiceDeps {
@@ -89,6 +90,7 @@ export class VoiceService {
 
   async synthesizeAudio(params: SynthesizeParams): Promise<TtsAudioResult & { profile: VoiceProfile }> {
     const profile = this.resolveProfile(params.voiceProfileId);
+    assertTtsProfileCompatible(profile, this.deps.asyncTtsName);
     const emotion = parseEmotion(params.emotion) ?? profile.defaultEmotion;
     const style = resolveStyle(profile, { emotion, speed: params.speed });
     const result = await this.deps.asyncTts.synthesize({
@@ -134,6 +136,7 @@ export class VoiceService {
 
   private async speakNow(params: SpeakParams): Promise<VoiceAssetWithUrl> {
     const profile = this.resolveProfile(params.voiceProfileId);
+    assertTtsProfileCompatible(profile, this.deps.asyncTtsName);
     const emotion = params.emotion ?? profile.defaultEmotion;
     const style = resolveStyle(profile, { emotion, speed: params.speed });
     const synthesized = await this.deps.asyncTts.synthesize({
@@ -159,8 +162,6 @@ export class VoiceService {
         messageId,
         direction: params.direction ?? 'assistant',
         voiceProfileId: profile.id,
-        text: params.text,
-        ttsScript: params.ttsScript,
         emotion,
         durationMs: synthesized.durationMs,
         format: synthesized.format,

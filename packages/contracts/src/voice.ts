@@ -82,7 +82,7 @@ export interface PcmChunk {
 
 export interface BatchTtsProvider {
   /** 完整文字 -> 完整音频 */
-  synthesize(request: TtsRequest): Promise<TtsAudioResult>;
+  synthesize(request: TtsRequest, signal?: AbortSignal): Promise<TtsAudioResult>;
 }
 
 export interface StreamTtsProvider {

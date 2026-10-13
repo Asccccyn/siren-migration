@@ -47,6 +47,14 @@ export class StreamRouter {
     return this.activeStreamId;
   }
 
+  /** Local interrupt must tombstone the current output before stopping playback. */
+  invalidateActive(): void {
+    this.cancelStream(this.activeStreamId ?? undefined);
+    this.pendingHeader = null;
+  }
+
+  discardPendingBinary(): void { this.pendingHeader = null; }
+
   /** 服务端文本帧中与下行流相关的部分；返回是否被本路由消费 */
   handleJson(message: Record<string, unknown>): boolean {
     switch (message.t) {

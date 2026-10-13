@@ -179,7 +179,7 @@ describe('Conversation 连续性（P0-4.5 电话与网页共享同一 conversati
     expect(turnsRepo.listByCall('call-dup').length).toBe(1);
   });
 
-  it('被打断的 assistant turn 只保留已播出内容（interrupted 元数据，不伪装完整回复）', async () => {
+  it('被打断的 assistant turn 保留已下发句子前缀并标记 interrupted（不声称用户已听）', async () => {
     const { harness, turnsRepo } = buildRecording({
       conversationId: 'conv-int',
       callId: 'call-int',
@@ -198,7 +198,7 @@ describe('Conversation 连续性（P0-4.5 电话与网页共享同一 conversati
     const turns = turnsRepo.listByCall('call-int');
     expect(turns.length).toBe(1);
     expect(turns[0].interrupted).toBe(1);
-    // 未播完的内容不伪装成完整回复：assistant_text 是已播出部分的子串且不含未播出尾部
+    // 只记录已完整下发的句子前缀；客户端播放进度有独立的 client_reported/unknown 合同。
     expect(turns[0].assistant_text ?? '').not.toContain('第四句还没说');
   });
 });

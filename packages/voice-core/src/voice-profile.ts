@@ -1,15 +1,27 @@
 /**
- * Voice Profile 加载器：config/voices/*.json 是音色配置的唯一来源。
+ * Voice Profile 加载器：data/voices/*.json 是音色档案来源（空音色可回退环境变量）。
  * 禁止把 Voice ID 写死在业务代码（规范第 8/47 节）。
  */
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
+  ProviderError,
   SIREN_EMOTIONS,
   type ProviderKind,
   type SirenEmotion,
   type VoiceProfile
 } from '@siren/contracts';
+
+/** A profile belongs to the TTS provider used by this operation, never to the ASR provider. */
+export function assertTtsProfileCompatible(profile: VoiceProfile, activeProviderName?: string): void {
+  if (!activeProviderName) return; // Directly injected providers may omit operational metadata.
+  const actual = activeProviderName.split('(')[0].trim();
+  if (actual === 'mock') return; // Mock generates synthetic audio and does not consume a vendor voice ID.
+  if (profile.provider !== actual) {
+    throw new ProviderError('provider_unavailable', actual,
+      `voice profile provider ${profile.provider} is incompatible with configured TTS provider ${actual}`);
+  }
+}
 
 export class VoiceProfileRegistry {
   private readonly profiles = new Map<string, VoiceProfile>();

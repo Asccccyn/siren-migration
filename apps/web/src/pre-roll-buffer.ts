@@ -10,7 +10,7 @@
  * （服务端 asr-prebuffer 是建连期保护，与本模块互补，两者缺一不可。）
  */
 export class AudioPreRollBuffer {
-  private readonly ring: Float32Array;
+  private ring: Float32Array;
   private writePos = 0;
   private filled = 0;
 
@@ -23,6 +23,16 @@ export class AudioPreRollBuffer {
 
   get capacity(): number {
     return this.ring.length;
+  }
+
+  /** Grow before accepting a candidate block; preserve samples already retained. */
+  ensureCapacity(capacitySamples: number): void {
+    const capacity = Math.ceil(capacitySamples);
+    if (!Number.isFinite(capacity) || capacity <= this.ring.length) return;
+    if (capacity > 16000 * 3) throw new Error('pre-roll window exceeds 3 seconds');
+    const kept = this.drain();
+    this.ring = new Float32Array(capacity);
+    this.push(kept);
   }
 
   /** 已缓冲样本数 */

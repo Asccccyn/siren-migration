@@ -37,7 +37,8 @@ export class MockTtsProvider implements BatchTtsProvider, StreamTtsProvider {
   readonly synthesizedTexts: string[] = [];
   faults: MockTtsFaults = {};
 
-  async synthesize(request: TtsRequest): Promise<TtsAudioResult> {
+  async synthesize(request: TtsRequest, signal?: AbortSignal): Promise<TtsAudioResult> {
+    signal?.throwIfAborted();
     this.calls.batchCount++;
     if (this.faults.failBatch) {
       throw new ProviderError('tts_failed', 'mock-tts', 'mock batch tts failure');

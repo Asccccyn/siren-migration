@@ -112,12 +112,13 @@
           <label class="muted" style="display:inline-flex;align-items:center;gap:8px">
             模式
             <select class="input-box" id="mode">
-              <option value="vad">VAD 自动断句</option>
+              <option value="vad">自然对话（开口打断）</option>
               <option value="ptt">按住说话（PTT）</option>
             </select>
           </label>
           <button class="btn btn-ghost" id="pttBtn" style="display:none">🎤 按住说话</button>
           <span class="muted" id="noiseFloor">noise floor: −</span>
+          <span class="muted" id="voiceModeStatus">未连接</span>
         </div>
         <div class="vad-grid">
           <span class="muted" style="letter-spacing:.08em">VAD 参数</span>
@@ -226,7 +227,7 @@
   function loadFeatureScripts() {
     if (scriptsLoaded) return;
     scriptsLoaded = true;
-    for (const src of ['/assets/realtime-call-test.js?v=3', '/assets/async-voice-test.js?v=3']) {
+    for (const src of ['/assets/realtime-call-test.js?v=1012-interrupt', '/assets/async-voice-test.js?v=1012-interrupt']) {
       const s = document.createElement('script');
       s.src = src;
       document.body.appendChild(s);

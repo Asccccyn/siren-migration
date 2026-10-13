@@ -7,12 +7,14 @@
  * 原有 Bearer 客户端不受影响，无需重连。
  */
 import { randomBytes } from 'node:crypto';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { SirenConfig } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { escapeHtml } from '../routes/html.ts';
-import { OAuthClientStore, type OAuthClient } from './client-store.ts';
+import { OAuthClientStore, RegistrationCapacityError, type OAuthClient } from './client-store.ts';
 import { RevocationList } from './revocation.ts';
+import { OAuthRateLimit } from './rate-limit.ts';
+import { OAuthStateError } from './state-file.ts';
 import {
   constantTimeEqualString,
   isCanonicalToken,
@@ -50,6 +52,8 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
   const revocationReady = revocation.load();
   const codes = new Map<string, AuthCodeEntry>();
   const attempts = new Map<string, { count: number; resetAt: number }>();
+  const registrations = new OAuthRateLimit(10, 60);
+  const revocations = new OAuthRateLimit(60, 600);
 
   function rateLimited(ip: string): boolean {
     const now = Date.now();
@@ -94,6 +98,34 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
       done(null, Object.fromEntries(new URLSearchParams(String(body))));
     });
     await Promise.all([storeReady, revocationReady]);
+    app.addHook('onClose', async () => {
+      await Promise.all([store.flush(), revocation.flush()]);
+    });
+
+    // 状态写入失败不可伪装成授权/撤销成功；错误响应不带磁盘路径或上游原文。
+    app.addHook('onError', async (_request, _reply, error) => {
+      if (error instanceof OAuthStateError) logger.error('oauth_state_unavailable');
+    });
+
+    // 新授权管理面仅限静态维护者凭据，voice scope 不授予管理其他客户端的权限。
+    const ownerOnly = {
+      preHandler: async (request: FastifyRequest, reply: FastifyReply) => {
+        const supplied = request.headers.authorization?.replace(/^Bearer /, '').trim() ?? '';
+        if (!config.internalToken || !constantTimeEqualString(supplied, config.internalToken)) {
+          await reply.code(403).send({ error: 'owner_token_required' });
+        }
+      }
+    };
+    app.get('/v1/oauth/clients', ownerOnly, async () => ({ items: store.list() }));
+    app.post('/v1/oauth/clients/:clientId/remove', ownerOnly, async (request, reply) => {
+      const { clientId } = request.params as { clientId: string };
+      try {
+        await reply.send({ removed: await store.remove(clientId) });
+      } catch {
+        logger.error('oauth_state_unavailable');
+        await reply.code(503).send({ error: 'oauth_storage_unavailable' });
+      }
+    });
 
     app.get('/.well-known/oauth-protected-resource', async (_req, reply) => {
       await reply
@@ -117,13 +149,25 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
         });
     });
 
-    app.post('/oauth/register', async (request, reply) => {
+    app.post('/oauth/register', { bodyLimit: 16 * 1024 }, async (request, reply) => {
+      if (!registrations.allow(request.ip)) {
+        await reply.header('retry-after', registrations.retryAfter()).code(429).send({ error: 'too_many_requests' });
+        return;
+      }
       const body = (request.body ?? {}) as Record<string, unknown>;
-      const redirectUris = Array.isArray(body.redirect_uris)
-        ? body.redirect_uris.filter((u): u is string => typeof u === 'string' && u.length > 0)
-        : [];
-      if (redirectUris.length === 0) {
-        await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: 'redirect_uris 必填' });
+      if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0 || body.redirect_uris.length > 8 ||
+          !body.redirect_uris.every((uri) => typeof uri === 'string' && uri.length > 0 && Buffer.byteLength(uri) <= 2048)) {
+        await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '需要 1–8 个回调地址，每个不超过 2048 字节' });
+        return;
+      }
+      const redirectUris = body.redirect_uris as string[];
+      if (body.client_name !== undefined && (typeof body.client_name !== 'string' || Buffer.byteLength(body.client_name) > 256)) {
+        await reply.code(400).send({ error: 'invalid_client_metadata', error_description: 'client_name 不超过 256 字节' });
+        return;
+      }
+      if (body.token_endpoint_auth_method !== undefined && body.token_endpoint_auth_method !== 'none' &&
+          body.token_endpoint_auth_method !== 'client_secret_post') {
+        await reply.code(400).send({ error: 'invalid_client_metadata', error_description: '不支持的 token_endpoint_auth_method' });
         return;
       }
       // S1011-010：结构校验——可解析、http(s)、无 fragment（存储仍按原文精确匹配）
@@ -132,28 +176,32 @@ export function createOAuth(config: SirenConfig, logger: Logger): OAuthModule {
         try {
           parsed = new URL(uri);
         } catch {
-          await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: `无法解析: ${uri.slice(0, 80)}` });
+          await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '回调地址无法解析' });
           return;
         }
         if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
           await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '仅允许 http/https' });
           return;
         }
-        if (parsed.hash) {
+        if (uri.includes('#') || parsed.username || parsed.password) {
           await reply.code(400).send({ error: 'invalid_redirect_uri', error_description: '不允许携带 fragment' });
           return;
         }
       }
-      if (store.size >= 200) {
-        await reply.code(503).send({ error: 'registration_capacity_reached', error_description: '注册容量已满' });
+      const method = body.token_endpoint_auth_method === 'client_secret_post' ? 'client_secret_post' : 'none';
+      let client: OAuthClient;
+      try {
+        client = await store.register({
+          clientName: typeof body.client_name === 'string' && body.client_name ? body.client_name : 'mcp-client',
+          redirectUris,
+          tokenEndpointAuthMethod: method
+        });
+      } catch (error) {
+        const code = error instanceof RegistrationCapacityError ? 'registration_capacity_reached' : 'oauth_storage_unavailable';
+        logger.error(code);
+        await reply.code(503).send({ error: code });
         return;
       }
-      const method = body.token_endpoint_auth_method === 'client_secret_post' ? 'client_secret_post' : 'none';
-      const client = await store.register({
-        clientName: typeof body.client_name === 'string' && body.client_name ? body.client_name : 'mcp-client',
-        redirectUris,
-        tokenEndpointAuthMethod: method
-      });
       logger.info('oauth_client_registered', { client_id: client.clientId, method });
       const resp: Record<string, unknown> = {
         client_id: client.clientId,
@@ -245,6 +293,16 @@ ${opts.hidden}
         );
         return;
       }
+      try {
+        if (!(await store.authorize(v.client.clientId))) {
+          await reply.code(400).send({ error: 'invalid_client' });
+          return;
+        }
+      } catch {
+        logger.error('oauth_state_unavailable');
+        await reply.code(503).send({ error: 'oauth_storage_unavailable' });
+        return;
+      }
       attempts.delete(ip);
       const code = randomBytes(24).toString('base64url');
       rememberCode(code, {
@@ -316,7 +374,13 @@ ${opts.hidden}
         }
         // S1011-011：刷新令牌一次性轮换——旧 RT 立即入吊销名单（按其到期时间回收），
         // 重放旧 RT 按无效拒绝；新 RT 随本次响应发放
-        revocation.add(tokenHash(token), claims.e * 1000);
+        try {
+          await revocation.add(tokenHash(token), claims.e * 1000);
+        } catch {
+          logger.error('oauth_state_unavailable');
+          await reply.code(503).send({ error: 'oauth_storage_unavailable' });
+          return;
+        }
         const accessToken = signToken(config.signingSecret, 'at', client.clientId, ACCESS_TTL_SEC);
         const refreshToken = signToken(config.signingSecret, 'rt', client.clientId, REFRESH_TTL_SEC);
         logger.info('oauth_token_refreshed', { client_id: client.clientId, rotated: true });
@@ -334,12 +398,24 @@ ${opts.hidden}
     });
 
     app.post('/oauth/revoke', async (request, reply) => {
+      if (!revocations.allow(request.ip)) {
+        await reply.header('retry-after', revocations.retryAfter()).code(429).send({ error: 'too_many_requests' });
+        return;
+      }
       const form = (request.body ?? {}) as Record<string, unknown>;
       const token = form.token;
       // S1011-001/007/011：只登记验签通过且未过期的规范令牌，按到期时间入持久名单
       if (isCanonicalToken(token)) {
         const claims = peekTokenClaims(config.signingSecret, token);
-        if (claims) revocation.add(tokenHash(token), claims.e * 1000);
+        if (claims) {
+          try {
+            await revocation.add(tokenHash(token), claims.e * 1000);
+          } catch {
+            logger.error('oauth_state_unavailable');
+            await reply.code(503).send({ error: 'oauth_storage_unavailable' });
+            return;
+          }
+        }
       }
       await reply.send({});
     });
@@ -347,6 +423,9 @@ ${opts.hidden}
 
   return {
     registerRoutes,
-    acceptBearer: (token) => verifyToken(config.signingSecret, token, 'at', revocation) !== null
+    acceptBearer: (token) => {
+      const claims = verifyToken(config.signingSecret, token, 'at', revocation);
+      return claims !== null && store.find(claims.c) !== null;
+    }
   };
 }

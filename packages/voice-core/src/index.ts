@@ -2,7 +2,7 @@ export { loadConfig, assertProductionReadiness } from './config.ts';
 export type { SirenConfig, EnvSource } from './config.ts';
 export { parseEmotion, resolveStyle, emotionToFillerCategory } from './emotion.ts';
 export type { FillerCategory } from './emotion.ts';
-export { VoiceProfileRegistry, validateProfile } from './voice-profile.ts';
+export { VoiceProfileRegistry, validateProfile, assertTtsProfileCompatible } from './voice-profile.ts';
 export { buildProviders, buildMemoryProviders, packageBidirectionalPcmForBatch } from './provider-registry.ts';
 export type { ProviderBundle } from './provider-registry.ts';
 export { CallTokenStore } from './call-token.ts';

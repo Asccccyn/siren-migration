@@ -20,6 +20,7 @@ import type { ObjectStore } from '@siren/storage';
 import { LocalObjectStore, MemoryObjectStore, R2ObjectStore } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
 import type { SirenConfig } from './config.ts';
+import { r2ConfigurationState } from './config.ts';
 
 export interface ProviderBundle {
   asr: AsrProvider;
@@ -173,9 +174,7 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
 
   // --- Object Store ---
   // S1011-023：与 assertProductionReadiness 同一判定——bucket 显式为空即不启用 R2
-  const r2Ready = Boolean(
-    config.r2.accountId && config.r2.accessKeyId && config.r2.secretAccessKey && config.r2.bucket
-  );
+  const r2Ready = r2ConfigurationState(config.r2) === 'ready';
   let store: ObjectStore;
   let storageName: string;
   if (r2Ready) {
@@ -227,10 +226,10 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
  */
 function aggregateBidiAsBatch(bidi: VolcBidirectionalTtsProvider): BatchTtsProvider {
   return {
-    synthesize: async (request) => {
+    synthesize: async (request, signal) => {
       const parts: Buffer[] = [];
       let sampleRate = request.sampleRate ?? 24000;
-      for await (const chunk of bidi.synthesizeStream(request)) {
+      for await (const chunk of bidi.synthesizeStream(request, signal)) {
         parts.push(chunk.audio);
         sampleRate = chunk.sampleRate;
       }

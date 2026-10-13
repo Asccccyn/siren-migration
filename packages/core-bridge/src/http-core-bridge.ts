@@ -29,6 +29,8 @@ export class HttpCoreBridge implements CoreBridge {
       timedOut = true;
       controller.abort();
     }, timeoutMs);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let responseBody: ReadableStream<Uint8Array> | null = null;
     try {
       const response = await fetch(`${this.options.baseUrl.replace(/\/$/, '')}/v1/chat/stream`, {
         method: 'POST',
@@ -41,18 +43,28 @@ export class HttpCoreBridge implements CoreBridge {
           call_id: input.callId,
           turn_id: input.turnId,
           modality: input.modality,
-          text: input.text
+          text: input.text,
+          ...(input.interruptedTurn ? {
+            interrupted_turn: {
+              turn_id: input.interruptedTurn.turnId,
+              input_id: input.interruptedTurn.inputId,
+              output_stream_id: input.interruptedTurn.outputStreamId,
+              playback: input.interruptedTurn.playback.basis === 'client_reported'
+                ? { basis: 'client_reported', played_ms: input.interruptedTurn.playback.playedMs }
+                : { basis: 'unknown' }
+            }
+          } : {})
         }),
         signal: controller.signal
       });
-      if (!response.ok || !response.body) {
+      responseBody = response.body;
+      if (!response.ok || !responseBody) {
         throw new CoreBridgeError('core_http_error', `core responded ${response.status}`);
       }
-      const reader = response.body.getReader();
+      reader = responseBody.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
       // S1011-024：应用层 done 终态——done 即完成，EOF 与 done 后帧各有明确语义
-      let sawDone = false;
       outer: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -68,11 +80,9 @@ export class HttpCoreBridge implements CoreBridge {
           } catch {
             continue; // 忽略残行
           }
-          if (sawDone) continue; // done 之后的帧一律忽略（完成态不被后续帧改变）
           if (message.type === 'delta' && typeof message.text === 'string' && message.text.length > 0) {
             yield { text: message.text };
           } else if (message.type === 'done') {
-            sawDone = true;
             break outer;
           } else if (message.type === 'error') {
             throw new CoreBridgeError('core_stream_error', message.message ?? 'core stream error');
@@ -92,7 +102,16 @@ export class HttpCoreBridge implements CoreBridge {
       throw new CoreBridgeError('core_unreachable', 'failed to reach core', { cause: error });
     } finally {
       clearTimeout(timeout);
-      this.controllers.delete(input.turnId);
+      // Logical done is not HTTP EOF. Keep ownership until the body and reader
+      // have been canceled/released, including early consumer return/errors.
+      controller.abort();
+      try {
+        if (reader) await reader.cancel().catch(() => undefined);
+        else await responseBody?.cancel().catch(() => undefined);
+      } finally {
+        reader?.releaseLock();
+        if (this.controllers.get(input.turnId) === controller) this.controllers.delete(input.turnId);
+      }
     }
   }
 

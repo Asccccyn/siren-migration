@@ -1,5 +1,6 @@
 /** MCP Tool: voice_list（规范第 12 节）。按 conversation_id / message_id / 时间范围查询。 */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { FieldDecryptionError } from '@siren/storage';
 import { voiceListInputSchema } from '@siren/contracts';
 import { serializeAsset } from '../../routes/voice-message.ts';
 import type { Logger } from '@siren/telemetry';
@@ -27,15 +28,22 @@ export function registerListVoicesTool(server: McpServer, deps: { voice: VoiceSe
           content: [{ type: 'text', text: JSON.stringify({ error: 'invalid_input', details: parsed.error.issues }) }]
         };
       }
-      const { items } = await deps.voice.listVoiceMessages({
-        conversationId: parsed.data.conversation_id,
-        messageId: parsed.data.message_id,
-        fromMs: parsed.data.from ? Date.parse(parsed.data.from) : undefined,
-        toMs: parsed.data.to ? Date.parse(parsed.data.to) : undefined,
-        limit: parsed.data.limit
-      });
-      deps.logger.info('mcp_tool_called', { tool: 'voice_list', count: items.length });
-      return { content: [{ type: 'text', text: JSON.stringify({ items: items.map(serializeAsset) }) }] };
+      try {
+        const { items } = await deps.voice.listVoiceMessages({
+          conversationId: parsed.data.conversation_id,
+          messageId: parsed.data.message_id,
+          fromMs: parsed.data.from ? Date.parse(parsed.data.from) : undefined,
+          toMs: parsed.data.to ? Date.parse(parsed.data.to) : undefined,
+          limit: parsed.data.limit
+        });
+        deps.logger.info('mcp_tool_called', { tool: 'voice_list', count: items.length });
+        return { content: [{ type: 'text', text: JSON.stringify({ items: items.map(serializeAsset) }) }] };
+      } catch (error) {
+        if (error instanceof FieldDecryptionError) {
+          return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'data_unreadable' }) }] };
+        }
+        throw error;
+      }
     }
   );
 }

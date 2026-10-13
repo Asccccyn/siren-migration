@@ -12,6 +12,9 @@ interface StreamState {
   ended: boolean;
   cancelled: boolean;
   drainedNotified: boolean;
+  spans: { start: number; duration: number }[];
+  stoppedAt?: number;
+  completedSeconds: number;
 }
 
 export class JitteredPcmPlayer {
@@ -22,7 +25,8 @@ export class JitteredPcmPlayer {
   constructor(
     private readonly ctx: AudioContext,
     private readonly getJitterMs: () => number,
-    private readonly onStreamIdle?: (streamId: string) => void
+    private readonly onStreamIdle?: (streamId: string) => void,
+    private readonly output: AudioNode = ctx.destination
   ) {}
 
   /** 喂入一帧 PCM16 little-endian 二进制（属于 streamId 流，rate 为该 chunk 真实采样率） */
@@ -39,16 +43,21 @@ export class JitteredPcmPlayer {
     }
     const source = this.ctx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(this.ctx.destination);
+    source.connect(this.output);
     const now = this.ctx.currentTime;
     if (this.nextAt < now) {
       this.nextAt = now + this.getJitterMs() / 1000; // 首块抖动缓冲
     }
+    const span = { start: this.nextAt, duration: audioBuffer.duration };
+    state.spans.push(span);
     source.start(this.nextAt);
     this.nextAt += audioBuffer.duration;
     state.sources.add(source);
     source.onended = () => {
       state.sources.delete(source);
+      state.completedSeconds += Math.max(0, Math.min(span.duration, (state.stoppedAt ?? this.ctx.currentTime) - span.start));
+      const index = state.spans.indexOf(span);
+      if (index >= 0) state.spans.splice(index, 1);
       this.maybeIdle(streamId, state);
     };
   }
@@ -72,6 +81,7 @@ export class JitteredPcmPlayer {
     for (const id of targets) {
       const state = this.streams.get(id);
       if (!state) continue;
+      state.stoppedAt ??= this.ctx.currentTime;
       state.cancelled = true;
       state.ended = false;
       this.stopSources(state);
@@ -90,10 +100,18 @@ export class JitteredPcmPlayer {
     return total;
   }
 
+  /** Client-observed rendered duration only; never derive a text prefix from it. */
+  playedMs(streamId: string): number {
+    const state = this.streams.get(streamId);
+    if (!state) return 0;
+    return state.spans.reduce((sum, span) =>
+      sum + Math.max(0, Math.min(span.duration, (state.stoppedAt ?? this.ctx.currentTime) - span.start)), state.completedSeconds) * 1000;
+  }
+
   private stateOf(streamId: string): StreamState {
     let state = this.streams.get(streamId);
     if (!state) {
-      state = { sources: new Set(), ended: false, cancelled: false, drainedNotified: false };
+      state = { sources: new Set(), ended: false, cancelled: false, drainedNotified: false, spans: [], completedSeconds: 0 };
       this.streams.set(streamId, state);
       this.order.push(streamId);
       // 只保留最近几个流的状态，防慢泄漏

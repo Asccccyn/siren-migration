@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createLogger, errorFields } from '@siren/telemetry';
+import { HttpCoreBridge } from '@siren/core-bridge';
 
 function capture(): { lines: Record<string, unknown>[]; logger: ReturnType<typeof createLogger> } {
   const lines: Record<string, unknown>[] = [];
@@ -56,10 +57,10 @@ describe('Logger 脱敏（规范第 38 节）', () => {
     expect(lines[0].turn_index).toBe(3);
   });
 
-  it('Error 对象压缩为 name/message', () => {
+  it('Error 对象仅保留安全分类', () => {
     const { lines, logger } = capture();
     logger.error('e', { err: new Error('boom') });
-    expect(lines[0].err).toEqual({ name: 'Error', message: 'boom' });
+    expect(lines[0].err).toEqual({ error_name: 'Error' });
   });
 
   it('P1-5：延迟/计数指标含 token 字样不再被误脱敏', () => {
@@ -126,9 +127,33 @@ describe('S1011-008：递归脱敏与 bindings 覆盖', () => {
     expect(String(parsed.text)).toMatch(/^\[len:/); // 文本默认不落日志
   });
 
-  it('超长上游错误信息截断到 200 字符（有界）', () => {
-    const fields = errorFields(new Error('x'.repeat(5000)));
-    expect((fields.error_message as string).length).toBeLessThanOrEqual(220);
-    expect((fields.error_message as string)).toContain('[truncated]');
+  it('短错误正文、绑定和嵌套 Error 也不进入日志，错误码仍可定位', () => {
+    const { logger, lines } = capture();
+    const error = Object.assign(new Error('private-transcript token=short-secret'), { code: 'ETIMEDOUT' });
+    logger.child({ error_message: error.message }).error('provider_failed', {
+      ...errorFields(error), nested: [error, { cause: { message: error.message } }], err: error
+    });
+    expect(JSON.stringify(lines)).not.toContain('private-transcript');
+    expect(JSON.stringify(lines)).not.toContain('short-secret');
+    expect(lines[0].error_code).toBe('ETIMEDOUT');
+    expect(errorFields(new Error('x'.repeat(5000)))).toEqual({ error_name: 'Error' });
+  });
+
+  it('Core 返回的错误正文穿过真实错误处理路径后仍不会写入日志', async () => {
+    const { logger, lines } = capture();
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({ type: 'error', message: 'synthetic-private-core-text' }) + '\n'
+    ));
+    try {
+      const core = new HttpCoreBridge({ baseUrl: 'https://never-connected.invalid', logger });
+      await expect((async () => {
+        for await (const _delta of core.streamReply({ callId: 'audit', turnId: 'audit', conversationId: 'audit', modality: 'voice_call', text: 'input' })) { /* consume */ }
+      })()).rejects.toBeDefined();
+      expect(lines.length).toBeGreaterThan(0);
+      expect(JSON.stringify(lines)).not.toContain('synthetic-private-core-text');
+      expect(lines[0].error_code).toBe('core_stream_error');
+    } finally {
+      fetch.mockRestore();
+    }
   });
 });

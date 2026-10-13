@@ -209,11 +209,11 @@ function resolveProviderSections(env: EnvSource) {
       timeoutMs: num(env, 'ELEVENLABS_TIMEOUT_MS', 30000)
     },
     r2: {
-      accountId: env.R2_ACCOUNT_ID ?? '',
-      accessKeyId: env.R2_ACCESS_KEY_ID ?? '',
-      secretAccessKey: env.R2_SECRET_ACCESS_KEY ?? '',
+      accountId: env.R2_ACCOUNT_ID?.trim() ?? '',
+      accessKeyId: env.R2_ACCESS_KEY_ID?.trim() ?? '',
+      secretAccessKey: env.R2_SECRET_ACCESS_KEY?.trim() ?? '',
       // S1011-023：未设用默认；显式设为空白=明确的不完整配置（生产阻断，readiness 不放行）
-      bucket: env.R2_BUCKET !== undefined ? env.R2_BUCKET : 'siren-voice'
+      bucket: env.R2_BUCKET !== undefined ? env.R2_BUCKET.trim() : 'siren-voice'
     }
   };
 }
@@ -283,6 +283,15 @@ export interface ProductionReadiness {
   mock: string[];
 }
 
+/** Shared by startup validation and provider assembly after configuration normalization. */
+export function r2ConfigurationState(r2: SirenConfig['r2']): 'disabled' | 'ready' | 'incomplete' {
+  const { accountId, accessKeyId, secretAccessKey, bucket } = r2;
+  if ([accountId, accessKeyId, secretAccessKey, bucket].every((value) => value.trim().length > 0)) {
+    return 'ready';
+  }
+  return accountId || accessKeyId || secretAccessKey || bucket !== 'siren-voice' ? 'incomplete' : 'disabled';
+}
+
 /**
  * 生产配置校验（P1-4：security 与 mock readiness 拆开，fail closed）。
  * - security：SIREN_INTERNAL_TOKEN / SIREN_SIGNING_SECRET 必须显式配置；
@@ -300,11 +309,7 @@ export function assertProductionReadiness(config: SirenConfig): ProductionReadin
   if (!config.signingSecretExplicit) {
     security.push('SIREN_SIGNING_SECRET 未显式配置：资源签名密钥将由内部 token 派生，生产禁止');
   }
-  const r2 = config.r2;
-  const r2ConfiguredAny = Boolean(r2.accountId || r2.accessKeyId || r2.secretAccessKey || r2.bucket !== 'siren-voice');
-  // S1011-023：bucket 显式为空同属半配置——readiness 与装配（provider-registry）共用
-  // "四件齐备"判定，空 bucket 不得启用 R2 存储
-  if (r2ConfiguredAny && !(r2.accountId && r2.accessKeyId && r2.secretAccessKey && r2.bucket)) {
+  if (r2ConfigurationState(config.r2) === 'incomplete') {
     security.push('R2 配置不完整：account id / access key / secret key / bucket 必须配齐（bucket 不允许显式留空），不允许半配置');
   }
 

@@ -1,21 +1,8 @@
 /**
- * 上行 utterance 编排（客户端纯逻辑，可测试）。
- *
- * 数据流（16kHz Float32）：
- *   采集块 -> [vad 模式且未发送时] pre-roll 环形缓冲
- *          -> VAD 判定
- *          -> start：flush pre-roll（含当前块）+ 开始分帧上行
- *          -> 正在发送：当前块直接分帧上行（start 块已随 flush 消费，不重复发）
- *
- * 半双工合同（对讲机模型，v2）：
- * - 仅在服务端 listening 状态采信麦克风（VAD start -> 上行）。
- * - AI 活跃（thinking/speaking）期间 VAD 触发一律吞掉：不上行、不自动打断。
- *   动机：① 播放走 WebAudio 通道，浏览器 AEC 参考信号覆盖不到，外放回声必然
- *   误触发 VAD（P0-4）；② 自动打断路径是实测故障区（打断后紧接轮次 100% 空转写），
- *   收敛掉整条交互线（1002 定案）。
- * - 句首始终留在 pre-roll：AI 回 listening 时用户仍在说话则自动接上，不丢句首。
- * - 想中途打断：UI 手动打断（状态徽章点击）直接发 abort——不经 VAD，
- *   服务端 handleAbort 机制保留专供手动打断与协议层使用。
+ * Utterance input ownership: retain candidate samples, confirm speech promptly,
+ * then submit PCM once. Negotiated voice interruption uses the turn coordinator;
+ * legacy peers retain explicit half-duplex/manual behavior.
+ * minSpeech validates the completed utterance, not interruption response time.
  */
 import type { VadMachine, VadOutcome } from './vad.ts';
 import type { AudioPreRollBuffer } from './pre-roll-buffer.ts';
@@ -31,6 +18,10 @@ export interface UtteranceUplinkDeps {
   sendFrame: (frame: ArrayBuffer) => void;
   /** AI 处于 thinking/speaking 时返回 true（由服务端 state 帧驱动）——半双工门控 */
   isAiActive: () => boolean;
+  /** Negotiated identity/handoff support; absent means the legacy manual mode. */
+  canInterrupt?: () => boolean;
+  startInput?: () => void;
+  finishInput?: (valid: boolean) => void;
   log?: (message: string) => void;
 }
 
@@ -59,12 +50,14 @@ export class UtteranceUplink {
     if (this.sending) {
       this.sending = false;
       this.flushFramerTail(); // F19：模式切换前把当前句残余发出
-      this.deps.sendJson({ t: 'end' });
+      this.finishInput(true);
       this.deps.log?.('切换模式，结束当前 utterance -> end');
     }
     this.mode = mode;
     // S1011-005：被吞的输入意图不跨模式存活——切 PTT 后未按键不得恢复上行
     this.suppressedByAi = false;
+    this.vadSpeech = false;
+    this.deps.vad.reset();
     this.deps.preRoll.clear();
   }
 
@@ -73,11 +66,13 @@ export class UtteranceUplink {
     if (muted) {
       // S1011-005：静音撤销一切待恢复的输入意图
       this.suppressedByAi = false;
+      this.vadSpeech = false;
+      this.deps.vad.reset();
       this.deps.preRoll.clear(); // 静音期间不积累，避免解除静音后送出旧音频
       if (this.sending) {
         this.sending = false;
         this.flushFramerTail(); // F19：静音断句同样先发残余
-        this.deps.sendJson({ t: 'end' });
+        this.finishInput(true);
       }
     }
   }
@@ -98,17 +93,20 @@ export class UtteranceUplink {
   }
 
   /** 16kHz Float32 采样块入口（已重采样） */
-  handleSamples(samples: Float32Array): void {
+  handleSamples(samples: Float32Array, detectionSamples = samples): void {
     if (this.muted || samples.length === 0) return;
     if (this.mode === 'ptt') {
       if (this.sending) this.sendFrames(samples);
       return;
     }
     if (!this.sending) {
+      this.deps.preRoll.ensureCapacity(this.deps.vad.requiredPreRollSamples + samples.length);
       // pre-roll 先收当前块再判定：start 时的 drain 必然包含本块
       this.deps.preRoll.push(samples);
     }
-    const outcome = this.deps.vad.process(samples);
+    // The echo gate controls detection, not candidate retention: late near-end
+    // confirmation must not erase the first microphone samples of the new word.
+    const outcome = this.deps.vad.process(detectionSamples);
     if (outcome.event === 'start') {
       this.vadSpeech = true;
     } else if (outcome.event === 'end') {
@@ -127,10 +125,11 @@ export class UtteranceUplink {
 
   // --- PTT 入口 ---
   startPtt(): void {
-    if (this.sending) return;
+    if (this.sending || this.muted || this.mode !== 'ptt') return;
+    if (this.deps.isAiActive() && !this.deps.canInterrupt?.()) return;
     this.sending = true;
     this.deps.preRoll.clear();
-    this.deps.sendJson({ t: 'start' });
+    this.startInput();
     this.deps.log?.('PTT: start');
   }
 
@@ -138,7 +137,7 @@ export class UtteranceUplink {
     if (!this.sending) return;
     this.sending = false;
     this.flushFramerTail(); // F19：PTT 结束把不满一帧的残余发出，不串入下一轮
-    this.deps.sendJson({ t: 'end' });
+    this.finishInput(true);
     this.deps.log?.('PTT: end');
   }
 
@@ -149,12 +148,13 @@ export class UtteranceUplink {
     this.vadSpeech = false;
     this.deps.preRoll.clear();
     this.deps.framer.reset();
+    this.deps.vad.reset();
   }
 
   private handleVadStart(): boolean {
-    // 半双工门控：AI 活跃（thinking/speaking）期间不采信 VAD——不上行、不自动打断。
+    // 旧服务端的显式兼容模式：不协商新合同就不自动打断。
     // 回声与误触发在这条线上整个消失；句首留在 pre-roll。
-    if (this.deps.isAiActive()) {
+    if (this.deps.isAiActive() && !this.deps.canInterrupt?.()) {
       this.suppressedByAi = true;
       this.deps.log?.('AI 活跃（半双工）：忽略本次 VAD start，句首留在 pre-roll');
       return false;
@@ -167,7 +167,7 @@ export class UtteranceUplink {
   /** 开始一次上行 utterance：start + flush pre-roll（句首保护） */
   private beginSending(): void {
     this.sending = true;
-    this.deps.sendJson({ t: 'start' });
+    this.startInput();
     this.deps.log?.(`VAD: 说话开始 -> start（pre-roll ${Math.round(this.deps.preRoll.bufferedMs)}ms）`);
     // flush pre-roll：包含 confirm 窗口内的句首 + 当前块
     this.sendFrames(this.deps.preRoll.drain());
@@ -178,8 +178,18 @@ export class UtteranceUplink {
     if (!this.sending) return;
     this.sending = false;
     this.flushFramerTail(); // F19：静音断句前发出尾帧残余
-    this.deps.sendJson({ t: 'end' });
+    this.finishInput(outcome.valid);
     this.deps.log?.(`VAD: 静音断句 -> end（spoken ${Math.round(outcome.spokenMs)}ms）`);
+  }
+
+  private startInput(): void {
+    if (this.deps.startInput) this.deps.startInput();
+    else this.deps.sendJson({ t: 'start' });
+  }
+
+  private finishInput(valid: boolean): void {
+    if (this.deps.finishInput) this.deps.finishInput(valid);
+    else this.deps.sendJson({ t: valid ? 'end' : 'abort' });
   }
 
   private sendFrames(samples: Float32Array): void {

@@ -3,7 +3,7 @@
  * - 021：Core 中途失败时已收到的原始文本（含未成句半句）独立保留并下发
  * - 018：TTS 流式+批量双失败的任何原生异常都归属 tts_failed，不再误报 core_failed
  * - 017：TTS 失败后的生产者收敛有界——卡在 Core 读取时 core.cancel 真正终止，不拖到 60s 超时
- * - 016：批量合成不可取消的等待被 turn 取解绑——abort 后立即按打断收尾
+ * - 016：确认批量调用已经开始，turn 的取消信号真正传入该操作
  */
 import { describe, expect, it } from 'vitest';
 import type { CoreBridge } from '@siren/core-bridge';
@@ -36,17 +36,24 @@ class ScriptedCore implements CoreBridge {
   }
 }
 
-function failingTts(options: { batchHangs?: boolean } = {}): TtsProvider {
-  return {
-    // eslint-disable-next-line require-yield -- 立即抛错的流式桩（模拟网络原生异常）
+function failingTts(options: { batchHangs?: boolean } = {}): TtsProvider & { batchCalls: number; batchSignal?: AbortSignal } {
+  const tts: TtsProvider & { batchCalls: number; batchSignal?: AbortSignal } = {
+    batchCalls: 0,
+    // eslint-disable-next-line require-yield -- provider failure before any PCM, allowing batch fallback
     synthesizeStream: async function* (): AsyncGenerator<{ audio: Buffer; sampleRate: number }> {
-      throw new Error('fetch network down');
+      throw new ProviderError('tts_failed', 'controlled', 'stream network down');
     },
-    synthesize: () =>
-      options.batchHangs
-        ? new Promise<never>(() => undefined)
-        : Promise.reject(new Error('batch timeout'))
-  } as unknown as TtsProvider;
+    synthesize: (_request, signal) => {
+      tts.batchCalls++;
+      tts.batchSignal = signal;
+      if (!options.batchHangs) return Promise.reject(new Error('batch timeout'));
+      return new Promise<never>((_resolve, reject) => {
+        if (signal?.aborted) { reject(new Error('batch aborted')); return; }
+        signal?.addEventListener('abort', () => reject(new Error('batch aborted')), { once: true });
+      });
+    }
+  };
+  return tts;
 }
 
 describe('S1011-021/018：Core 中途失败保留已收文本 + TTS 异常归属正确', () => {
@@ -67,7 +74,7 @@ describe('S1011-021/018：Core 中途失败保留已收文本 + TTS 异常归属
     }
   });
 
-  it('TTS 流式+批量全挂（原生异常）：错误码 tts_failed，不再误报 core_failed', async () => {
+  it('TTS 确实进入批量后抛原生异常：错误码 tts_failed，不再误报 core_failed', async () => {
     const core = new ScriptedCore({ kind: 'yield-then-stall', deltas: ['一句话。', '再'] }); // 第二段首字触发切句器吐出第一句
     const tts = failingTts();
     const harness = buildSessionHarness({ core: core as never, tts });
@@ -77,6 +84,7 @@ describe('S1011-021/018：Core 中途失败保留已收文本 + TTS 异常归属
       harness.session.handleMessage({ t: 'end' });
       await waitFor(() => harness.texts().some((m) => m.t === 'error'), 5000);
       const error = harness.texts().find((m) => m.t === 'error');
+      expect(tts.batchCalls).toBeGreaterThan(0);
       expect(error?.code).toBe('tts_failed');
     } finally {
       harness.session.destroy('test');
@@ -113,8 +121,9 @@ describe('S1011-017/016：失败收敛有界 + 批量降级可取消', () => {
       harness.session.handleMessage({ t: 'start' });
       harness.session.handleBinary(Buffer.alloc(3200, 0));
       harness.session.handleMessage({ t: 'end' });
-      await waitFor(() => harness.texts().some((m) => m.t === 'state' && m.state === 'thinking'), 5000);
+      await waitFor(() => tts.batchCalls > 0, 5000);
       harness.session.handleMessage({ t: 'abort' });
+      expect(tts.batchSignal?.aborted).toBe(true);
       await waitFor(() => harness.texts().some((m) => m.t === 'interrupted'), 3000);
       const elapsed = Date.now() - startedAt;
       expect(elapsed).toBeLessThan(8000); // 批量 promise 永不落定也不许拖住打断

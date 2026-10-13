@@ -8,6 +8,7 @@
  * 网络层全部走桩：vi.mock node:http / node:dns/promises（ESM 具名导入经模块工厂替换）。
  */
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('node:http', async (importOriginal) => {
@@ -217,7 +218,7 @@ describe('S1011-003：DNS 解析钉住（重绑定防护）', () => {
     let got: unknown = null;
     (captured.lookup as unknown as (h: string, o: unknown, cb: (e: Error | null, a: unknown) => void) => void)(
       'media.example-a.test',
-      {},
+      { all: true },
       (_err, addresses) => {
         got = addresses;
       }
@@ -238,5 +239,42 @@ describe('S1011-003：DNS 解析钉住（重绑定防护）', () => {
       downloadWithLimits('http://media.example-b.test/a.wav', { maxBytes: 1024, timeoutMs: 1000 })
     ).rejects.toMatchObject({ code: 'blocked_url' });
     expect(http.request).not.toHaveBeenCalled();
+  });
+});
+
+describe('下载绝对期限覆盖 DNS / 响应头 / body', () => {
+  it('DNS 超时后拒绝；晚到的解析不能继续创建请求', async () => {
+    vi.useFakeTimers();
+    let resolveDns!: (addresses: { address: string; family: number }[]) => void;
+    vi.mocked(dns.lookup).mockImplementation(() => new Promise((resolve) => { resolveDns = resolve; }) as never);
+    try {
+      const promise = downloadWithLimits('http://pending.example.invalid/a.wav', { timeoutMs: 20, maxBytes: 100 });
+      const rejected = expect(promise).rejects.toMatchObject({ code: 'download_failed' });
+      await vi.advanceTimersByTimeAsync(20);
+      await rejected;
+      resolveDns([{ address: '93.184.216.34', family: 4 }]);
+      await Promise.resolve();
+      expect(http.request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['headers', 'body'] as const)('%s 挂起时超时会拒绝并释放请求/响应', async (phase) => {
+    vi.useFakeTimers();
+    const body = Object.assign(new PassThrough(), { statusCode: 200, headers: {} });
+    const destroy = vi.fn((error?: Error) => { queueMicrotask(() => request.emit('error', error)); });
+    const request = Object.assign(new EventEmitter(), {
+      end: () => { if (phase === 'body') queueMicrotask(() => request.emit('response', body)); },
+      destroy
+    });
+    vi.mocked(http.request).mockReturnValue(request as never);
+    try {
+      const promise = downloadWithLimits('http://93.184.216.34/audio', { timeoutMs: 20, maxBytes: 100 });
+      const rejected = expect(promise).rejects.toMatchObject({ code: 'download_failed' });
+      await vi.advanceTimersByTimeAsync(20);
+      await rejected;
+      expect(destroy).toHaveBeenCalledTimes(1);
+      if (phase === 'body') expect(body.destroyed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { body.destroy(); vi.useRealTimers(); }
   });
 });

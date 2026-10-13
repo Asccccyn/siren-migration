@@ -35,13 +35,22 @@ export const WS_PROTOCOL_VERSION = 2;
 export interface ClientWsCapabilities {
   playback_drain?: boolean;
   stream_identity?: boolean;
+  /** Targeted, idempotent interruption with an independent next input. */
+  voice_interrupt?: boolean;
+}
+
+/** Client-observed playback, never a claim that a person heard the audio. */
+export interface ClientPlaybackProgress {
+  stream_id: string;
+  played_ms: number;
 }
 
 export type ClientWsMessage =
   | { t: 'ready'; protocol?: number; capabilities?: ClientWsCapabilities }
-  | { t: 'start' }
-  | { t: 'end' }
-  | { t: 'abort' }
+  | { t: 'start'; input_id?: string }
+  | { t: 'end'; input_id?: string }
+  | { t: 'abort'; input_id?: string; playback?: ClientPlaybackProgress }
+  | { t: 'interrupt'; target_input_id: string; new_input_id: string; playback?: ClientPlaybackProgress }
   | { t: 'ping' }
   | { t: 'playback_drained'; stream_id: string };
 
@@ -54,18 +63,25 @@ const clientCapabilitiesSchema = z
   .object({
     playback_drain: z.boolean().optional(),
     stream_identity: z.boolean().optional(),
+    voice_interrupt: z.boolean().optional(),
   })
   .passthrough();
 
+const inputIdSchema = z.string().min(1).max(128);
+const playbackSchema = z.object({
+  stream_id: z.string().min(1).max(256),
+  played_ms: z.number().finite().nonnegative()
+});
 const clientWsMessageSchema = z.discriminatedUnion('t', [
   z.object({
     t: z.literal('ready'),
     protocol: z.number().optional(),
     capabilities: clientCapabilitiesSchema.optional()
   }),
-  z.object({ t: z.literal('start') }),
-  z.object({ t: z.literal('end') }),
-  z.object({ t: z.literal('abort') }),
+  z.object({ t: z.literal('start'), input_id: inputIdSchema.optional() }),
+  z.object({ t: z.literal('end'), input_id: inputIdSchema.optional() }),
+  z.object({ t: z.literal('abort'), input_id: inputIdSchema.optional(), playback: playbackSchema.optional() }),
+  z.object({ t: z.literal('interrupt'), target_input_id: inputIdSchema, new_input_id: inputIdSchema, playback: playbackSchema.optional() }),
   z.object({ t: z.literal('ping') }),
   z.object({ t: z.literal('playback_drained'), stream_id: z.string().min(1).max(256) })
 ]);
@@ -88,7 +104,7 @@ export interface WsAudioContract {
   format: 'pcm16';
 }
 
-export type ServerWsMessage =
+export type ServerWsMessage = (
   | {
       t: 'ready';
       protocol: number;
@@ -96,7 +112,9 @@ export type ServerWsMessage =
       /** 服务端调参建议（S1011-015：VAD/jitter 配置的真实下发通道；客户端应用为默认值） */
       vad?: { confirm_ms: number; min_speech_ms: number; end_silence_ms: number; rms_ratio: number };
       jitter_ms?: number;
+      capabilities?: { voice_interrupt: boolean };
     }
+  | { t: 'input_started'; input_id: string }
   | { t: 'partial'; text: string }
   | { t: 'asr'; text: string; language?: string; durationMs?: number }
   | { t: 'state'; state: CallState }
@@ -107,7 +125,8 @@ export type ServerWsMessage =
   | { t: 'metrics'; metrics: TurnLatencyMetrics }
   | { t: 'pong' }
   | { t: 'notice'; code: string; message: string }
-  | { t: 'error'; code: string; message: string };
+  | { t: 'error'; code: string; message: string }
+) & { input_id?: string };
 
 /** 单轮延迟指标（规范第 39 节），随 metrics 帧下发给前端展示 */
 export interface TurnLatencyMetrics {
@@ -125,5 +144,6 @@ export const WS_CLOSE_CODES = {
   SESSION_EXISTS: 4002,
   SERVER_SHUTDOWN: 4003,
   PROTOCOL_ERROR: 4004,
-  BACKPRESSURE_OVERFLOW: 4005
+  BACKPRESSURE_OVERFLOW: 4005,
+  CAPACITY_REACHED: 4006
 } as const;

@@ -4,12 +4,13 @@
  * 职责（音频生产在 reply-pipeline.ts，落库在 call-recorder.ts）：
  * - WebSocket 消息/二进制帧 -> 状态机驱动
  * - ASR 建连 prebuffer（不丢句首）与 final/partial 采纳
- * - Barge-in：abort 真正取消 LLM / TTS / PCM 队列，保留已播出内容
+ * - Barge-in：abort 真正取消 LLM / TTS / PCM 队列，保留已下发前缀与独立的播放证据
  * - 协议帧组装与背压保护（背压超限走幂等 finalize，禁止 zombie session，P0-6）
  */
 import { randomUUID } from 'node:crypto';
 import type {
   CallState,
+  ClientPlaybackProgress,
   ClientWsMessage,
   RealtimeVoiceProvider,
   ServerWsMessage,
@@ -17,7 +18,7 @@ import type {
   WsAudioContract
 } from '@siren/contracts';
 import { WS_PROTOCOL_VERSION, WS_CLOSE_CODES } from '@siren/contracts';
-import type { CoreBridge } from '@siren/core-bridge';
+import type { CoreBridge, CoreInterruption } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import { LatencyTracker, errorFields, type Logger } from '@siren/telemetry';
 import type { SirenConfig } from './config.ts';
@@ -58,6 +59,10 @@ export class CallSession {
   private lastPartialText = '';
   /** 客户端 ready 时上报的 playback_drain 能力（协议 v2） */
   private clientDrainCapable = false;
+  private voiceInterruptCapable = false;
+  private readonly knownInputIds = new Set<string>();
+  private lastInputId: string | undefined;
+  private pendingInterruption: CoreInterruption | undefined;
   /** 等待客户端 playback_drained ACK 的输出流（P0-4） */
   private pendingDrain: { streamId: string; timer: NodeJS.Timeout; sentAt: number; settle: (drained: boolean) => void } | null = null;
 
@@ -79,9 +84,15 @@ export class CallSession {
         fillers: deps.fillers
       },
       {
-        sendJson: (message) => this.sendJson(message),
-        sendRaw: (frame) => this.sendRaw(frame),
-        onFirstAudio: () => this.enterSpeaking()
+        sendJson: (message, turn) => {
+          if (this.turn === turn && !turn.aborted) this.sendJson(message, turn);
+        },
+        sendRaw: (frame, turn) => {
+          if (this.turn === turn && !turn.aborted) this.sendRaw(frame);
+        },
+        onFirstAudio: (turn) => {
+          if (this.turn === turn && !turn.aborted) this.enterSpeaking();
+        }
       }
     );
     void this.deps.fillers.preload();
@@ -117,13 +128,16 @@ export class CallSession {
         this.handleReady(message.protocol, message.capabilities);
         break;
       case 'start':
-        this.handleStart();
+        this.handleStart(message.input_id);
         break;
       case 'end':
-        void this.handleEnd();
+        if (this.matchesInput(message.input_id)) void this.handleEnd();
         break;
       case 'abort':
-        this.handleAbort();
+        if (this.matchesInput(message.input_id)) this.handleAbort(message.playback);
+        break;
+      case 'interrupt':
+        this.handleInterrupt(message);
         break;
       case 'playback_drained':
         this.handlePlaybackDrained(message.stream_id);
@@ -187,11 +201,57 @@ export class CallSession {
   // 用户开始说话
   // -------------------------------------------------------------------------
 
+  private inputError(code: string, message: string, inputId?: string): void {
+    this.sendJson({ t: 'error', code, message, ...(inputId ? { input_id: inputId } : {}) });
+  }
+
+  /** Legacy peers retain manual controls; negotiated peers must target a turn. */
+  private matchesInput(inputId?: string): boolean {
+    if (!this.voiceInterruptCapable) return true;
+    if (!inputId) {
+      this.inputError('input_id_required', 'this operation requires input_id');
+      return false;
+    }
+    // Replayed end/abort for a retired input is a no-op, never a new-turn abort.
+    return this.turn?.inputId === inputId;
+  }
+
+  private handleInterrupt(message: Extract<ClientWsMessage, { t: 'interrupt' }>): void {
+    const nextId = message.new_input_id;
+    if (!this.voiceInterruptCapable) {
+      this.inputError('capability_required', 'negotiate voice_interrupt first', nextId);
+      return;
+    }
+    if (nextId === message.target_input_id) {
+      this.inputError('invalid_input_id', 'new and target input must differ', nextId);
+      return;
+    }
+    if (this.turn?.inputId === nextId) {
+      this.sendJson({ t: 'input_started', input_id: nextId });
+      return;
+    }
+    if (this.knownInputIds.has(nextId)) {
+      this.inputError('retired_input', 'input_id cannot be reused', nextId);
+      return;
+    }
+    if (!this.knownInputIds.has(message.target_input_id) ||
+        (this.turn ? this.turn.inputId !== message.target_input_id : this.lastInputId !== message.target_input_id)) {
+      this.inputError('stale_interrupt', 'target is not the active input', nextId);
+      return;
+    }
+    // Retire the old turn synchronously. Provider cleanup is deliberately not
+    // awaited: the new input obtains its own ASR/prebuffer immediately.
+    if (this.turn) this.handleAbort(message.playback);
+    this.handleStart(nextId);
+  }
+
   /** P1-7：ready 能力协商。只回版本与音频约定，不做复杂 negotiation */
   private handleReady(clientProtocol: number | undefined, capabilities: unknown): void {
     // 记录 playback_drain 能力：决定 pcm_end 后是否等待真正播完再回 listening
-    const caps = (capabilities ?? {}) as { playback_drain?: boolean };
+    const caps = (capabilities ?? {}) as { playback_drain?: boolean; voice_interrupt?: boolean };
     this.clientDrainCapable = caps.playback_drain === true;
+    // Once negotiated, an extra ready frame cannot downgrade targeting guards.
+    this.voiceInterruptCapable ||= caps.voice_interrupt === true;
     // 采样率契约来自 Realtime Provider 边界（P0-7/P1-1），不再假设固定值
     const audio: WsAudioContract = {
       input_rate: this.deps.voice.inputSampleRate,
@@ -202,6 +262,7 @@ export class CallSession {
       t: 'ready',
       protocol: WS_PROTOCOL_VERSION,
       audio,
+      capabilities: { voice_interrupt: this.voiceInterruptCapable },
       // S1011-015：VAD/jitter 服务端配置随 ready 下发，客户端作为默认参数
       vad: {
         confirm_ms: this.deps.config.vad.confirmMs,
@@ -221,22 +282,44 @@ export class CallSession {
     this.sendJson({ t: 'state', state: this.state });
   }
 
-  private handleStart(): void {
+  private handleStart(inputId?: string): void {
+    if (this.voiceInterruptCapable) {
+      if (!inputId) {
+        this.inputError('input_id_required', 'start requires input_id');
+        return;
+      }
+      if (this.knownInputIds.has(inputId)) {
+        if (this.turn?.inputId === inputId) this.sendJson({ t: 'input_started', input_id: inputId });
+        else this.inputError('retired_input', 'input_id cannot be reused', inputId);
+        return;
+      }
+    }
     if (!this.stateMachine.is('idle', 'listening')) {
-      this.sendJson({ t: 'error', code: 'invalid_state', message: `cannot start in state=${this.state}` });
+      this.inputError('invalid_state', `cannot start in state=${this.state}`, inputId);
+      return;
+    }
+    if (this.turn && this.voiceInterruptCapable) {
+      this.inputError('input_active', 'use interrupt to replace an active input', inputId);
       return;
     }
     if (this.turn) {
       // 上一轮输入未收尾：静默丢弃并重建
+      this.turn.aborted = true;
       this.turn.asr.abort();
     }
+    this.lastPartialText = '';
     if (this.stateMachine.state === 'idle') {
       this.stateMachine.transition('listening');
     }
     this.turnIndex++;
+    const nextInputId = inputId ?? randomUUID();
+    this.knownInputIds.add(nextInputId);
+    this.lastInputId = nextInputId;
     const turn: ActiveTurn = {
       index: this.turnIndex,
       turnId: randomUUID(),
+      inputId: nextInputId,
+      interruptedTurn: this.pendingInterruption,
       outputStreamId: newOutputStreamId(),
       nextSequence: 0,
       userText: '',
@@ -247,7 +330,7 @@ export class CallSession {
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
         (text) => {
           // F09：旧 turn 的迟到 partial 不得写入共享 lastPartialText / 转发给客户端
-          if (this.turn !== turn || this.closed) return;
+          if (this.turn !== turn || turn.aborted || this.closed || this.closing) return;
           turn.asrPartials += 1;
           this.lastPartialText = text;
           this.sendJson({ t: 'partial', text });
@@ -261,7 +344,7 @@ export class CallSession {
       aborted: false,
       ttsAbort: new AbortController(),
       fullText: '',
-      playedText: '',
+      sentText: '',
       pcmStarted: false,
       written: false
     };
@@ -279,6 +362,9 @@ export class CallSession {
         });
       })
       .catch(() => undefined);
+    // ACK means this input owns a prebuffer; neither old cleanup nor ASR's
+    // network handshake blocks acceptance of the next utterance.
+    if (this.voiceInterruptCapable) this.sendJson({ t: 'input_started', input_id: nextInputId });
     this.sendJson({ t: 'state', state: 'listening' });
     this.log.info('turn_started', { turn_index: this.turnIndex, turn_id: this.turn.turnId });
   }
@@ -289,6 +375,7 @@ export class CallSession {
 
   private async handleEnd(): Promise<void> {
     const turn = this.turn;
+    if (this.voiceInterruptCapable && turn && !this.stateMachine.is('listening')) return;
     if (!turn || !this.stateMachine.is('listening')) {
       this.sendJson({ t: 'error', code: 'invalid_state', message: `cannot end in state=${this.state}` });
       return;
@@ -360,21 +447,21 @@ export class CallSession {
   private async runReplyPhase(turn: ActiveTurn): Promise<void> {
     if (turn.aborted || this.turn !== turn) return;
     this.stateMachine.transition('thinking');
+    if (this.pendingInterruption === turn.interruptedTurn) this.pendingInterruption = undefined;
     this.sendJson({ t: 'state', state: 'thinking' });
 
     const result = await this.pipeline.run(turn);
 
-    if (result.status === 'aborted' || this.closed) {
+    if (result.status === 'aborted' || turn.aborted || this.turn !== turn || this.closed) {
       // 打断路径：interrupted / reply 已由 handleAbort 同步下发
       return;
     }
     if (result.status === 'failed') {
       // TTS / Core 失败：保留文字，明确降级（规范第 40 节）。
       // S1011-021：Core 中途失败时已收到的原始文本独立保留并下发（含未成句的半句），
-      // 与"已播放正文"（fullText/playedText）语义分离
+      // 与已下发正文（sentText）语义分离；仅在统一出口发布 reply。
       if (result.kind === 'core' && turn.receivedText) {
         turn.fullText = turn.receivedText;
-        this.sendJson({ t: 'reply', text: turn.receivedText });
       }
       this.log.warn('turn_failed', {
         ...errorFields(result.error),
@@ -432,9 +519,21 @@ export class CallSession {
   // Barge-in（规范第 20 节）
   // -------------------------------------------------------------------------
 
-  private handleAbort(): void {
+  private handleAbort(playback?: ClientPlaybackProgress): void {
+    const interrupted = this.turn;
+    if (interrupted && (interrupted.userText || interrupted.receivedText)) {
+      this.pendingInterruption = {
+        turnId: interrupted.turnId,
+        inputId: interrupted.inputId,
+        outputStreamId: interrupted.outputStreamId,
+        playback: playback?.stream_id === interrupted.outputStreamId
+          ? { basis: 'client_reported', playedMs: playback.played_ms }
+          : { basis: 'unknown' }
+      };
+    }
     if (this.stateMachine.is('idle', 'listening')) {
       // 收回未提交的输入：丢弃当前 utterance
+      if (this.turn) this.turn.aborted = true;
       this.turn?.asr.abort();
       this.turn = null;
       this.lastPartialText = '';
@@ -447,6 +546,11 @@ export class CallSession {
         this.backToListening();
         return;
       }
+      // ENDING may have a real partial but no adopted transcript yet. Preserve
+      // that draft in the interrupted record; do not merge it into the new input
+      // or pretend it was finalized/committed to Core.
+      const inputStatus = turn.userText ? 'adopted' : this.lastPartialText ? 'partial' : 'unrecognized';
+      if (!turn.userText && this.lastPartialText) turn.userText = this.lastPartialText;
       if (this.stateMachine.is('speaking')) {
         this.stateMachine.transition('interrupting');
       }
@@ -454,7 +558,7 @@ export class CallSession {
       // 旧输出流永久失效（P0-3）：客户端凭 stream_id 丢弃迟到 chunk，且不再要求 drained
       this.clearPendingDrain('interrupted');
       this.sendJson({ t: 'interrupted', stream_id: turn.outputStreamId });
-      // 保留已真正播出的内容（规范第 20 节第 6 条）
+      // 只保留已完整下发的句子前缀；客户端实际播放另有证据字段。
       if (turn.fullText) {
         this.sendJson({ t: 'reply', text: turn.fullText });
       }
@@ -464,7 +568,8 @@ export class CallSession {
       this.sendJson({ t: 'metrics', metrics: turn.metrics.compute() });
       this.log.info('turn_interrupted', {
         turn_index: turn.index,
-        played_len: turn.playedText.length,
+        input_status: inputStatus,
+        sent_len: turn.sentText.length,
         total_len: turn.fullText.length
       });
       this.backToListening();
@@ -479,8 +584,9 @@ export class CallSession {
     turn.asr.abort();
     // 立即终止 TTS provider 上游流（P0-2/P0-9：不是只停止消费）
     if (!turn.ttsAbort.signal.aborted) turn.ttsAbort.abort();
-    // 先截取已播出文本，保证随后落库/下发的都是真正播出的内容（规范第 20 节第 6 条）
-    turn.fullText = turn.playedText;
+    // This prefix was sent, not necessarily played. Core receives separate
+    // explicitly client-reported/unknown playback evidence on the next turn.
+    turn.fullText = turn.sentText;
     void this.deps.core.cancel(turn.turnId).catch(() => undefined);
     this.log.debug('turn_abort', { reason, turn_index: turn.index });
   }
@@ -565,9 +671,14 @@ export class CallSession {
     this.deps.send('binary', frame);
   }
 
-  private sendJson(message: ServerWsMessage): void {
+  private sendJson(message: ServerWsMessage, turn = this.turn): void {
     if (this.closed) return;
-    this.deps.send(JSON.stringify(message));
+    const inputId = turn?.inputId ?? this.lastInputId;
+    this.deps.send(JSON.stringify(
+      this.voiceInterruptCapable && inputId && message.t !== 'ready' && message.t !== 'pong'
+        ? { ...message, input_id: message.input_id ?? inputId }
+        : message
+    ));
   }
 
   private writeTurn(turn: ActiveTurn, outcome: TurnOutcome): void {

@@ -1,7 +1,8 @@
 /** MCP Tool: voice_speak（规范第 12 节）。text 与 tts_script 必须分离。 */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { voiceSpeakInputSchema } from '@siren/contracts';
-import type { Logger } from '@siren/telemetry';
+import { errorFields, type Logger } from '@siren/telemetry';
+import { FieldDecryptionError } from '@siren/storage';
 import type { VoiceService } from '@siren/voice-core';
 import { serializeAsset } from '../../routes/voice-message.ts';
 import { VOICE_PLAYER_TOOL_META } from '../voice-player.ts';
@@ -45,11 +46,11 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           language: parsed.data.language
         });
         deps.logger.info('mcp_tool_called', { tool: 'voice_speak', voice_message_id: asset.id });
-        // S1011-035：不回显 text/tts_script——调用方刚发过它们，回显只消耗其对端
-        // 模型上下文 token；audio_url 短时效，消费即取（voice_message_id 可长期引用回读）
+        // 播放器只接收 tool-result，必须随结果提供展示正文；不公开 TTS 专用脚本。
         const payload = {
           voice_message_id: asset.id,
           audio_url: asset.audioUrl,
+          text: asset.text,
           duration_ms: asset.durationMs,
           format: asset.audioFormat
         };
@@ -64,10 +65,11 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           _meta: VOICE_PLAYER_TOOL_META
         };
       } catch (error) {
-        deps.logger.warn('mcp_tool_failed', { tool: 'voice_speak', error_message: (error as Error).message });
+        const code = error instanceof FieldDecryptionError ? 'data_unreadable' : 'tts_failed';
+        deps.logger.warn('mcp_tool_failed', { tool: 'voice_speak', ...errorFields(error) });
         return {
           isError: true,
-          content: [{ type: 'text', text: JSON.stringify({ error: 'tts_failed', message: (error as Error).message }) }]
+          content: [{ type: 'text', text: JSON.stringify({ error: code }) }]
         };
       }
     }

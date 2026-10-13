@@ -1,7 +1,7 @@
 /**
  * OAuth 无状态令牌（HMAC 签名，密钥复用 SirenConfig.signingSecret）。
  * 格式：<random>.<payload-b64url>.<hmac-b64url>，payload = { t, e, c }（类型/过期/客户端）。
- * 不落库：重启不失效；吊销走进程内 denylist（best-effort，重启后旧 denylist 清空）。
+ * 令牌不落库；吊销与 refresh 消费记录须由持久名单提交，正常重启保持有效。
  *
  * 规范形态（S1011-001 修复）：验证只接受严格规范编码——三段均为无填充、
  * 可逆往返一致的 base64url。等价编码变体（尾缀字符、'=' 填充等）一律拒绝，

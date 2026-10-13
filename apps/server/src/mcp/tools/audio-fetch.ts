@@ -206,126 +206,107 @@ export async function assertPublicHttpUrl(rawUrl: string): Promise<URL> {
   return (await resolveOutbound(rawUrl)).url;
 }
 
-/** 已校验地址的连接器 lookup：连接阶段不再独立解析（DNS 重绑定防护的落点） */
+/** 连接仍使用原 Host/TLS 名称，DNS 只返回已经校验的地址。 */
 function pinnedLookup(addresses: LookupAddress[]): NonNullable<RequestOptions['lookup']> {
-  return ((_hostname: string, _options: unknown, callback: (err: Error | null, addrs: LookupAddress[]) => void) => {
-    callback(null, addresses);
+  return ((_hostname: string, options: { all?: boolean; family?: number }, callback: (...args: unknown[]) => void) => {
+    const choices = options.family ? addresses.filter((entry) => entry.family === options.family) : addresses;
+    if (choices.length === 0) { callback(new Error('no validated address for requested family')); return; }
+    if (options.all) callback(null, choices);
+    else callback(null, choices[0]!.address, choices[0]!.family);
   }) as unknown as NonNullable<RequestOptions['lookup']>;
 }
 
-interface PinnedResponse {
-  res: IncomingMessage;
-  /** 调用方读完/放弃 body 后必须调用（解除超时计时器对 socket 的持有） */
-  settled: () => void;
+/** DNS 没有可取消的底层句柄；晚到的解析只能被丢弃，绝不能继续建连。 */
+function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
 }
 
-/** 发起到已校验目标的请求；超时覆盖建连+响应头+body（body 结束须调 settled） */
-function sendPinned(target: OutboundTarget, timeoutMs: number): Promise<PinnedResponse> {
+/** 同一 abort 信号负责响应头之前的 Promise 与响应头之后的 body。 */
+function sendPinned(target: OutboundTarget, signal: AbortSignal): Promise<IncomingMessage> {
   return new Promise((resolve, reject) => {
-    const doRequest = target.url.protocol === 'https:' ? httpsRequest : httpRequest;
-    const options: RequestOptions = {
-      headers: { 'user-agent': 'siren-audio-fetch', accept: '*/*' }
-    };
+    if (signal.aborted) { reject(signal.reason); return; }
+    const options: RequestOptions = { headers: { 'user-agent': 'siren-audio-fetch', accept: '*/*' } };
     if (target.pinned) options.lookup = pinnedLookup(target.pinned);
-    const req = doRequest(target.url, options);
-    let done = false;
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      req.destroy(new Error(`audio fetch timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-    const settle = (fn: () => void) => {
-      if (done) return;
-      done = true;
-      fn();
+    const req = (target.url.protocol === 'https:' ? httpsRequest : httpRequest)(target.url, options);
+    let response: IncomingMessage | undefined;
+    let finished = false;
+    const finish = () => {
+      finished = true;
+      signal.removeEventListener('abort', abort);
     };
+    const fail = (error: Error) => {
+      if (finished) return;
+      finish();
+      reject(error); // 头前结束等待；头后由 destroy(error) 解锁 body 读取。
+      response?.destroy(error);
+      req.destroy(error);
+    };
+    const abort = () => fail(signal.reason as Error);
+    signal.addEventListener('abort', abort, { once: true });
+    req.on('error', fail);
     req.on('response', (res) => {
-      settle(() => {
-        resolve({
-          res,
-          settled: () => {
-            clearTimeout(timer);
-          }
-        });
-      });
-      // body 结束/中断同样解除计时器（超时不再作用于已完结的响应）
-      res.on('end', () => clearTimeout(timer));
-      res.on('close', () => clearTimeout(timer));
-    });
-    req.on('error', (error) => {
-      settle(() => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      clearTimeout(timer);
+      if (finished) { res.destroy(); return; }
+      response = res;
+      res.once('end', finish);
+      res.once('close', finish);
+      res.once('error', fail);
+      resolve(res);
     });
     req.end();
   });
 }
 
-// ---------------------------------------------------------------------------
-// 受限下载
-// ---------------------------------------------------------------------------
-
-export async function downloadWithLimits(rawUrl: string, options: AudioDownloadOptions): Promise<AudioDownload> {
-  const maxRedirects = options.maxRedirects ?? 3;
-  let current = await resolveOutbound(rawUrl);
-  let response: PinnedResponse;
-  for (let hop = 0; ; hop++) {
-    response = await sendPinned(current, options.timeoutMs);
-    const status = response.res.statusCode ?? 0;
-    if (status >= 300 && status < 400) {
-      const location = response.res.headers.location;
-      response.res.destroy();
-      response.settled();
-      if (!location) {
-        throw new AudioFetchError('download_failed', `redirect without location: ${status}`);
-      }
-      if (hop >= maxRedirects) {
-        throw new AudioFetchError('download_failed', 'too many redirects');
-      }
-      // 每一跳重定向都重新做出站校验（F03：不校验重定向目标等于没有校验）
-      current = await resolveOutbound(new URL(location, current.url).toString());
-      continue;
-    }
-    break;
-  }
-  const status = response.res.statusCode ?? 0;
-  if (status < 200 || status >= 300) {
-    response.res.destroy();
-    response.settled();
-    throw new AudioFetchError('download_failed', `audio download failed: ${status}`);
-  }
-
-  // F21：Content-Length 提前拒绝（声明即拒绝，不等分配）
-  const declaredLength = Number(response.res.headers['content-length'] ?? '0');
-  if (Number.isFinite(declaredLength) && declaredLength > options.maxBytes) {
-    response.res.destroy();
-    response.settled();
+async function readAudio(response: IncomingMessage, maxBytes: number): Promise<AudioDownload> {
+  const status = response.statusCode ?? 0;
+  if (status < 200 || status >= 300) throw new AudioFetchError('download_failed', `audio download failed: ${status}`);
+  const declaredLength = Number(response.headers['content-length'] ?? '0');
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new AudioFetchError('too_large', `audio too large: declared ${declaredLength} bytes`);
   }
-
-  // F21：流式累计，越界立即取消读——没有"先全量 arrayBuffer 再检查"的窗口
   const chunks: Buffer[] = [];
   let total = 0;
   try {
-    for await (const chunk of response.res) {
+    for await (const chunk of response) {
       total += chunk.length;
-      if (total > options.maxBytes) {
-        throw new AudioFetchError('too_large', `audio too large: exceeded ${options.maxBytes} bytes`);
-      }
+      if (total > maxBytes) throw new AudioFetchError('too_large', `audio too large: exceeded ${maxBytes} bytes`);
       chunks.push(chunk);
     }
   } catch (error) {
-    response.res.destroy();
     if (error instanceof AudioFetchError) throw error;
-    throw new AudioFetchError('download_failed', `audio download interrupted: ${(error as Error).message}`);
-  } finally {
-    response.settled();
+    throw new AudioFetchError('download_failed', 'audio download interrupted');
   }
-  return {
-    audio: Buffer.concat(chunks),
-    contentType: response.res.headers['content-type'] ?? '',
-    bytes: total
-  };
+  return { audio: Buffer.concat(chunks), contentType: response.headers['content-type'] ?? '', bytes: total };
+}
+
+/** 一个绝对期限覆盖 DNS、每次重定向、连接、响应头及 body。 */
+export async function downloadWithLimits(rawUrl: string, options: AudioDownloadOptions): Promise<AudioDownload> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new AudioFetchError('download_failed', 'audio download timed out'));
+  }, options.timeoutMs);
+  const signal = controller.signal;
+  try {
+    let current = await withAbort(resolveOutbound(rawUrl), signal);
+    for (let hop = 0; ; hop++) {
+      const response = await sendPinned(current, signal);
+      try {
+        const status = response.statusCode ?? 0;
+        if (status < 300 || status >= 400) return await readAudio(response, options.maxBytes);
+        const location = response.headers.location;
+        response.destroy();
+        if (!location) throw new AudioFetchError('download_failed', `redirect without location: ${status}`);
+        if (hop >= (options.maxRedirects ?? 3)) throw new AudioFetchError('download_failed', 'too many redirects');
+        current = await withAbort(resolveOutbound(new URL(location, current.url).toString()), signal);
+      } finally {
+        response.destroy();
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }

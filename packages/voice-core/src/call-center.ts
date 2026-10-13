@@ -15,6 +15,7 @@ import type { SirenConfig } from './config.ts';
 import type { FillerManager } from './filler-manager.ts';
 import { CascadeRealtimeProvider } from './realtime-provider.ts';
 import type { VoiceProfileRegistry } from './voice-profile.ts';
+import { assertTtsProfileCompatible } from './voice-profile.ts';
 
 export interface CallCenterDeps {
   config: SirenConfig;
@@ -74,6 +75,7 @@ export class CallCenter {
     const callId = randomUUID();
     const fallback = this.deps.profiles.defaultProfileId() ?? 'main';
     const profile = this.deps.profiles.get(params.voiceProfileId ?? undefined, fallback);
+    assertTtsProfileCompatible(profile, this.deps.ttsName);
     const conversationId = params.conversationId ?? null;
     // 上下文在签发时刻冻结：token 属于哪个 conversation / profile 由服务端唯一决定
     const { token, expiresAt } = this.tokens.issue(callId, conversationId, profile.id);
@@ -122,8 +124,14 @@ export class CallCenter {
     close: (code: number, reason: string) => void;
   }): CallSession | null {
     if (this.sessions.has(params.callId)) return null;
+    // Tokens are reservations, not resource permits. Enforce capacity at the
+    // synchronous registration point so pre-issued tokens cannot bypass it.
+    if (this.sessions.size >= this.deps.config.maxConcurrentCalls) {
+      throw new Error('call_capacity_reached');
+    }
     const fallback = this.deps.profiles.defaultProfileId() ?? 'main';
     const baseProfile = this.deps.profiles.get(params.reservation.voiceProfileId, fallback);
+    assertTtsProfileCompatible(baseProfile, this.deps.ttsName);
     const profile = { ...baseProfile, voiceId: this.deps.profiles.resolveVoiceId(baseProfile) };
     const session = new CallSession({
       config: this.deps.config,

@@ -11,7 +11,7 @@ import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { SqliteDatabase } from '@siren/storage';
-import { deriveFieldCipher } from '@siren/storage';
+import { deriveFieldCipher, FieldDecryptionError } from '@siren/storage';
 import {
   CallSessionsRepository,
   CallTurnsRepository,
@@ -32,7 +32,7 @@ import {
 } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { createLogger } from '@siren/telemetry';
-import { registerAuthHook } from './auth.ts';
+import { registerAuthHook, normalizeRequestPath } from './auth.ts';
 import { createOAuth } from './oauth/index.ts';
 import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
@@ -73,9 +73,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
       logTranscripts: config.logTranscripts
     });
 
-  const db = options.db ?? openDatabase(config.databasePath);
-  // S1011-013：DB 正文字段静态加密（SIREN_DATA_KEY 优先，否则从签名密钥派生；懒迁移兼容旧行）
+  // Validate key syntax before acquiring the database. Old plaintext is read-only compatibility, not a migration.
   const fieldCipher = deriveFieldCipher({ dataKey: config.dataKey, signingSecret: config.signingSecret });
+  const db = options.db ?? openDatabase(config.databasePath);
   const providers = options.providers ?? buildProviders(config, logger);
   for (const warning of providers.warnings) {
     logger.warn('config_warning', { message: warning });
@@ -107,21 +107,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     }
   }
 
-  // S1011-022：profile.provider 与实际装配的供应商一致性——错配会让音色跨供应商
-  // 错用（如 profile 标 volc 而异步链路是 elevenlabs）。生产 fail-closed，开发告警。
-  const activeProviderNames = new Set(
-    [providers.active.asr, providers.active.asyncTts, providers.active.realtimeTts]
-      .map((name) => name.split('(')[0]!.trim())
-  );
-  for (const profile of profiles.list()) {
-    if (profile.provider !== 'mock' && !activeProviderNames.has(profile.provider)) {
-      const message = `音色档案 ${profile.id} 声明 provider=${profile.provider}，与实际装配（${[...activeProviderNames].join('/')}）不符——音色将跨供应商错配`;
-      if (config.env === 'production') {
-        throw new Error(message);
-      }
-      logger.warn('config_warning', { message });
-    }
-  }
+  // Each TTS operation validates its selected profile against that exact provider.
+  // An unused profile may belong to another supported chain; ASR membership cannot validate a TTS voice.
 
   const fillers =
     options.fillers ??
@@ -164,6 +151,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   const app = Fastify({
     logger: false,
     bodyLimit: 1024 * 1024
+  });
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof FieldDecryptionError) {
+      logger.error('stored_data_unreadable', { code: error.code });
+      void reply.code(503).send({ error: error.code });
+      return;
+    }
+    void reply.send(error);
   });
 
   await app.register(fastifyCors, {
@@ -227,13 +222,19 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   // S1011-009：fastifyStatic 的 setHeaders 会被插件自身回复头逻辑覆盖——
   // 缓存策略在 onSend（最终响应头层）统一落实，并用真实响应断言
   if (existsSync(config.webDir)) {
+    app.addHook('onRequest', async (request, reply) => {
+      const path = normalizeRequestPath(request.url);
+      if (path.startsWith('/assets/') && /\.html?$/i.test(path)) {
+        await reply.code(404).send({ error: 'not_found' });
+      }
+    });
     await app.register(fastifyStatic, {
       root: config.webDir,
       prefix: '/assets/',
       index: false
     });
     app.addHook('onSend', async (request, reply, payload) => {
-      if (request.url.split('?')[0]!.startsWith('/assets/')) {
+      if (normalizeRequestPath(request.url).startsWith('/assets/')) {
         reply.header('cache-control', 'no-cache');
       }
       return payload;

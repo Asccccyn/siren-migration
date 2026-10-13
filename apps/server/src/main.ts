@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { assertProductionReadiness, loadConfig } from '@siren/voice-core';
 import { buildApp } from './app.ts';
 import { cleanupTmpDir, ensureTmpDir } from './tmp-files.ts';
+import { errorFields } from '@siren/telemetry';
 
 async function bootstrap(): Promise<void> {
   try {
@@ -61,6 +62,6 @@ async function bootstrap(): Promise<void> {
 }
 
 bootstrap().catch((error) => {
-  console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', event: 'startup_failed', error_message: error instanceof Error ? error.message : String(error) }));
+  console.error(JSON.stringify({ ts: new Date().toISOString(), level: 'error', event: 'startup_failed', ...errorFields(error) }));
   process.exit(1);
 });

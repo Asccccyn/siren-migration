@@ -34,7 +34,8 @@ interface VolcTtsResponse {
 export class VolcBatchTtsProvider implements BatchTtsProvider {
   constructor(private readonly config: VolcTtsConfig) {}
 
-  async synthesize(request: TtsRequest): Promise<TtsAudioResult> {
+  async synthesize(request: TtsRequest, signal?: AbortSignal): Promise<TtsAudioResult> {
+    signal?.throwIfAborted();
     const voiceId = request.profile.voiceId;
     if (!voiceId) {
       throw new ProviderError('provider_unavailable', 'volc-tts', 'voice id missing (set VOLC_VOICE_ID or profile voiceId)');
@@ -68,7 +69,9 @@ export class VolcBatchTtsProvider implements BatchTtsProvider {
         Authorization: `Bearer;${this.config.accessToken}`
       },
       body,
-      signal: AbortSignal.timeout(this.config.timeoutMs)
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)])
+        : AbortSignal.timeout(this.config.timeoutMs)
     });
     if (!response.ok) {
       throw new ProviderError('tts_failed', 'volc-tts', `tts http ${response.status}`);

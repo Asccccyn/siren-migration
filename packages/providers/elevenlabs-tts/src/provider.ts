@@ -80,13 +80,14 @@ function mapFormat(format: AudioFormat, sampleRateHint: number): {
 export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
   constructor(private readonly config: ElevenLabsConfig) {}
 
-  async synthesize(request: TtsRequest): Promise<TtsAudioResult> {
+  async synthesize(request: TtsRequest, signal?: AbortSignal): Promise<TtsAudioResult> {
+    signal?.throwIfAborted();
     const voiceId = request.profile.voiceId;
     if (!voiceId) {
       throw new ProviderError('provider_unavailable', 'elevenlabs', 'voice id missing (set ELEVENLABS_VOICE_ID or profile voiceId)');
     }
     const mapped = mapFormat(request.format, request.sampleRate ?? 0);
-    const audio = await this.rawRequest(voiceId, request, mapped.outputFormat);
+    const audio = await this.rawRequest(voiceId, request, mapped.outputFormat, signal);
     return {
       audio,
       // 如实上报：请求 wav 但拿回 pcm 时格式就是 pcm，MIME/扩展名按此为准
@@ -154,10 +155,11 @@ export class ElevenLabsTtsProvider implements TtsProvider, StreamTtsProvider {
     return this.post(voiceId, request, outputFormat, '/stream', combined);
   }
 
-  private async rawRequest(voiceId: string, request: TtsRequest, outputFormat: string): Promise<Buffer> {
+  private async rawRequest(voiceId: string, request: TtsRequest, outputFormat: string, signal?: AbortSignal): Promise<Buffer> {
     let response: Response;
     try {
-      response = await this.post(voiceId, request, outputFormat, '', AbortSignal.timeout(this.config.timeoutMs));
+      const timeout = AbortSignal.timeout(this.config.timeoutMs);
+      response = await this.post(voiceId, request, outputFormat, '', signal ? AbortSignal.any([signal, timeout]) : timeout);
     } catch (error) {
       if (error instanceof ProviderError) throw error;
       // F16：批量路径的网络故障同样归类 tts_failed（REST 层才能回 502 而不是 500）

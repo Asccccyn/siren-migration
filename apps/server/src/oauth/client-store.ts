@@ -1,14 +1,11 @@
-/**
- * OAuth 客户端注册表（RFC 7591 动态注册的结果落盘）。
- * JSON 文件存 data/oauth-clients.json，原子写（tmp+rename）；注册必须跨重启存活，
- * 否则客户端 refresh_token 会因 client 丢失而失效，用户就得重新走一遍授权。
- */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+/** OAuth 注册表：单进程串行事务；提交成功后才发布内存状态。 */
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { isMissingFile, OAuthStateError, writeOAuthState } from './state-file.ts';
 
-/** 注册表总量上限（S1011-007：公开 DCR 的容量边界；超限拒绝新注册） */
 const MAX_CLIENTS = 200;
+const PENDING_TTL_MS = 24 * 3600_000;
 
 export interface OAuthClient {
   clientId: string;
@@ -17,82 +14,140 @@ export interface OAuthClient {
   redirectUris: string[];
   clientName: string;
   createdAt: string;
+  /** null=新注册待人类授权；缺省为旧版档案，保守保护，不自动删除。 */
+  authorizedAt?: string | null;
 }
 
-interface StoreFile {
-  clients: Record<string, OAuthClient>;
+export class RegistrationCapacityError extends Error {
+  constructor() { super('registration_capacity_reached'); }
+}
+
+function validClient(value: unknown, id: string): value is OAuthClient {
+  if (!value || typeof value !== 'object') return false;
+  const c = value as Partial<OAuthClient>;
+  return c.clientId === id && typeof c.clientName === 'string' &&
+    typeof c.createdAt === 'string' && Number.isFinite(Date.parse(c.createdAt)) &&
+    (c.clientSecret === null || typeof c.clientSecret === 'string') &&
+    (c.tokenEndpointAuthMethod === 'none' || c.tokenEndpointAuthMethod === 'client_secret_post') &&
+    Array.isArray(c.redirectUris) && c.redirectUris.every((uri) => typeof uri === 'string') &&
+    (c.authorizedAt === undefined || c.authorizedAt === null ||
+      (typeof c.authorizedAt === 'string' && Number.isFinite(Date.parse(c.authorizedAt))));
+}
+
+function expiredPending(client: OAuthClient): boolean {
+  return client.authorizedAt === null && Date.parse(client.createdAt) + PENDING_TTL_MS <= Date.now();
 }
 
 export class OAuthClientStore {
   private readonly file: string;
   private clients: Record<string, OAuthClient> = {};
-  /** S1011-006：persist 串行化——单写者链，杜绝并发 tmp/rename 互踩 */
   private writeChain: Promise<void> = Promise.resolve();
+  private writeFailed = false;
 
-  constructor(dataDir: string) {
-    this.file = join(dataDir, 'oauth-clients.json');
-  }
+  constructor(dataDir: string) { this.file = join(dataDir, 'oauth-clients.json'); }
 
   async load(): Promise<void> {
     try {
-      const raw = JSON.parse(await readFile(this.file, 'utf8')) as StoreFile;
-      this.clients = raw.clients ?? {};
-    } catch {
-      this.clients = {};
-    }
-    // S1011-007：容量边界——超出上限裁掉最旧的注册（按 createdAt）
-    const entries = Object.values(this.clients).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    if (entries.length > MAX_CLIENTS) {
-      for (const victim of entries.slice(0, entries.length - MAX_CLIENTS)) delete this.clients[victim.clientId];
-      await this.persist();
+      const raw = JSON.parse(await readFile(this.file, 'utf8')) as { clients?: unknown };
+      if (!raw || !raw.clients || typeof raw.clients !== 'object' || Array.isArray(raw.clients)) {
+        throw new OAuthStateError();
+      }
+      const clients: Record<string, OAuthClient> = {};
+      for (const [id, value] of Object.entries(raw.clients)) {
+        if (!validClient(value, id)) throw new OAuthStateError();
+        Object.defineProperty(clients, id, { value, enumerable: true, configurable: true, writable: true });
+      }
+      this.clients = clients;
+    } catch (error) {
+      if (!isMissingFile(error)) throw new OAuthStateError();
     }
   }
 
-  private persist(): Promise<void> {
-    // S1011-006：串行提交 + 唯一临时文件；失败不吞（调用方上抛），链不断
-    const job = this.writeChain.then(() => this.writeNow());
-    this.writeChain = job.catch(() => undefined);
+  private transact<T>(update: (next: Record<string, OAuthClient>) => T): Promise<T> {
+    const job = this.writeChain.then(async () => {
+      const next = { ...this.clients };
+      const result = update(next);
+      try {
+        await writeOAuthState(this.file, { clients: next });
+        this.writeFailed = false;
+      } catch (error) {
+        this.writeFailed = true;
+        throw error;
+      }
+      this.clients = next;
+      return result;
+    });
+    this.writeChain = job.then(() => undefined, () => undefined);
     return job;
   }
 
-  private async writeNow(): Promise<void> {
-    await mkdir(dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-    await writeFile(tmp, JSON.stringify({ clients: this.clients }, null, 2), 'utf8');
-    await rename(tmp, this.file);
+  async flush(): Promise<void> {
+    await this.writeChain;
+    if (this.writeFailed) throw new OAuthStateError();
   }
 
-  get size(): number {
-    return Object.keys(this.clients).length;
-  }
+  get size(): number { return Object.keys(this.clients).length; }
 
-  async register(input: {
+  register(input: {
     clientName: string;
     redirectUris: string[];
     tokenEndpointAuthMethod: 'none' | 'client_secret_post';
   }): Promise<OAuthClient> {
-    if (Object.keys(this.clients).length >= MAX_CLIENTS) {
-      throw new Error('registration_capacity_reached');
-    }
-    const clientId = `siren-${randomBytes(12).toString('base64url')}`;
-    const client: OAuthClient = {
-      clientId,
-      clientSecret:
-        input.tokenEndpointAuthMethod === 'client_secret_post'
-          ? randomBytes(24).toString('base64url')
-          : null,
-      tokenEndpointAuthMethod: input.tokenEndpointAuthMethod,
-      redirectUris: input.redirectUris,
-      clientName: input.clientName,
-      createdAt: new Date().toISOString()
-    };
-    this.clients[clientId] = client;
-    await this.persist();
-    return client;
+    return this.transact((next) => {
+      for (const client of Object.values(next)) {
+        if (expiredPending(client)) delete next[client.clientId];
+      }
+      while (Object.keys(next).length >= MAX_CLIENTS) {
+        const oldest = Object.values(next).filter((c) => c.authorizedAt === null)
+          .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+        if (!oldest) throw new RegistrationCapacityError();
+        // 匿名注册不能永久占满容量；已授权和旧版客户端始终保留。
+        delete next[oldest.clientId];
+      }
+      const client: OAuthClient = {
+        clientId: `siren-${randomBytes(12).toString('base64url')}`,
+        clientSecret: input.tokenEndpointAuthMethod === 'client_secret_post' ? randomBytes(24).toString('base64url') : null,
+        tokenEndpointAuthMethod: input.tokenEndpointAuthMethod,
+        redirectUris: [...input.redirectUris],
+        clientName: input.clientName,
+        createdAt: new Date().toISOString(),
+        authorizedAt: null
+      };
+      next[client.clientId] = client;
+      return client;
+    });
+  }
+
+  /** 在发授权码前可靠标记：容量回收不得淘汰人类已授权的客户端。 */
+  authorize(clientId: string): Promise<boolean> {
+    return this.transact((next) => {
+      const client = Object.hasOwn(next, clientId) ? next[clientId] : undefined;
+      if (!client || expiredPending(client)) return false;
+      next[clientId] = { ...client, authorizedAt: client.authorizedAt ?? new Date().toISOString() };
+      return true;
+    });
   }
 
   find(clientId: string): OAuthClient | null {
-    return this.clients[clientId] ?? null;
+    const client = Object.hasOwn(this.clients, clientId) ? this.clients[clientId] : undefined;
+    return client && !expiredPending(client) ? client : null;
+  }
+
+  list(): { client_id: string; client_name: string; created_at: string; pending: boolean }[] {
+    return Object.values(this.clients).map((client) => ({
+      client_id: client.clientId,
+      client_name: client.clientName,
+      created_at: client.createdAt,
+      pending: client.authorizedAt === null
+    }));
+  }
+
+  remove(clientId: string): Promise<boolean> {
+    return this.transact((next) => {
+      const found = Object.hasOwn(next, clientId);
+      delete next[clientId];
+      return found;
+    });
   }
 
   verifySecret(client: OAuthClient, secret: string | undefined): boolean {
@@ -100,8 +155,6 @@ export class OAuthClientStore {
     if (!client.clientSecret || !secret) return false;
     const a = Buffer.from(secret);
     const b = Buffer.from(client.clientSecret);
-    let diff = a.length ^ b.length;
-    for (let i = 0; i < Math.min(a.length, b.length); i++) diff |= a[i]! ^ b[i]!;
-    return diff === 0;
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 }

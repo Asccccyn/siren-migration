@@ -66,16 +66,13 @@ export interface AssetMetaInput {
   messageId: string;
   direction: 'user' | 'assistant';
   voiceProfileId: string;
-  text?: string | null;
-  ttsScript?: string | null;
-  transcript?: string | null;
   emotion?: string | null;
   durationMs: number;
   format: string;
   sampleRate: number;
 }
 
-/** 与音频文件同目录的 meta.json 内容（object key 由 audioKey 推导） */
+/** Object sidecars contain delivery metadata only;正文 remains in the encrypted DB fields. */
 export function metaObjectKey(audioObjectKey: string): string {
   return `${audioObjectKey.slice(0, audioObjectKey.lastIndexOf('/'))}/meta.json`;
 }
@@ -89,9 +86,6 @@ export function buildAssetMeta(input: AssetMetaInput): Buffer {
         message_id: input.messageId,
         direction: input.direction,
         voice_profile: input.voiceProfileId,
-        text: input.text ?? null,
-        tts_script: input.ttsScript ?? null,
-        transcript: input.transcript ?? null,
         emotion: input.emotion ?? null,
         duration_ms: input.durationMs,
         format: input.format,

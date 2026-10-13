@@ -9,6 +9,15 @@ export interface CoreTurnInput {
   turnId: string;
   text: string;
   modality: 'voice_call';
+  /** Prior interrupted reply, with explicitly limited playback evidence. */
+  interruptedTurn?: CoreInterruption;
+}
+
+export interface CoreInterruption {
+  turnId: string;
+  inputId: string;
+  outputStreamId: string;
+  playback: { basis: 'unknown' } | { basis: 'client_reported'; playedMs: number };
 }
 
 export interface CoreDelta {

@@ -74,20 +74,28 @@ describe('VadMachine（F05：候选语音冻结噪声底 + 时间归一化）', 
   });
 });
 
-describe('S1011-015：最短有效语音参与 start 门（max(confirm, minSpeech)）', () => {
-  it('minSpeechMs 大于 confirmMs 时，start 延后到最短语音窗越过（句首由 pre-roll 保护）', () => {
+describe('confirmation and minimum completed speech are independent', () => {
+  it('confirms promptly, then marks a short utterance invalid on end', () => {
     let clockMs = 0;
-    const vad = new VadMachine(() => ({ confirmMs: 40, minSpeechMs: 100, endSilenceMs: 40, rmsRatio: 2 }), () => clockMs);
-    const loud = () => new Float32Array(160).fill(0.9);
-    const silent = () => new Float32Array(160);
-    for (let i = 0; i < 6; i++) { clockMs += 10; vad.process(silent()); }
-    let startedAtTick = -1;
-    for (let i = 0; i < 15; i++) {
-      clockMs += 10;
-      const outcome = vad.process(loud());
-      if (outcome.event === 'start') { startedAtTick = i; break; }
-    }
-    // confirm=40ms 在第 4 块即满足，但 minSpeech=100ms 要求语音持续 100ms（第 11 块，索引 10）才 start
-    expect(startedAtTick).toBe(10);
+    const vad = new VadMachine(() => ({ confirmMs: 40, minSpeechMs: 400, endSilenceMs: 40, rmsRatio: 2 }), () => clockMs);
+    const outcomes = [];
+    for (let i = 0; i < 10; i++) { clockMs += 10; outcomes.push(vad.process(new Float32Array(160).fill(0.9))); }
+    expect(outcomes.findIndex(x => x.event === 'start')).toBe(4);
+    for (let i = 0; i < 5; i++) { clockMs += 10; outcomes.push(vad.process(new Float32Array(160))); }
+    expect(outcomes.find(x => x.event === 'end')).toMatchObject({ event: 'end', valid: false });
+  });
+
+  it('freezes settings for a candidate and applies changes to the next candidate', () => {
+    let clockMs = 0;
+    let confirmMs = 40;
+    const vad = new VadMachine(() => ({ confirmMs, minSpeechMs: 10, endSilenceMs: 40, rmsRatio: 2 }), () => clockMs);
+    clockMs = 10; vad.process(new Float32Array(160).fill(0.9));
+    confirmMs = 600;
+    clockMs = 50;
+    expect(vad.process(new Float32Array(160).fill(0.9)).event).toBe('start');
+    clockMs = 100; vad.process(new Float32Array(160));
+    clockMs = 110; vad.process(new Float32Array(160).fill(0.9));
+    clockMs = 150;
+    expect(vad.process(new Float32Array(160).fill(0.9)).event).toBe('none');
   });
 });

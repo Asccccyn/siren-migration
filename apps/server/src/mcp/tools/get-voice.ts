@@ -1,5 +1,6 @@
 /** MCP Tool: voice_get（规范第 12 节）。按 voice_message_id 或 message_id 获取语音资产。 */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { FieldDecryptionError } from '@siren/storage';
 import { voiceGetInputSchema } from '@siren/contracts';
 import { serializeAsset } from '../../routes/voice-message.ts';
 import type { Logger } from '@siren/telemetry';
@@ -26,15 +27,22 @@ export function registerGetVoiceTool(server: McpServer, deps: { voice: VoiceServ
           ]
         };
       }
-      const asset = await deps.voice.getVoiceMessage({
-        id: parsed.data.voice_message_id,
-        messageId: parsed.data.message_id
-      });
-      deps.logger.info('mcp_tool_called', { tool: 'voice_get', found: Boolean(asset) });
-      if (!asset) {
-        return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'not_found' }) }] };
+      try {
+        const asset = await deps.voice.getVoiceMessage({
+          id: parsed.data.voice_message_id,
+          messageId: parsed.data.message_id
+        });
+        deps.logger.info('mcp_tool_called', { tool: 'voice_get', found: Boolean(asset) });
+        if (!asset) {
+          return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'not_found' }) }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(serializeAsset(asset)) }] };
+      } catch (error) {
+        if (error instanceof FieldDecryptionError) {
+          return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'data_unreadable' }) }] };
+        }
+        throw error;
       }
-      return { content: [{ type: 'text', text: JSON.stringify(serializeAsset(asset)) }] };
     }
   );
 }

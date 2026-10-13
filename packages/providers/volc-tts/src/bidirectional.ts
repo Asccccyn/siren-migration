@@ -311,13 +311,11 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
       release = resolve;
     });
     const previous = this.sessionChain;
-    this.sessionChain = gate;
-    await previous;
-    if (signal?.aborted) {
-      release();
-      throw new ProviderError('tts_failed', 'volc-tts', 'tts aborted');
-    }
+    // A canceled queued request may leave immediately, but its successors must
+    // still wait for the active predecessor (never overlap upstream sessions).
+    this.sessionChain = previous.then(() => gate);
     try {
+      await waitForSessionSlot(previous, signal);
       yield* this.streamOnce(request, signal);
     } finally {
       release();
@@ -448,6 +446,24 @@ export class VolcBidirectionalTtsProvider implements StreamTtsProvider {
           .finally(() => signal.removeEventListener('abort', onAbort));
       })
     ]);
+  }
+}
+
+async function waitForSessionSlot(previous: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return previous;
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      previous,
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(new ProviderError('tts_failed', 'volc-tts', 'queued tts aborted'));
+        signal.addEventListener('abort', onAbort, { once: true });
+      })
+    ]);
+    signal.throwIfAborted();
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
   }
 }
 

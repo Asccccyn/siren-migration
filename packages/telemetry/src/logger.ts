@@ -81,6 +81,7 @@ export interface Logger {
 /** 递归脱敏（S1011-008）：嵌套对象/数组里的敏感键同样处理，深度上限防循环/超深 */
 function redactValue(value: unknown, logTranscripts: boolean, depth: number): unknown {
   if (depth > 6) return '[depth-limit]';
+  if (value instanceof Error) return errorFields(value);
   if (Array.isArray(value)) {
     return value.map((item) => redactValue(item, logTranscripts, depth + 1));
   }
@@ -101,10 +102,11 @@ function redactEntry(key: string, value: unknown, logTranscripts: boolean, depth
   if (isSensitiveKey(key)) {
     return '[redacted]';
   }
+  const errorKey = key.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+  if (['error_message', 'error_description', 'stack'].includes(errorKey)) return '[redacted]';
+  if (['error', 'err', 'cause'].includes(errorKey)) return errorFields(value);
   if (value instanceof Error) {
-    // S1011-008：上游错误原文不整段直落日志——截断 200 字符（有界泄漏，保排障价值）
-    const message = value.message.length > 200 ? `${value.message.slice(0, 200)}…[truncated]` : value.message;
-    return { name: value.name, message };
+    return errorFields(value);
   }
   return redactValue(value, logTranscripts, depth);
 }
@@ -169,13 +171,26 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   return makeLogger(options.bindings ?? {});
 }
 
-/** 把任意 unknown 错误压缩成可安全记录的形状。
- * S1011-008：上游 message 不再整段直落日志——截断到 200 字符（错误信息以
- * 错误码/URL 为主，截断即有界；正文类内容由 LOG_TRANSCRIPTS 开关另行控制）。 */
+const ERROR_NAMES = new Set([
+  'Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError',
+  'ProviderError', 'CoreBridgeError', 'AudioFetchError', 'FieldDecryptionError', 'OAuthStateError'
+]);
+const ERROR_CODES = new Set([
+  'asr_failed', 'tts_failed', 'provider_unavailable', 'invalid_audio', 'invalid_input',
+  'provider_timeout', 'unsupported_format',
+  'core_http_error', 'core_stream_error', 'core_timeout', 'core_unreachable',
+  'blocked_url', 'too_large', 'download_failed', 'data_unreadable', 'oauth_storage_unavailable',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EACCES', 'ENOSPC', 'EIO'
+]);
+
+/** 错误只记录受控分类；上游 message/stack/cause 可能含正文和凭据，永不默认输出。
+ * LOG_TRANSCRIPTS 仅允许显式文本字段，不授权输出错误字符串中的秘密。 */
 export function errorFields(error: unknown): Record<string, unknown> {
-  if (error instanceof Error) {
-    const message = error.message.length > 200 ? `${error.message.slice(0, 200)}…[truncated]` : error.message;
-    return { error_name: error.name, error_message: message };
+  const fields: Record<string, unknown> = {
+    error_name: error instanceof Error && ERROR_NAMES.has(error.name) ? error.name : 'Error'
+  };
+  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' && ERROR_CODES.has(error.code)) {
+    fields.error_code = error.code;
   }
-  return { error: String(error).slice(0, 200) };
+  return fields;
 }

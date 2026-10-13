@@ -36,22 +36,33 @@ export function registerCallWebSocket(app: FastifyInstance, deps: CallHandlerDep
       return;
     }
 
-    const session = deps.callCenter.createSession({
-      callId,
-      reservation,
-      send: (data, binary) => {
-        if (binary) socket.send(binary);
-        else socket.send(data);
-      },
-      bufferedAmount: () => socket.bufferedAmount,
-      close: (code, reason) => {
-        try {
-          socket.close(code, reason);
-        } catch {
-          // 已关闭
+    let session;
+    try {
+      session = deps.callCenter.createSession({
+        callId,
+        reservation,
+        send: (data, binary) => {
+          if (binary) socket.send(binary);
+          else socket.send(data);
+        },
+        bufferedAmount: () => socket.bufferedAmount,
+        close: (code, reason) => {
+          try {
+            socket.close(code, reason);
+          } catch {
+            // 已关闭
+          }
         }
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'call_capacity_reached') {
+        socket.close(WS_CLOSE_CODES.CAPACITY_REACHED, 'call capacity reached');
+        return;
       }
-    });
+      log.error('ws_session_creation_failed', errorFields(error));
+      socket.close(WS_CLOSE_CODES.PROTOCOL_ERROR, 'session creation failed');
+      return;
+    }
     if (!session) {
       socket.close(WS_CLOSE_CODES.SESSION_EXISTS, 'call session already active');
       return;

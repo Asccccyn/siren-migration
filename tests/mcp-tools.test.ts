@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { FieldDecryptionError } from '@siren/storage';
 import { createSirenMcpServer } from '../apps/server/src/mcp/server.ts';
 import { buildTestVoice, connectMcpClient, silentLogger } from './helpers.ts';
 
@@ -8,6 +9,30 @@ function toolPayload(result: { content: { type: string; text: string }[] }): Rec
 }
 
 describe('Voice MCP（走完整 MCP 协议）', () => {
+  it('speak/get/list 的解密失败返回明确 data_unreadable，不伪装为语音合成失败', async () => {
+    const bundle = buildTestVoice();
+    const server = createSirenMcpServer({ voice: bundle.voice, store: bundle.store, logger: silentLogger, version: 'test' });
+    const { client, close } = await connectMcpClient(server);
+    const cases = [
+      { tool: 'voice_speak', method: 'speak', args: { text: 'test' } },
+      { tool: 'voice_get', method: 'getVoiceMessage', args: { message_id: 'test' } },
+      { tool: 'voice_list', method: 'listVoiceMessages', args: {} }
+    ] as const;
+    try {
+      for (const entry of cases) {
+        const mocked = vi.spyOn(bundle.voice, entry.method).mockRejectedValue(new FieldDecryptionError());
+        const result = await client.callTool({ name: entry.tool, arguments: entry.args });
+        expect(result.isError).toBe(true);
+        expect(toolPayload(result as never)).toEqual({ error: 'data_unreadable' });
+        mocked.mockRestore();
+      }
+    } finally {
+      await close();
+      bundle.db.close();
+      vi.restoreAllMocks();
+    }
+  });
+
   it('voice_speak：正常合成并返回 audio_url', async () => {
     const bundle = buildTestVoice();
     const server = createSirenMcpServer({
@@ -32,6 +57,9 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
       expect(payload.voice_message_id).toBeTruthy();
       expect(String(payload.audio_url)).toContain('/v1/assets/');
       expect(Number(payload.duration_ms)).toBeGreaterThan(0);
+      expect(payload.text).toBe('你，我在。');
+      expect(payload).not.toHaveProperty('tts_script');
+      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.text).toBe(payload.text);
       expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.audio_url).toBe(payload.audio_url);
       expect((result as { _meta?: Record<string, unknown> })._meta?.['openai/outputTemplate']).toBe(
         'ui://siren/voice-player-v1.html'
