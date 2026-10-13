@@ -2,7 +2,7 @@
 
 端点：`POST /mcp`（Streamable HTTP，stateless JSON 模式；公网 `https://voice.example.invalid/mcp`）。
 
-- 鉴权双轨：**静态 `SIREN_INTERNAL_TOKEN` Bearer**（机器直连）**或 MCP OAuth 2.1**（见下节），两者同权共存。
+- 鉴权双轨：**静态 `SIREN_INTERNAL_TOKEN` Bearer**（机器直连）**或 MCP OAuth 2.1**（见下节），两者在语音API共存；客户端管理API仅静态维护者token。
 - MCP 与 REST 共用同一个 `VoiceService`，能力与行为完全一致。
 - GET / DELETE（SSE 会话管理）在 stateless 模式下返回 405。
 
@@ -16,7 +16,7 @@
   （经 URL 参数追加，保留回调自身 query）→ `POST /oauth/token` 换 access(1h) + refresh。
 - 刷新令牌**一次性轮换**：每次刷新发新 refresh，旧 refresh 立即吊销（重放按 invalid_grant 拒绝）；
   吊销名单落盘 `data/oauth-revoked.json`，重启不复活。`POST /oauth/revoke` 按到期时间登记回收。
-- 令牌只接受严格规范编码（等价签名变体一律拒收），OAuth access 与静态 token 在 `/v1/*` 与 `/mcp` 同权。
+- 令牌只接受严格规范编码（等价签名变体一律拒收），OAuth access与静态token在语音API及/mcp放行；/v1/oauth/clients管理是明确例外。
 
 ## 客户端配置示例
 
@@ -61,7 +61,8 @@
   "voice_message_id": "...",
   "audio_url": "https://.../audio.mp3?...",
   "duration_ms": 2150,
-  "format": "mp3"
+  "format": "mp3",
+  "text": "你，我在。"
 }
 ```
 
@@ -86,3 +87,13 @@
 ```json
 { "error": "invalid_input" | "asr_failed" | "tts_failed" | "not_found", "details"?: [...] }
 ```
+
+## 1012 持久状态与容量恢复
+
+- revoke与refresh轮换成功前等待持久提交；写失败返回503，不能把新refresh作为成功发放。文件损坏/不可读拒绝初始化；仅缺文件按初始状态处理，维护时不得删除已部署撤销文件。关停等待写链。
+- DCR：每IP每分钟10次、全局60次；body最大16KiB，1–8个URI/每个最多2048B，client_name最多256B。
+- 新注册pending在24小时后过期，容量满时可回收最旧pending；授权过的客户端及旧版档案不自动淘汰。撤销限速每IP60/min、全局600/min。
+- 维护者（静态SIREN_INTERNAL_TOKEN）可GET /v1/oauth/clients查看无secret清单，POST /v1/oauth/clients/:clientId/remove移除客户端。OAuth access不能访问这些管理接口；移除后该客户端AT/RT不再有效。
+- voice_speak保留text字段供随仓播放器展开正文；结构化结果、文本content与UI meta的兼容负载仍保留，未为瘦身破坏消费者。
+- voice_get/list/speak遇密文不可读返回isError及data_unreadable，不伪装成功空字段。REST相关读取返回503。
+- audio_url下载在一次总期限内完成DNS、连接、重定向和body；DNS解析结果钉住实际连接，超时终止请求/流并让调用方落定。

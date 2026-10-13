@@ -4,10 +4,10 @@
 
 ```ts
 interface AsrProvider { transcribe(input): Promise<TranscriptResult>; createStream(options, handlers): Promise<AsrStream> }
-interface TtsProvider { synthesize(request): Promise<TtsAudioResult>; synthesizeStream(request, signal?): AsyncIterable<PcmChunk> }
+interface TtsProvider { synthesize(request, signal?): Promise<TtsAudioResult>; synthesizeStream(request, signal?): AsyncIterable<PcmChunk> }
 ```
 
-选择由环境变量控制：`ASR_PROVIDER` / `ASYNC_TTS_PROVIDER` / `REALTIME_TTS_PROVIDER`（volc | elevenlabs | mock）。
+选择由环境变量控制：`ASR_PROVIDER`支持volc/mock；`ASYNC_TTS_PROVIDER`与`REALTIME_TTS_PROVIDER`支持volc/elevenlabs/mock。档案必须匹配实际TTS链路，不自动把同一个音色ID用于不同供应商。
 
 开发环境缺少凭据时自动回退 Mock 并打警告；**生产环境直接拒绝启动**（`SIREN_ALLOW_MOCK_IN_PRODUCTION=true` 只豁免 mock provider 一组，不豁免 token / 签名 / R2 完整性检查）。
 
@@ -90,3 +90,9 @@ CoreBridge 与 conversation 所有权不变。
 2. 在 `provider-registry.ts` 注册环境变量分支；
 3. 在 voice profile JSON 中把 `provider` 指向它；
 4. 无需改动任何业务代码。
+
+## 1012 取消与生成脚本
+
+批量和流式TTS都接收AbortSignal。HTTP请求同时受turn取消与Provider超时控制；API-key批量聚合透传signal到bidi session。排队取消立即落定，后续session仍等待在途前驱释放，不越过它抢同一通道。
+
+filler脚本通过统一registry及选定profile生成；mock必须显式--mock，非mock缺能力拒绝，产物manifest标注来源。bundle由脚本finally dispose。真实生成仍会消耗配额，未获批准不执行；本批仅fake验证。
