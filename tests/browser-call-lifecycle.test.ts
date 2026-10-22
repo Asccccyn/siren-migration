@@ -26,9 +26,9 @@ const browser = vi.hoisted(() => {
       return controls.get(key);
     }
   });
-  const captures: { context?: AudioContext; settled: boolean; resolve(value: unknown): void; reject(error: Error): void }[] = [];
-  const capture = vi.fn((_samples: unknown, context?: AudioContext) => new Promise((resolve, reject) => {
-    const pending = { context, settled: false,
+  const captures: { context?: AudioContext; onDeviceLost?: () => void; settled: boolean; resolve(value: unknown): void; reject(error: Error): void }[] = [];
+  const capture = vi.fn((_samples: unknown, context?: AudioContext, onDeviceLost?: () => void) => new Promise((resolve, reject) => {
+    const pending = { context, onDeviceLost, settled: false,
       resolve(value: unknown) { pending.settled = true; resolve(value); },
       reject(error: Error) { pending.settled = true; reject(error); } };
     captures.push(pending);
@@ -173,6 +173,46 @@ describe('call button owns browser capture lifetime', () => {
     oldClose?.({ code: 1006 }); oldError?.(); await flush();
     expect(current.close).not.toHaveBeenCalled();
     expect(FakeContext.instances[1].state).toBe('running');
+    expect(browser.badge).not.toHaveBeenCalledWith('ended');
+  });
+});
+
+describe('C09：采集设备丢失显式结束通话（device_lost）', () => {
+  it('通话中 track 设备丢失：device_lost 状态 + DEVICE_LOST 关闭码 + 统一 teardown 清理', async () => {
+    const socket = await startCall();
+    const pending = browser.captures[0]!;
+    expect(pending.onDeviceLost).toBeTypeOf('function');
+    const pipelineInstance = pipeline(pending.context!);
+    pending.resolve(pipelineInstance);
+    await flush();
+    expect(FakeContext.instances[0].state).toBe('running');
+
+    pending.onDeviceLost!(); // 蓝牙耳机拔出：fake track 触发 onended
+    await flush();
+    // 显式状态：badge= device_lost（非供应商 error，非用户挂断 ended）
+    expect(browser.badge).toHaveBeenCalledWith('device_lost');
+    // WS 关闭原因与用户主动挂断（1000/'hangup'）区分
+    expect(socket.close).toHaveBeenCalledWith(4007, 'capture device lost');
+    // 复用统一 teardown：capture dispose（关 context）、按钮复位
+    expect(pipelineInstance.dispose).toHaveBeenCalled();
+    expect(FakeContext.instances[0].state).toBe('closed');
+    expect(browser.ui.callBtn.disabled).toBe(false);
+  });
+
+  it('旧通话的设备丢失回调不能误伤新通话（旧回调不复活/不拆新通话）', async () => {
+    const old = await startCall();
+    const staleDeviceLost = browser.captures[0]!.onDeviceLost!;
+    old.close(); await flush(); // 挂断旧通话（teardown 已清理）
+    const current = await startCall();
+    browser.captures[1]!.resolve(pipeline(browser.captures[1]!.context!));
+    await flush();
+    browser.badge.mockClear();
+
+    staleDeviceLost(); // 旧通话装配期捕获的回调迟到触发
+    await flush();
+    expect(current.close).not.toHaveBeenCalled();
+    expect(FakeContext.instances[1].state).toBe('running');
+    expect(browser.badge).not.toHaveBeenCalledWith('device_lost');
     expect(browser.badge).not.toHaveBeenCalledWith('ended');
   });
 });

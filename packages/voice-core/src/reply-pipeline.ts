@@ -266,17 +266,21 @@ export class ReplyPipeline {
     turn.metrics.setFillerPlayed();
     this.log.info('filler_played', { turn_index: turn.index });
     for (const frame of frames) {
-      this.sendAudioChunk(turn, { audio: frame, sampleRate: REALTIME_OUTPUT_SAMPLE_RATE });
+      // C11：filler 帧只计历史首音口径（audio_play_request），不占正文首音
+      this.sendAudioChunk(turn, { audio: frame, sampleRate: REALTIME_OUTPUT_SAMPLE_RATE }, 'filler');
     }
   }
 
-  /** 每个二进制帧前发 JSON 头：stream_id + sequence + 真实 rate + bytes（P0-3/P0-7） */
-  private sendAudioChunk(turn: ActiveTurn, chunk: PcmChunk): void {
+  /** 每个二进制帧前发 JSON 头：stream_id + sequence + 真实 rate + bytes（P0-3/P0-7）。
+   * C11：kind 区分 filler 与正文——正文首帧额外标记 content_audio_play_request，
+   * filler 只进历史首音口径（audio_play_request），正文首音指标不再被 filler 污染。 */
+  private sendAudioChunk(turn: ActiveTurn, chunk: PcmChunk, kind: 'filler' | 'content' = 'content'): void {
     if (turn.aborted) throw new TurnAbortedError();
     const first = !turn.pcmStarted;
     turn.pcmStarted = true;
     if (first) this.port.onFirstAudio(turn);
     turn.metrics.mark('audio_play_request');
+    if (kind === 'content') turn.metrics.mark('content_audio_play_request');
     this.port.sendJson({
       t: 'pcm',
       stream_id: turn.outputStreamId,

@@ -41,6 +41,8 @@ export function renderMetrics(metrics: Record<string, unknown> | undefined): voi
     ['LLM TTFT', `${metrics.llm_first_token_ms ?? '-'} ms`],
     ['TTS first audio', `${metrics.tts_first_audio_ms ?? '-'} ms`],
     ['Total first audio', `${metrics.total_first_audio_ms ?? '-'} ms`],
+    // C11：正文（非 filler）首音；只有 filler 时显示 '-'
+    ['First content audio', `${metrics.first_content_audio_ms ?? '-'} ms`],
     ['Interrupted', String(metrics.interrupted ?? false)],
     ['Filler', String(metrics.filler_played ?? false)]
   ];

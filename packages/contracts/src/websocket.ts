@@ -133,7 +133,13 @@ export interface TurnLatencyMetrics {
   asr_latency_ms: number | null;
   llm_first_token_ms: number | null;
   tts_first_audio_ms: number | null;
+  /** 历史口径：首个下行音频播放请求（filler 计入）——speech_end -> audio_play_request */
   total_first_audio_ms: number | null;
+  /**
+   * C11：首个正文（非 filler）音频的 speech_end -> content_audio_play_request。
+   * 只有 filler、没有任何正文音频时为 null（不虚构 0）。
+   */
+  first_content_audio_ms: number | null;
   interrupted: boolean;
   filler_played: boolean;
 }
@@ -145,5 +151,8 @@ export const WS_CLOSE_CODES = {
   SERVER_SHUTDOWN: 4003,
   PROTOCOL_ERROR: 4004,
   BACKPRESSURE_OVERFLOW: 4005,
-  CAPACITY_REACHED: 4006
+  CAPACITY_REACHED: 4006,
+  /** C09：客户端采集设备丢失（蓝牙耳机拔出等 track ended/devicechange）——
+   * 显式通话终止状态，与用户主动挂断（1000/hangup）和供应商错误区分 */
+  DEVICE_LOST: 4007
 } as const;

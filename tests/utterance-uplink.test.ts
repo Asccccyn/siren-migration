@@ -10,6 +10,8 @@ import { VadMachine, type VadParams } from '../apps/web/src/vad.ts';
 import { AudioPreRollBuffer } from '../apps/web/src/pre-roll-buffer.ts';
 import { Pcm16Framer } from '../apps/web/src/uplink-encoder.ts';
 import { UtteranceUplink } from '../apps/web/src/utterance-uplink.ts';
+import { VoiceTurnCoordinator } from '../apps/web/src/voice-turn-coordinator.ts';
+import { StreamRouter } from '../apps/web/src/stream-router.ts';
 
 const BLOCK = 160; // 10ms @16k
 
@@ -225,5 +227,134 @@ describe('UtteranceUplink（半双工：AI 活跃期间 VAD 一律不触发上�
     // 之后重新开口走正常路径
     for (let i = 0; i < 8; i++) h.tick(loud(i));
     expect(h.json.filter((m) => m.t === 'start').length).toBe(1);
+  });
+});
+
+/** C05 短输入不丢：uplink + 真实 VoiceTurnCoordinator/StreamRouter 联动 */
+function negotiatedHarness() {
+  const json: Record<string, unknown>[] = [];
+  const frames: ArrayBuffer[] = [];
+  const dropped: string[] = [];
+  let invalidations = 0;
+  let lastInvalidatedStream: string | null = null;
+  let clockMs = 0;
+  const router = new StreamRouter({
+    onChunk: () => {},
+    onStreamStart: () => {},
+    onStreamEnd: () => {},
+    onDrained: () => {},
+    onDropped: (reason) => dropped.push(reason)
+  });
+  const turns = new VoiceTurnCoordinator({
+    idPrefix: 'c05',
+    sendJson: (m) => json.push(m),
+    sendFrame: (f) => frames.push(f),
+    invalidateOutput: () => {
+      // 顺序保持 L45-46：先作废 router 再 stopAll（本测试无播放器，只记顺序事实）
+      invalidations += 1;
+      const stream = router.activeStream;
+      router.invalidateActive();
+      lastInvalidatedStream = stream;
+      return stream ? { stream_id: stream, played_ms: 12 } : undefined;
+    },
+    onFailure: () => {
+      throw new Error('unexpected coordinator failure');
+    }
+  });
+  turns.negotiate(true);
+  let aiActive = false;
+  const uplink = new UtteranceUplink({
+    vad: new VadMachine(
+      () => ({ confirmMs: 40, minSpeechMs: 400, endSilenceMs: 60, rmsRatio: 2 }),
+      () => clockMs
+    ),
+    preRoll: new AudioPreRollBuffer(6400),
+    framer: new Pcm16Framer(320),
+    sendJson: (m) => json.push(m),
+    sendFrame: (f) => turns.sendFrame(f),
+    isAiActive: () => aiActive,
+    canInterrupt: () => turns.supported,
+    startInput: () => turns.begin(),
+    finishInput: (valid) => turns.finish(valid),
+    endInput: () => turns.endInput()
+  });
+  return {
+    json, frames, dropped, turns, router, uplink,
+    get invalidations() { return invalidations; },
+    get lastInvalidatedStream() { return lastInvalidatedStream; },
+    setAiActive(value: boolean) { aiActive = value; },
+    tick(samples: Float32Array) { clockMs += 10; uplink.handleSamples(samples); }
+  };
+}
+
+
+describe('C05：短输入完成而非中止（minSpeech 门下不丢弃）', () => {
+  /** 公共前置：建立第一轮 input（c05_1）+ 服务端已在播旧输出流 out_old */
+  function establishedTurn() {
+    const h = negotiatedHarness();
+    h.router.handleJson({ t: 'pcm', stream_id: 'out_old', sequence: 0, rate: 24000, bytes: 640 });
+    h.router.handleBinary(new ArrayBuffer(640));
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    for (let i = 0; i < 46; i++) h.tick(loud(i)); // spoken ≈ 450ms ≥ 400ms
+    h.turns.accept({ t: 'input_started', input_id: 'c05_1' }); // ACK 前 flush
+    for (let i = 0; i < 8; i++) h.tick(SILENT); // endSilence 60ms
+    expect(h.json.some((m) => m.t === 'end' && m.input_id === 'c05_1')).toBe(true);
+    h.setAiActive(true); // AI 正在播报第一轮的回复
+    return h;
+  }
+
+  it('AI 播报中短音起声：interrupt 带作废旧输出，PCM 缓冲等 ACK', () => {
+    const h = establishedTurn();
+    const framesBefore = h.frames.length;
+    for (let i = 0; i < 26; i++) h.tick(loud(i)); // spoken ≈ 250ms
+    const interrupt = h.json.find((m) => m.t === 'interrupt');
+    expect(interrupt).toMatchObject({ target_input_id: 'c05_1', new_input_id: 'c05_2' });
+    expect(interrupt).toMatchObject({ playback: { stream_id: 'out_old', played_ms: 12 } });
+    // 每次 begin 各作废一次（第一轮 begin 无活跃流、第二轮 begin 作废 out_old）；
+    // 旧行为的 abort 会带来第三次作废
+    expect(h.invalidations).toBe(2);
+    expect(h.frames.length).toBe(framesBefore); // ACK 前 PCM 仍在缓冲
+  });
+
+  it('AI 播报中 250ms 短音（<400ms 门）：end 提交 ASR，不 abort，旧输出不复活', () => {
+    const h = establishedTurn();
+    const framesBefore = h.frames.length;
+    for (let i = 0; i < 26; i++) h.tick(loud(i)); // spoken ≈ 250ms
+    for (let i = 0; i < 8; i++) h.tick(SILENT); // 静音断句：spoken<400 → invalid
+    // 旧行为：finishInput(false) -> abort（丢弃）；新行为：end 提交
+    expect(h.json.some((m) => m.t === 'abort')).toBe(false);
+    expect(h.invalidations).toBe(2); // 没有第三次作废（未走 abort）
+    expect(h.json.filter((m) => m.t === 'end' && m.input_id === 'c05_2')).toHaveLength(0); // end 在缓冲 PCM 之后
+    h.turns.accept({ t: 'input_started', input_id: 'c05_2' });
+    expect(h.json.some((m) => m.t === 'end' && m.input_id === 'c05_2')).toBe(true);
+    expect(h.frames.length).toBeGreaterThan(framesBefore); // 短音 PCM 真正上行（进 ASR）
+    // 旧输出不复活：短输入结束后旧流迟到 chunk 仍被取消/丢弃
+    h.router.handleJson({ t: 'pcm', stream_id: 'out_old', sequence: 1, rate: 24000, bytes: 640 });
+    h.router.handleBinary(new ArrayBuffer(640));
+    expect(h.dropped).toContain('cancelled_stream_chunk');
+  });
+
+  it('静音假起声（从未确认）不上行不 abort；从未 begin 的 finish(false) 仍 abort（legacy 语义保留）', () => {
+    const h = negotiatedHarness();
+    for (let i = 0; i < 6; i++) h.tick(SILENT);
+    // 低于 confirmMs=40ms 的候选起声后转静音：从未 start，VAD 直接回到空闲
+    for (let i = 0; i < 2; i++) h.tick(loud(i));
+    for (let i = 0; i < 10; i++) h.tick(SILENT);
+    expect(h.json).toHaveLength(0);
+    expect(h.frames).toHaveLength(0);
+    expect(h.invalidations).toBe(0);
+
+    // 从未 begin 的输入显式 finish(false)（假候选路径）：abort 保留
+    const legacy = new VoiceTurnCoordinator({
+      idPrefix: 'legacy',
+      sendJson: (m) => h.json.push(m),
+      sendFrame: () => {},
+      invalidateOutput: () => undefined,
+      onFailure: () => {}
+    });
+    legacy.negotiate(false);
+    legacy.finish(false);
+    expect(h.json.some((m) => m.t === 'abort')).toBe(true);
+    expect(h.json.some((m) => m.t === 'end')).toBe(false);
   });
 });

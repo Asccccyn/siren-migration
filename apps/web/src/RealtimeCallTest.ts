@@ -25,6 +25,9 @@ requireToken();
 
 const PRE_ROLL_MS = 400; // P0-1：16kHz 下 6400 samples
 const PROTOCOL_VERSION = 2;
+/** C09：采集设备丢失关闭码——镜像 @siren/contracts WS_CLOSE_CODES.DEVICE_LOST(4007)。
+ * 客户端 bundle 不依赖 contracts 包，本地常量与协议文档同步维护。 */
+const CLOSE_DEVICE_LOST = 4007;
 
 function authHeaders(): Record<string, string> {
   const token = getStoredToken();
@@ -50,6 +53,8 @@ let captureGeneration = 0;
 let serverState = 'idle';
 let serverProtocol = 0;
 let muted = false;
+/** C09：本轮通话是否因采集设备丢失结束（badge 区分 device_lost 与 ended；新呼叫复位） */
+let deviceLost = false;
 // S1011-015：服务端 ready 帧下发的 VAD/jitter 建议作为基线；UI 输入仍可覆盖
 let serverVadDefaults: VadParams | null = null;
 let serverJitterMs: number | null = null;
@@ -131,6 +136,7 @@ function ensureConversationId(): string {
 
 ui.callBtn.addEventListener('click', async () => {
   const generation = ++captureGeneration;
+  deviceLost = false; // C09：新呼叫从明确的非设备丢失状态开始
   ui.callBtn.disabled = true;
   ui.hangupBtn.disabled = false;
   const request = new AbortController();
@@ -219,7 +225,8 @@ async function connectSocket(wsUrl: string, token: string): Promise<void> {
     if (ws !== socket) return;
     logEvent(`WebSocket 关闭 code=${event.code}`);
     teardown();
-    setBadge('ended');
+    // C09：设备丢失的通话结束展示显式 device_lost，与正常/用户挂断的 ended 区分
+    setBadge(deviceLost ? 'device_lost' : 'ended');
     ui.callBtn.disabled = false;
   };
   socket.onerror = () => {
@@ -233,7 +240,19 @@ async function setupCapture(): Promise<void> {
   const prepared = pendingAudioContext ?? undefined;
   const pipeline = await setupCaptureModule((samples, reference) => {
     if (generation === captureGeneration) handleCapturedSamples(samples, reference);
-  }, prepared);
+  }, prepared, () => {
+    // C09：采集设备丢失（蓝牙耳机拔出等 track ended / devicechange）——
+    // 旧行为：流静默死亡，通话卡死无任何状态。新行为：置显式 device_lost 状态，
+    // 复用统一 teardown 清理（不新建第二套），WS 关闭码与用户主动挂断（1000/hangup）区分。
+    if (generation !== captureGeneration) return; // 旧通话的迟到回调不误伤新通话
+    deviceLost = true;
+    logEvent('麦克风设备丢失（track ended/devicechange），通话结束');
+    const socket = ws;
+    teardown();
+    socket?.close(CLOSE_DEVICE_LOST, 'capture device lost');
+    setBadge('device_lost');
+    ui.callBtn.disabled = false;
+  });
   if (generation !== captureGeneration) {
     // F18：挂断/换通话发生在授权等待期间——迟到的采集立即释放
     await pipeline.dispose().catch(() => undefined);
@@ -273,6 +292,8 @@ async function setupCapture(): Promise<void> {
     sendFrame: (frame) => turns?.sendFrame(frame),
     startInput: () => turns?.begin(),
     finishInput: (valid) => turns?.finish(valid),
+    // C05：已 begin 的短输入（VAD minSpeech 不达标）以 end 提交送 ASR，不再 abort 丢弃
+    endInput: () => turns?.endInput(),
     canInterrupt: () => turns?.supported ?? false,
     isAiActive: hasResponse,
     log: (message) => logEvent(message)

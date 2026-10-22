@@ -21,6 +21,11 @@ export class PlaybackEchoGuard {
 
   get suppressingEcho(): boolean { return this.echo; }
 
+  /** 浸泡测试用：内部三个环形缓冲均为固定容量，此值不随处理时长增长 */
+  get fixedBufferSamples(): number {
+    return this.reference.length + this.fullReference.length + this.microphone.length;
+  }
+
   /** Both inputs are synchronous 16kHz samples from the same AudioContext. */
   process(mic: Float32Array, rendered: Float32Array): Float32Array {
     for (let i = 0; i < mic.length; i++) {

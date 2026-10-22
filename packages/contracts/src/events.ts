@@ -9,6 +9,8 @@ export const LATENCY_MARKS = [
   'first_sentence_ready',
   'tts_first_chunk',
   'audio_play_request',
+  // C11：首个正文（非 filler）音频下发时刻——filler 不再污染正文首音口径
+  'content_audio_play_request',
   'turn_end'
 ] as const;
 

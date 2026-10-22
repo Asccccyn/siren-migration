@@ -164,6 +164,8 @@ export function buildSessionHarness(deps: {
   sessionsRepo?: CallSessionsRepository;
   bufferedAmount?: () => number;
   onDestroyed?: (session: CallSession) => void;
+  /** 缺省为不可用 FillerManager；filler 相关用例注入真实实例 */
+  fillers?: FillerManager;
 }): SessionHarness {
   const frames: (string | Buffer)[] = [];
   const closeCalls: { code: number; reason: string }[] = [];
@@ -182,7 +184,7 @@ export function buildSessionHarness(deps: {
     profile: TEST_PROFILE,
     voice: new CascadeRealtimeProvider({ name: 'cascade(test)', asr, tts }),
     core,
-    fillers: new FillerManager('Z:\\nonexistent-fillers', false, silentLogger),
+    fillers: deps.fillers ?? new FillerManager('Z:\\nonexistent-fillers', false, silentLogger),
     turnsRepo,
     sessionsRepo,
     send: (data, binary) => {

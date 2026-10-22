@@ -16,6 +16,10 @@ export interface CallTurnRow {
   asr_latency_ms: number | null;
   llm_first_token_ms: number | null;
   tts_first_audio_ms: number | null;
+  /** 历史口径首音（filler 计入）；C11 迁移新增，可省略（落 NULL） */
+  first_audio_ms?: number | null;
+  /** 首个正文（非 filler）音频；只有 filler 的轮次为 NULL；C11 迁移新增，可省略 */
+  first_content_audio_ms?: number | null;
   created_at: number;
 }
 
@@ -30,18 +34,22 @@ export class CallTurnsRepository {
     const stored: CallTurnRow = this.cipher
       ? {
           ...row,
+          first_audio_ms: row.first_audio_ms ?? null,
+          first_content_audio_ms: row.first_content_audio_ms ?? null,
           user_text: row.user_text !== null ? this.cipher.seal(row.user_text) : null,
           assistant_text: row.assistant_text !== null ? this.cipher.seal(row.assistant_text) : null
         }
-      : row;
+      : { ...row, first_audio_ms: row.first_audio_ms ?? null, first_content_audio_ms: row.first_content_audio_ms ?? null };
     this.db
       .prepare(`
         INSERT INTO call_turns (
           id, call_id, turn_index, user_text, assistant_text, started_at, ended_at,
-          interrupted, asr_latency_ms, llm_first_token_ms, tts_first_audio_ms, created_at
+          interrupted, asr_latency_ms, llm_first_token_ms, tts_first_audio_ms,
+          first_audio_ms, first_content_audio_ms, created_at
         ) VALUES (
           @id, @call_id, @turn_index, @user_text, @assistant_text, @started_at, @ended_at,
-          @interrupted, @asr_latency_ms, @llm_first_token_ms, @tts_first_audio_ms, @created_at
+          @interrupted, @asr_latency_ms, @llm_first_token_ms, @tts_first_audio_ms,
+          @first_audio_ms, @first_content_audio_ms, @created_at
         )
       `)
       .run(stored);

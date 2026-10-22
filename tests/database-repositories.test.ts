@@ -81,9 +81,43 @@ describe('SQLite 仓储', () => {
   it('迁移幂等（重复打开安全）', async () => {
     const db = openDatabase(':memory:');
     // openDatabase 内部已跑迁移，再显式跑一次不应报错
+    // （C11 起含 002 可重入补列迁移，版本数 = 已应用迁移条数）
     const { migrate } = await import('@siren/storage');
     migrate(db);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 2 });
+  });
+
+  it('C11 迁移：旧库（001 后无新列）补列可重入，新列缺省 NULL', async () => {
+    const db = openDatabase(':memory:');
+    // 模拟旧库：去掉 C11 两列并撤销迁移记录，重新迁移必须无错补列
+    db.exec('ALTER TABLE call_turns DROP COLUMN first_audio_ms');
+    db.exec('ALTER TABLE call_turns DROP COLUMN first_content_audio_ms');
+    db.prepare('DELETE FROM _migrations WHERE version = 2').run();
+    const { migrate, CallTurnsRepository: Turns } = await import('@siren/storage');
+    migrate(db); // 可重入 ALTER：不存在才加，重复不报错
+    migrate(db);
+    const columns = (db.prepare('PRAGMA table_info(call_turns)').all() as { name: string }[])
+      .map((row) => row.name);
+    expect(columns).toContain('first_audio_ms');
+    expect(columns).toContain('first_content_audio_ms');
+    const turns = new Turns(db);
+    insertSession(new CallSessionsRepository(db), 'c', Date.now()); // call_turns 外键父行
+    turns.insert({
+      id: 'turn-old-schema',
+      call_id: 'c',
+      turn_index: 1,
+      user_text: null,
+      assistant_text: null,
+      started_at: null,
+      ended_at: null,
+      interrupted: 0,
+      asr_latency_ms: null,
+      llm_first_token_ms: null,
+      tts_first_audio_ms: null,
+      created_at: Date.now()
+    });
+    expect(turns.listByCall('c')[0].first_audio_ms).toBeNull();
+    expect(turns.listByCall('c')[0].first_content_audio_ms).toBeNull();
   });
 
   it('审计回归：endAllActive 启动清扫（创建后从未连 WS 的 call 不永久残留 active）', () => {

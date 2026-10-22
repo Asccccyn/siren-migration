@@ -5,10 +5,15 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { MIGRATION_001 } from './migrations/001-init.ts';
+import { addCallTurnLatencyColumns } from './migrations/002-turn-latency-columns.ts';
 
 export type SqliteDatabase = Database.Database;
 
-const MIGRATIONS: { version: number; sql: string }[] = [{ version: 1, sql: MIGRATION_001 }];
+/** sql 为纯 DDL 字符串；run 用于需要探测旧结构的可重入迁移（如 ADD COLUMN） */
+const MIGRATIONS: { version: number; sql?: string; run?: (db: SqliteDatabase) => void }[] = [
+  { version: 1, sql: MIGRATION_001 },
+  { version: 2, run: addCallTurnLatencyColumns }
+];
 
 export function openDatabase(path: string): SqliteDatabase {
   if (path !== ':memory:') {
@@ -32,7 +37,8 @@ export function migrate(db: SqliteDatabase): void {
   for (const migration of MIGRATIONS) {
     if (applied.has(migration.version)) continue;
     const tx = db.transaction(() => {
-      db.exec(migration.sql);
+      if (migration.sql) db.exec(migration.sql);
+      migration.run?.(db);
       db.prepare('INSERT INTO _migrations (version, applied_at) VALUES (?, ?)').run(
         migration.version,
         Date.now()

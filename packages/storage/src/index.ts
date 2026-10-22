@@ -1,6 +1,7 @@
 export { openDatabase, migrate } from './sqlite.ts';
 export type { SqliteDatabase } from './sqlite.ts';
 export { MIGRATION_001 } from './migrations/001-init.ts';
+export { addCallTurnLatencyColumns } from './migrations/002-turn-latency-columns.ts';
 export * from './repositories/index.ts';
 export * from './object-store.ts';
 export { LocalObjectStore, signObjectKey, verifyObjectSignature } from './local-store.ts';

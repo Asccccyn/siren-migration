@@ -6,7 +6,7 @@
 
 POST /v1/calls必填conversation_id，token冻结conversation/voice profile。WS为/ws/call/:callId?token=...。上行PCM16/16kHz/mono；下行PCM16默认24kHz，每帧rate为准。
 
-关闭码：4001无效/吊销token、4002相同call重放、4004非法消息、4005背压、4006实际并发容量已满。预签token不占活跃连接许可，createSession才检查并占位。
+关闭码：4001无效/吊销token、4002相同call重放、4004非法消息、4005背压、4006实际并发容量已满、4007客户端采集设备丢失（C09：蓝牙耳机拔出等track ended/devicechange，与用户主动挂断1000区分）。预签token不占活跃连接许可，createSession才检查并占位。
 
 ## 协商与输入
 
@@ -52,9 +52,13 @@ header+下一binary按序配对。无头、长度不符、旧input、已取消st
 
 ENDING新起声采用替换政策：取消旧ASR并开始独立输入，不自动拼接两句。旧轮已收到的partial仅保留为未定稿interrupted记录；迟到final被隔离。没有完整final时不声称旧句已完整转写。
 
+### 短输入语义（C05）
+
+客户端VAD的minSpeech（默认400ms）只标记"短于最短语音门"，不再决定丢弃：起声已确认（start/interrupt已发出、pre-roll已drain）的输入在静音断句时无论spokenMs是否达标都发end收尾，已缓冲PCM正常送ASR，由服务端终态判定——ASR可能识别出"嗯/不"等短句；空结果走既有empty_transcript notice回listening。abort只保留给从未begin的输入（假候选）与手动取消。ENDING语义不变：end后服务端进入ending等终态，不拼接、也不恢复被打断的旧输出（旧流在interrupt时已作废，保持作废）。
+
 ## VAD、参考回声与缓冲
 
-VAD确认默认200ms；minSpeech默认400ms，用于结束后判断有效短句，不能拖慢起声确认；结束静音700ms、RMS ratio4、jitter350ms。合法0值不被默认值吞掉。候选期冻结参数，下一候选应用新值。
+VAD确认默认200ms；minSpeech默认400ms，用于结束后标记"短于最短语音门"的输入（C05：标记不再等于丢弃——已确认起声的短输入以end提交，交服务端ASR判定），不能拖慢起声确认；结束静音700ms、RMS ratio4、jitter350ms。合法0值不被默认值吞掉。候选期冻结参数，下一候选应用新值。
 
 pre-roll至少400ms，按合法确认窗口+余量+触发块增长（最大3s）；确认参数有界。回声参考只辅助检测，送入ASR的候选保留原浏览器AEC处理后的mic样本，避免晚确认删除首段。
 

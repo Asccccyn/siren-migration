@@ -30,6 +30,9 @@ export class CallTurnRecorder {
         asr_latency_ms: metrics.asr_latency_ms,
         llm_first_token_ms: metrics.llm_first_token_ms,
         tts_first_audio_ms: metrics.tts_first_audio_ms,
+        // C11：首音两列（first_audio_ms 为 filler 计入历史口径，first_content_audio_ms 只算正文）
+        first_audio_ms: metrics.first_audio_ms,
+        first_content_audio_ms: metrics.first_content_audio_ms,
         created_at: Date.now()
       });
     } catch (error) {

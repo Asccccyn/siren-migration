@@ -2,7 +2,8 @@
  * Utterance input ownership: retain candidate samples, confirm speech promptly,
  * then submit PCM once. Negotiated voice interruption uses the turn coordinator;
  * legacy peers retain explicit half-duplex/manual behavior.
- * minSpeech validates the completed utterance, not interruption response time.
+ * minSpeech 校验完成后不再决定丢弃（C05）：已确认起声的短输入以 end 提交，
+ * 由服务端 ASR 判定；invalid 只表示"短于最短语音门"。
  */
 import type { VadMachine, VadOutcome } from './vad.ts';
 import type { AudioPreRollBuffer } from './pre-roll-buffer.ts';
@@ -22,6 +23,8 @@ export interface UtteranceUplinkDeps {
   canInterrupt?: () => boolean;
   startInput?: () => void;
   finishInput?: (valid: boolean) => void;
+  /** C05：已 begin 输入的短收尾入口（发 end 送 ASR）；缺省回退 finishInput(true)。 */
+  endInput?: () => void;
   log?: (message: string) => void;
 }
 
@@ -33,6 +36,8 @@ export class UtteranceUplink {
   private suppressedByAi = false;
   /** 最近一次 VAD 判定是否处于说话中（suppression 恢复用，与 sending 解耦） */
   private vadSpeech = false;
+  /** 本轮 utterance 是否已 begin（startInput 已调用，coordinator 侧已有 input 身份） */
+  private inputBegan = false;
 
   constructor(private readonly deps: UtteranceUplinkDeps) {}
 
@@ -146,6 +151,7 @@ export class UtteranceUplink {
     this.sending = false;
     this.suppressedByAi = false;
     this.vadSpeech = false;
+    this.inputBegan = false;
     this.deps.preRoll.clear();
     this.deps.framer.reset();
     this.deps.vad.reset();
@@ -179,15 +185,36 @@ export class UtteranceUplink {
     this.sending = false;
     this.flushFramerTail(); // F19：静音断句前发出尾帧残余
     this.finishInput(outcome.valid);
-    this.deps.log?.(`VAD: 静音断句 -> end（spoken ${Math.round(outcome.spokenMs)}ms）`);
+    // C05：invalid 不再等于丢弃——短于最短语音门的已确认输入以 end 提交，交服务端判定
+    this.deps.log?.(
+      `VAD: 静音断句 -> end（spoken ${Math.round(outcome.spokenMs)}ms${outcome.valid ? '' : '，短于最短语音门，交服务端判定'}）`
+    );
   }
 
   private startInput(): void {
     if (this.deps.startInput) this.deps.startInput();
     else this.deps.sendJson({ t: 'start' });
+    this.inputBegan = true;
   }
 
   private finishInput(valid: boolean): void {
+    // C05 短输入语义：旧行为——VAD 静音断句 spokenMs < minSpeechMs 时 finishInput(false)
+    // -> abort。起声已确认的短句（interrupt/start 已发出、pre-roll 已 drain）被 abort 后
+    // 既不进 ASR 也不恢复旧播放，等于普遍丢弃短输入。新行为：本轮 input 已 begin 的
+    // 短输入改发 end 正常收尾，把已缓冲 PCM 交服务端 ASR 判定（服务端已有
+    // adopted/partial/unrecognized 终态与 empty_transcript 处理）；只有从未 begin 的
+    // 假候选才保留 abort。VadMachine 的 minSpeech 校验不变——invalid 的含义从
+    // "丢弃"改为"短于最短语音门，交由服务端判定"。
+    if (!valid && this.inputBegan) {
+      this.inputBegan = false;
+      if (this.deps.endInput) {
+        this.deps.endInput();
+        return;
+      }
+      this.deps.sendJson({ t: 'end' });
+      return;
+    }
+    this.inputBegan = false;
     if (this.deps.finishInput) this.deps.finishInput(valid);
     else this.deps.sendJson({ t: valid ? 'end' : 'abort' });
   }
