@@ -64,6 +64,7 @@ export class HttpCoreBridge implements CoreBridge {
       reader = responseBody.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let completed = false;
       // S1011-024：应用层 done 终态——done 即完成，EOF 与 done 后帧各有明确语义
       outer: while (true) {
         const { done, value } = await reader.read();
@@ -78,16 +79,22 @@ export class HttpCoreBridge implements CoreBridge {
           try {
             message = JSON.parse(line);
           } catch {
-            continue; // 忽略残行
+            // A complete malformed line is not a transport fragment. Skipping
+            // it could silently delete generated content and report success.
+            throw new CoreBridgeError('core_invalid_response', 'core returned malformed NDJSON');
           }
           if (message.type === 'delta' && typeof message.text === 'string' && message.text.length > 0) {
             yield { text: message.text };
           } else if (message.type === 'done') {
+            completed = true;
             break outer;
           } else if (message.type === 'error') {
             throw new CoreBridgeError('core_stream_error', message.message ?? 'core stream error');
           }
         }
+      }
+      if (!completed && !controller.signal.aborted) {
+        throw new CoreBridgeError('core_stream_incomplete', 'core stream ended before done');
       }
     } catch (error) {
       if (timedOut) {
