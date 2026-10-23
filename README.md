@@ -9,6 +9,7 @@
 
 ## 当前基线与接手摘要
 
+- 2026-10-24（隔离分支，未部署）：GLM CallHome 执行轮——RE-16 列表/游标/回执预算收口（8192B 唯一总页合同+查询指纹快照游标+坏游标 isError+speak 模型面最小化单份）、RE-17 指标分母真实化（接纳轮不丢行/recognized=真实回复链/unknown=null+覆盖率/outcome 值域触发器）、B5 来电邀请持久状态（迁移004 call_invites：服务端过期回收+重启恢复+竞态单终态+declined≠expired）；探针 13/14（R7-01 v==3 快照断言被 004 取代、语义补充断言绿）；399 绿+2 跳过、tsc 0。
 - 2026-10-23（分支 `audit-fix-joint-voice-20261023` 叠加，未部署）：R7 轮次终态批（她 D6 裁定）：migration 003 `call_turns.outcome`（历史行 NULL=unknown 不回填）；新写入区分 completed/interrupted/asr_failed/asr_timeout/core_failed/tts_failed/**asr_empty（中性，空转写轮如实落库不再丢弃）**；聚合脚本新增 outcome 分布与三口径分母（接纳轮=全部行/识别轮=回复链四值/asr_empty 单列不计故障）。全套 392 绿+2 跳过、tsc 0。设备/真实供应商维维持 NOT_EXECUTED。
 
 2026-10-13 更新交接说明；本次仅维护文档，未重跑代码测试。
