@@ -49,7 +49,9 @@ export interface VoiceTranscribeOutput {
 
 export const voiceGetInputSchema = z.object({
   voice_message_id: z.string().min(1).max(128).optional(),
-  message_id: z.string().min(1).max(128).optional()
+  message_id: z.string().min(1).max(128).optional(),
+  // R3′（2026-10-23）：长正文分页——省略=首页；翻页传上页 text_page.next_cursor
+  cursor: z.string().min(8).max(200).optional()
 });
 
 export type VoiceGetInput = z.infer<typeof voiceGetInputSchema>;
@@ -59,7 +61,9 @@ export const voiceListInputSchema = z.object({
   message_id: z.string().min(1).max(128).optional(),
   from: z.string().datetime().optional(),
   to: z.string().datetime().optional(),
-  limit: z.number().int().min(1).max(200).optional()
+  limit: z.number().int().min(1).max(200).optional(),
+  // R3′（2026-10-23）：keyset 游标（created_at,id）——并发新增不漂移；OFFSET 已弃用
+  cursor: z.string().min(8).max(200).optional()
 });
 
 export type VoiceListInput = z.infer<typeof voiceListInputSchema>;

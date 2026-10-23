@@ -58,6 +58,8 @@ export interface ListAssetsFilter {
   toMs?: number;
   limit?: number;
   offset?: number;
+  /** R3′（2026-10-23）：keyset 游标 {c: created_at, i: id}（base64url JSON）——并发新增不漂移 */
+  cursor?: string;
 }
 
 export class VoiceAssetsRepository {
@@ -136,11 +138,18 @@ export class VoiceAssetsRepository {
       conditions.push('created_at <= @toMs');
       params.toMs = filter.toMs;
     }
+    // R3′（2026-10-23）：keyset 分页——游标 (created_at,id) 严格小于当前页尾；
+    // 并发新增（更大 created_at）不进当前游标页，翻页无重复无遗漏；OFFSET 路径保留给旧内部调用
+    let keyset: { c: number; i: string } | null = null;
+    if (filter.cursor) {
+      try { const parsed = JSON.parse(Buffer.from(filter.cursor, 'base64url').toString('utf8')) as { c?: number; i?: string }; if (typeof parsed.c === 'number' && typeof parsed.i === 'string') keyset = { c: parsed.c, i: parsed.i }; } catch { keyset = null; }
+    }
+    if (keyset) conditions.push('(created_at < @kc OR (created_at = @kc AND id < @ki))'), (params.kc = keyset.c), (params.ki = keyset.i);
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const limit = filter.limit ?? 50;
     const offset = filter.offset ?? 0;
     const rows = this.db
-      .prepare(`SELECT * FROM voice_assets ${where} ORDER BY created_at DESC LIMIT @limit OFFSET @offset`)
+      .prepare(`SELECT * FROM voice_assets ${where} ORDER BY created_at DESC, id DESC LIMIT @limit OFFSET @offset`)
       .all({ ...params, limit, offset }) as AssetRow[];
     return rows.map((row) => rowToRecord(row, this.cipher));
   }

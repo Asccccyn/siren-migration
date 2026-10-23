@@ -97,3 +97,10 @@
 - voice_speak保留text字段供随仓播放器展开正文；结构化结果、文本content与UI meta的兼容负载仍保留，未为瘦身破坏消费者。
 - voice_get/list/speak遇密文不可读返回isError及data_unreadable，不伪装成功空字段。REST相关读取返回503。
 - audio_url下载在一次总期限内完成DNS、连接、重定向和body；DNS解析结果钉住实际连接，超时终止请求/流并让调用方落定。
+
+## 2026-10-23 R3′：voice_get / voice_list 长正文分页（破坏性变更）
+
+- `voice_get` 正文/转写按 1200 汉字/页投影：首次调用只回首页 + `text_page { index, total_pages, total_chars, next_cursor? }`；翻页带 `cursor`（上页 `next_cursor`）再调。**`text` 字段不再一次返回全文**（旧消费者若依赖全文须循环翻页拼回）。游标锚 checksum：资产不可变，翻页按 id 复取并校验，不符= `snapshot_stale` 如实报。
+- `voice_list` 列表项正文只带 ≤120 字摘录 + `full_text_via`（提示用 voice_get 取全文）；输出新增 `next_cursor`（keyset：`(created_at, id)`，并发新增不进当前游标页——新消息由后续首次查询可见，不挤入进行中的翻页）。
+- 两个工具的投影均带字节预算门（get 8192B；list 8192B×页大小上限），超预算如实报 `projection_over_budget`，不截断造绿。
+- 背景：审计 SIR-U01（4000 字 get≈12340B 超预算无续读）——本变更为修复，当时无长正文消费者依赖（见 glm-root-cause-20261023/R3P_PAGINATION_PREMISE.md 消费者清单）。

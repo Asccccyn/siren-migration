@@ -14,7 +14,8 @@ export function registerGetVoiceTool(server: McpServer, deps: { voice: VoiceServ
       description: '获取语音资产元数据与签名音频 URL。',
       inputSchema: {
         voice_message_id: voiceGetInputSchema.shape.voice_message_id,
-        message_id: voiceGetInputSchema.shape.message_id
+        message_id: voiceGetInputSchema.shape.message_id,
+        cursor: voiceGetInputSchema.shape.cursor
       }
     },
     async (args) => {
@@ -36,7 +37,14 @@ export function registerGetVoiceTool(server: McpServer, deps: { voice: VoiceServ
         if (!asset) {
           return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'not_found' }) }] };
         }
-        return { content: [{ type: 'text', text: JSON.stringify(assetModelView(asset)) }] };
+        // R3′：分页投影 + 8192B 预算门（超预算=投影 bug，如实报不截断造绿）
+        const projected = assetModelView(asset, parsed.data.cursor);
+        const payload = JSON.stringify(projected);
+        if (Buffer.byteLength(payload, 'utf8') > 8192) {
+          deps.logger.warn('mcp_projection_over_budget', { tool: 'voice_get', bytes: Buffer.byteLength(payload, 'utf8') });
+          return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'projection_over_budget' }) }] };
+        }
+        return { content: [{ type: 'text', text: payload }] };
       } catch (error) {
         if (error instanceof FieldDecryptionError) {
           return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'data_unreadable' }) }] };
