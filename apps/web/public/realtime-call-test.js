@@ -385,6 +385,8 @@
       __publicField(this, "suppressedByAi", false);
       /** 最近一次 VAD 判定是否处于说话中（suppression 恢复用，与 sending 解耦） */
       __publicField(this, "vadSpeech", false);
+      /** 本轮 utterance 是否已 begin（startInput 已调用，coordinator 侧已有 input 身份） */
+      __publicField(this, "inputBegan", false);
     }
     get sendingActive() {
       return this.sending;
@@ -482,6 +484,7 @@
       this.sending = false;
       this.suppressedByAi = false;
       this.vadSpeech = false;
+      this.inputBegan = false;
       this.deps.preRoll.clear();
       this.deps.framer.reset();
       this.deps.vad.reset();
@@ -509,15 +512,20 @@
       this.sending = false;
       this.flushFramerTail();
       this.finishInput(outcome.valid);
-      this.deps.log?.(`VAD: \u9759\u97F3\u65AD\u53E5 -> end\uFF08spoken ${Math.round(outcome.spokenMs)}ms\uFF09`);
+      this.deps.log?.(
+        `VAD: \u9759\u97F3\u65AD\u53E5 -> end\uFF08spoken ${Math.round(outcome.spokenMs)}ms${outcome.valid ? "" : "\uFF0C\u77ED\u4E8E\u6700\u77ED\u8BED\u97F3\u95E8\uFF0C\u4EA4\u670D\u52A1\u7AEF\u5224\u5B9A"}\uFF09`
+      );
     }
     startInput() {
       if (this.deps.startInput) this.deps.startInput();
       else this.deps.sendJson({ t: "start" });
+      this.inputBegan = true;
     }
     finishInput(valid) {
-      if (this.deps.finishInput) this.deps.finishInput(valid);
-      else this.deps.sendJson({ t: valid ? "end" : "abort" });
+      const submit = valid || this.inputBegan;
+      this.inputBegan = false;
+      if (this.deps.finishInput) this.deps.finishInput(submit);
+      else this.deps.sendJson({ t: submit ? "end" : "abort" });
     }
     sendFrames(samples) {
       if (samples.length === 0) return;
@@ -835,6 +843,8 @@ ${ui.eventLog.textContent ?? ""}`.split("\n").slice(0, 200).join("\n");
       ["LLM TTFT", `${metrics.llm_first_token_ms ?? "-"} ms`],
       ["TTS first audio", `${metrics.tts_first_audio_ms ?? "-"} ms`],
       ["Total first audio", `${metrics.total_first_audio_ms ?? "-"} ms`],
+      // C11：正文（非 filler）首音；只有 filler 时显示 '-'
+      ["Server first content PCM", `${metrics.first_content_audio_ms ?? "-"} ms`],
       ["Interrupted", String(metrics.interrupted ?? false)],
       ["Filler", String(metrics.filler_played ?? false)]
     ];
@@ -857,18 +867,54 @@ class SirenCaptureProcessor extends AudioWorkletProcessor {
 }
 registerProcessor('siren-capture', SirenCaptureProcessor);
 `;
-  async function setupCapture(onSamples, preparedContext) {
+  function installDeviceWatch(audioTracks, onDeviceLost) {
+    let lost = false;
+    let released = false;
+    const notify = () => {
+      if (lost || released) return;
+      lost = true;
+      onDeviceLost?.();
+    };
+    for (const track of audioTracks) {
+      track.onended = () => notify();
+    }
+    let onDeviceChange = null;
+    if (navigator.mediaDevices?.addEventListener) {
+      onDeviceChange = () => {
+        if (audioTracks.some((track) => track.readyState === "ended")) notify();
+      };
+      navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
+    }
+    return {
+      get lost() {
+        return lost;
+      },
+      release() {
+        released = true;
+        for (const track of audioTracks) track.onended = null;
+        if (onDeviceChange && navigator.mediaDevices?.removeEventListener) {
+          navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
+        }
+      }
+    };
+  }
+  async function setupCapture(onSamples, preparedContext, onDeviceLost) {
     const mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
+    const audioTracks = mediaStream.getAudioTracks();
+    const deviceWatch = installDeviceWatch(audioTracks, onDeviceLost);
     let context = preparedContext ?? null;
     let worklet = null;
     let playbackInput = null;
     try {
       context ?? (context = new AudioContext());
       const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
-      await context.audioWorklet.addModule(blobUrl);
-      URL.revokeObjectURL(blobUrl);
+      try {
+        await context.audioWorklet.addModule(blobUrl);
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
       worklet = new AudioWorkletNode(context, "siren-capture", { numberOfInputs: 2, outputChannelCount: [1] });
       worklet.port.onmessage = (event) => {
         onSamples(event.data.microphone, event.data.reference);
@@ -881,8 +927,9 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     } catch (error) {
       worklet?.disconnect();
       playbackInput?.disconnect();
-      await context?.close().catch(() => void 0);
+      deviceWatch.release();
       mediaStream.getTracks().forEach((track) => track.stop());
+      await context?.close().catch(() => void 0);
       throw error;
     }
     const boundContext = context;
@@ -894,10 +941,14 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       worklet: boundWorklet,
       sampleRate: boundContext.sampleRate,
       playbackInput: boundPlayback,
-      echoCancellation: mediaStream.getAudioTracks()[0]?.getSettings().echoCancellation,
+      echoCancellation: audioTracks[0]?.getSettings().echoCancellation,
+      get deviceLost() {
+        return deviceWatch.lost;
+      },
       dispose: async () => {
         if (disposed) return;
         disposed = true;
+        deviceWatch.release();
         boundWorklet.port.onmessage = null;
         boundWorklet.disconnect();
         boundPlayback.disconnect();
@@ -1064,6 +1115,10 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     get suppressingEcho() {
       return this.echo;
     }
+    /** 浸泡测试用：内部三个环形缓冲均为固定容量，此值不随处理时长增长 */
+    get fixedBufferSamples() {
+      return this.reference.length + this.fullReference.length + this.microphone.length;
+    }
     /** Both inputs are synchronous 16kHz samples from the same AudioContext. */
     process(mic, rendered) {
       for (let i = 0; i < mic.length; i++) {
@@ -1133,6 +1188,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   requireToken();
   var PRE_ROLL_MS = 400;
   var PROTOCOL_VERSION = 2;
+  var CLOSE_DEVICE_LOST = 4007;
   function authHeaders() {
     const token = getStoredToken();
     return token ? { authorization: `Bearer ${token}` } : {};
@@ -1154,6 +1210,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   var serverState = "idle";
   var serverProtocol = 0;
   var muted = false;
+  var deviceLost = false;
   var serverVadDefaults = null;
   var serverJitterMs = null;
   function setting(value, fallback) {
@@ -1216,6 +1273,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
   }
   ui.callBtn.addEventListener("click", async () => {
     const generation = ++captureGeneration;
+    deviceLost = false;
     ui.callBtn.disabled = true;
     ui.hangupBtn.disabled = false;
     const request = new AbortController();
@@ -1305,7 +1363,7 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
       if (ws !== socket) return;
       logEvent(`WebSocket \u5173\u95ED code=${event.code}`);
       teardown();
-      setBadge("ended");
+      setBadge(deviceLost ? "device_lost" : "ended");
       ui.callBtn.disabled = false;
     };
     socket.onerror = () => {
@@ -1318,7 +1376,16 @@ registerProcessor('siren-capture', SirenCaptureProcessor);
     const prepared = pendingAudioContext ?? void 0;
     const pipeline = await setupCapture((samples, reference) => {
       if (generation === captureGeneration) handleCapturedSamples(samples, reference);
-    }, prepared);
+    }, prepared, () => {
+      if (generation !== captureGeneration) return;
+      deviceLost = true;
+      logEvent("\u9EA6\u514B\u98CE\u8BBE\u5907\u4E22\u5931\uFF08track ended/devicechange\uFF09\uFF0C\u901A\u8BDD\u7ED3\u675F");
+      const socket = ws;
+      teardown();
+      socket?.close(CLOSE_DEVICE_LOST, "capture device lost");
+      setBadge("device_lost");
+      ui.callBtn.disabled = false;
+    });
     if (generation !== captureGeneration) {
       await pipeline.dispose().catch(() => void 0);
       return;
