@@ -95,8 +95,11 @@ export async function setupCapture(
   try {
     context ??= new AudioContext();
     const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: 'application/javascript' }));
-    await context.audioWorklet.addModule(blobUrl);
-    URL.revokeObjectURL(blobUrl);
+    try {
+      await context.audioWorklet.addModule(blobUrl);
+    } finally {
+      URL.revokeObjectURL(blobUrl);
+    }
     worklet = new AudioWorkletNode(context, 'siren-capture', { numberOfInputs: 2, outputChannelCount: [1] });
     worklet.port.onmessage = (event) => {
       onSamples(event.data.microphone as Float32Array, event.data.reference as Float32Array);
@@ -111,9 +114,9 @@ export async function setupCapture(
     // F18：授权已拿到但装配失败——先归还麦克风再抛，避免轨道泄漏（指示灯常亮）
     worklet?.disconnect();
     playbackInput?.disconnect();
-    await context?.close().catch(() => undefined);
     deviceWatch.release();
     mediaStream.getTracks().forEach((track) => track.stop());
+    await context?.close().catch(() => undefined);
     throw error;
   }
   const boundContext = context;

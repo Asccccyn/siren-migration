@@ -124,4 +124,21 @@ describe('setupCapture 设备丢失上报（C09）', () => {
     expect(deviceListeners.get('devicechange')).toHaveLength(0);
     expect(track.readyState).toBe('ended'); // 麦克风已归还（F18 保持）
   });
+
+  it('装配失败立即停track并释放blob，即使AudioContext.close尚未完成', async () => {
+    const prepared = new FakeContext();
+    const revoke = vi.spyOn(URL, 'revokeObjectURL');
+    let finishClose!: () => void;
+    prepared.close = vi.fn(() => new Promise<void>((resolve) => { finishClose = resolve; }));
+    prepared.audioWorklet.addModule = vi.fn(async () => { throw new Error('controlled module failure'); });
+    const pending = setupCapture(() => {}, prepared as never).catch((error: Error) => error);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    try {
+      expect(track.readyState).toBe('ended');
+      expect(track.onended).toBeNull();
+      expect(revoke).toHaveBeenCalledTimes(1);
+    } finally {
+      finishClose(); await pending; revoke.mockRestore();
+    }
+  });
 });
