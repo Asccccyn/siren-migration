@@ -1,4 +1,4 @@
-export { VoiceAssetsRepository } from './voice-assets-repo.ts';
+export { VoiceAssetsRepository, InvalidCursorError, encodeListCursor, decodeListCursor, listQueryFingerprint } from './voice-assets-repo.ts';
 export type { ListAssetsFilter } from './voice-assets-repo.ts';
 export { CallSessionsRepository } from './call-sessions-repo.ts';
 export type { CallSessionRow } from './call-sessions-repo.ts';

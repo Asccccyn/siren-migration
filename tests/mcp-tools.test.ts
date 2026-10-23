@@ -57,10 +57,15 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
       expect(payload.voice_message_id).toBeTruthy();
       expect(String(payload.audio_url)).toContain('/v1/assets/');
       expect(Number(payload.duration_ms)).toBeGreaterThan(0);
-      expect(payload.text).toBe('你，我在。');
+      // R3″（2026-10-24，RE-16）：模型面 content 不再整段回显正文（摘录≤120字）；
+      // 播放器展示正文=structuredContent 单份；全文分页走 voice_get
+      expect(payload.spoken).toBe(true);
+      expect(String(payload.text_excerpt)).toContain('你，我在。'.slice(0, 5));
+      expect(payload).not.toHaveProperty('text');
       expect(payload).not.toHaveProperty('tts_script');
-      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.text).toBe(payload.text);
+      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.text).toBe('你，我在。');
       expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.audio_url).toBe(payload.audio_url);
+      expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(8192);
       expect((result as { _meta?: Record<string, unknown> })._meta?.['openai/outputTemplate']).toBe(
         'ui://siren/voice-player-v1.html'
       );

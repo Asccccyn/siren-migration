@@ -58,8 +58,43 @@ export interface ListAssetsFilter {
   toMs?: number;
   limit?: number;
   offset?: number;
-  /** R3′（2026-10-23）：keyset 游标 {c: created_at, i: id}（base64url JSON）——并发新增不漂移 */
+  /** R3″（2026-10-24，RE-16）：keyset 游标 {c: created_at, i: id, r: rowid 快照上界, q: 查询指纹}
+   *  base64url JSON——并发新增不漂移；坏游标=抛错（不静默当首页）；游标绑定原查询，换过滤器=错。
+   *  r=签发时刻全表 MAX(rowid)：签发后插入的行（同毫秒 created_at 也一样）不进进行中的翻页快照。 */
   cursor?: string;
+}
+
+/** 游标无效错误（工具层转为 isError；不再静默回首页） */
+export class InvalidCursorError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidCursorError';
+  }
+}
+
+/** 游标签发/校验共用：字段不齐/编码坏=InvalidCursorError */
+export function encodeListCursor(keyset: { c: number; i: string; r: number; q: string }): string {
+  return Buffer.from(JSON.stringify(keyset), 'utf8').toString('base64url');
+}
+
+export function listQueryFingerprint(filter: { conversationId?: string; messageId?: string; direction?: VoiceDirection; fromMs?: number; toMs?: number }): string {
+  return Buffer.from(JSON.stringify([filter.conversationId ?? null, filter.messageId ?? null, filter.direction ?? null, filter.fromMs ?? null, filter.toMs ?? null])).toString('base64url');
+}
+
+export function decodeListCursor(cursor: string, filter: { conversationId?: string; messageId?: string; direction?: VoiceDirection; fromMs?: number; toMs?: number }): { c: number; i: string; r: number } {
+  let parsed: { c?: unknown; i?: unknown; r?: unknown; q?: unknown };
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as typeof parsed;
+  } catch {
+    throw new InvalidCursorError('INVALID_CURSOR: cursor is not readable');
+  }
+  if (typeof parsed.c !== 'number' || typeof parsed.i !== 'string' || typeof parsed.r !== 'number' || !Number.isInteger(parsed.r) || parsed.r < 0) {
+    throw new InvalidCursorError('INVALID_CURSOR: cursor fields malformed');
+  }
+  if (typeof parsed.q !== 'string' || parsed.q !== listQueryFingerprint(filter)) {
+    throw new InvalidCursorError('INVALID_CURSOR: cursor belongs to a different query (filter changed) — restart from the first page');
+  }
+  return { c: parsed.c, i: parsed.i, r: parsed.r };
 }
 
 export class VoiceAssetsRepository {
@@ -138,13 +173,21 @@ export class VoiceAssetsRepository {
       conditions.push('created_at <= @toMs');
       params.toMs = filter.toMs;
     }
-    // R3′（2026-10-23）：keyset 分页——游标 (created_at,id) 严格小于当前页尾；
-    // 并发新增（更大 created_at）不进当前游标页，翻页无重复无遗漏；OFFSET 路径保留给旧内部调用
-    let keyset: { c: number; i: string } | null = null;
+    // R3″（2026-10-24，RE-16）：keyset 分页——游标 (created_at,id) 严格小于当前页尾 +
+    // rowid ≤ 签发时刻上界 r（签发后插入不进进行中的快照）；游标绑定原查询指纹；
+    // 坏游标/换过滤器=InvalidCursorError（调用方如实报错，不静默当首页）。
+    // OFFSET 路径保留给旧内部调用
+    let keyset: { c: number; i: string; r: number } | null = null;
     if (filter.cursor) {
-      try { const parsed = JSON.parse(Buffer.from(filter.cursor, 'base64url').toString('utf8')) as { c?: number; i?: string }; if (typeof parsed.c === 'number' && typeof parsed.i === 'string') keyset = { c: parsed.c, i: parsed.i }; } catch { keyset = null; }
+      keyset = decodeListCursor(filter.cursor, filter);
     }
-    if (keyset) conditions.push('(created_at < @kc OR (created_at = @kc AND id < @ki))'), (params.kc = keyset.c), (params.ki = keyset.i);
+    if (keyset) {
+      conditions.push('(created_at < @kc OR (created_at = @kc AND id < @ki))');
+      params.kc = keyset.c;
+      params.ki = keyset.i;
+      conditions.push('rowid <= @kr');
+      params.kr = keyset.r;
+    }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const limit = filter.limit ?? 50;
     const offset = filter.offset ?? 0;
@@ -152,5 +195,11 @@ export class VoiceAssetsRepository {
       .prepare(`SELECT * FROM voice_assets ${where} ORDER BY created_at DESC, id DESC LIMIT @limit OFFSET @offset`)
       .all({ ...params, limit, offset }) as AssetRow[];
     return rows.map((row) => rowToRecord(row, this.cipher));
+  }
+
+  /** R3″（2026-10-24，RE-16）：签发翻页快照上界——全表 MAX(rowid)（签发后的插入不进快照）。 */
+  maxRowid(): number {
+    const row = this.db.prepare('SELECT COALESCE(MAX(rowid), 0) AS m FROM voice_assets').get() as { m: number };
+    return row.m;
   }
 }

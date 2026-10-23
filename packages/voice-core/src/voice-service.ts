@@ -306,6 +306,11 @@ export class VoiceService {
     return { items };
   }
 
+  /** R3″（2026-10-24，RE-16）：翻页快照上界（全表 MAX(rowid)）——工具层签发游标用 */
+  listSnapshotCeiling(): number {
+    return this.deps.assetsRepo.maxRowid();
+  }
+
   // -------------------------------------------------------------------------
 
   protected resolveProfile(voiceProfileId?: string): VoiceProfile {

@@ -45,8 +45,21 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           language: parsed.data.language
         });
         deps.logger.info('mcp_tool_called', { tool: 'voice_speak', voice_message_id: asset.id });
-        // 播放器只接收 tool-result，必须随结果提供展示正文；不公开 TTS 专用脚本。
-        const payload = {
+        // R3″（2026-10-24，RE-16）：模型面回执最小化——完整 text 本就在模型自己的工具调用
+        // 参数里（回显=大正文双份：上轮实测 12261B/双份 24941B）。content 只带 spoken+摘录；
+        // 播放器展示正文走 structuredContent（单份，不进模型正文），全文分页走 voice_get。
+        const chars = [...asset.text];
+        const excerpt = chars.length > 120 ? chars.slice(0, 120).join('') + '…' : asset.text;
+        const modelPayload = {
+          voice_message_id: asset.id,
+          audio_url: asset.audioUrl,
+          spoken: true,
+          duration_ms: asset.durationMs,
+          format: asset.audioFormat,
+          text_excerpt: excerpt,
+          note: '语音已合成；正文以你的原话为准（摘录如上，不整段回显），全文走 voice_get'
+        };
+        const playerPayload = {
           voice_message_id: asset.id,
           audio_url: asset.audioUrl,
           text: asset.text,
@@ -54,11 +67,11 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           format: asset.audioFormat
         };
         return {
-          structuredContent: payload,
+          structuredContent: playerPayload,
           content: [
             {
               type: 'text',
-              text: JSON.stringify(payload)
+              text: JSON.stringify(modelPayload)
             }
           ],
           _meta: VOICE_PLAYER_TOOL_META

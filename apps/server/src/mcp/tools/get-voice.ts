@@ -38,7 +38,12 @@ export function registerGetVoiceTool(server: McpServer, deps: { voice: VoiceServ
           return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'not_found' }) }] };
         }
         // R3′：分页投影 + 8192B 预算门（超预算=投影 bug，如实报不截断造绿）
+        // R3″（2026-10-24，RE-16）：snapshot_stale / cursor_out_of_range 是错误事实——
+        // isError:true 返回（上轮反例：过期快照被当 MCP 成功）
         const projected = assetModelView(asset, parsed.data.cursor);
+        if (typeof projected.error === 'string') {
+          return { isError: true, content: [{ type: 'text', text: JSON.stringify(projected) }] };
+        }
         const payload = JSON.stringify(projected);
         if (Buffer.byteLength(payload, 'utf8') > 8192) {
           deps.logger.warn('mcp_projection_over_budget', { tool: 'voice_get', bytes: Buffer.byteLength(payload, 'utf8') });
