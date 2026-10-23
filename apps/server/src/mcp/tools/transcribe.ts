@@ -2,7 +2,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { voiceTranscribeInputObjectSchema, voiceTranscribeInputSchema } from '@siren/contracts';
 import type { ObjectStore } from '@siren/storage';
-import type { Logger } from '@siren/telemetry';
+import { errorFields, type Logger } from '@siren/telemetry';
 import type { VoiceService } from '@siren/voice-core';
 import { downloadWithLimits } from './audio-fetch.ts';
 
@@ -60,10 +60,10 @@ export function registerTranscribeTool(
           ]
         };
       } catch (error) {
-        deps.logger.warn('mcp_tool_failed', { tool: 'voice_transcribe', error_message: (error as Error).message });
+        deps.logger.warn('mcp_tool_failed', { tool: 'voice_transcribe', ...errorFields(error) });
         return {
           isError: true,
-          content: [{ type: 'text', text: JSON.stringify({ error: 'asr_failed', message: (error as Error).message }) }]
+          content: [{ type: 'text', text: JSON.stringify({ error: 'asr_failed', message: '音频转写未完成。' }) }]
         };
       }
     }

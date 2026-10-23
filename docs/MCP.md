@@ -74,7 +74,7 @@
 
 ## voice_get
 
-输入 `voice_message_id` 或 `message_id`，返回资产元数据 + 新签名的 `audio_url`。
+输入 `voice_message_id` 或 `message_id`，返回可读正文或转写、时长、方向、语言、格式、创建时间和新签名的 `audio_url`。返回的 `id` 可作为下一次 `voice_get.voice_message_id` 换取新 URL。TTS 脚本、音色参数与内部会话/消息关联留在存储及 REST UI，不进入此模型投影。
 
 ## voice_list
 

@@ -4,7 +4,6 @@ import { voiceSpeakInputSchema } from '@siren/contracts';
 import { errorFields, type Logger } from '@siren/telemetry';
 import { FieldDecryptionError } from '@siren/storage';
 import type { VoiceService } from '@siren/voice-core';
-import { serializeAsset } from '../../routes/voice-message.ts';
 import { VOICE_PLAYER_TOOL_META } from '../voice-player.ts';
 
 export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService; logger: Logger }): void {
@@ -76,4 +75,3 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
   );
 }
 
-export { serializeAsset };

@@ -2,7 +2,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { FieldDecryptionError } from '@siren/storage';
 import { voiceGetInputSchema } from '@siren/contracts';
-import { serializeAsset } from '../../routes/voice-message.ts';
+import { assetModelView } from '../asset-model-view.ts';
 import type { Logger } from '@siren/telemetry';
 import type { VoiceService } from '@siren/voice-core';
 
@@ -36,7 +36,7 @@ export function registerGetVoiceTool(server: McpServer, deps: { voice: VoiceServ
         if (!asset) {
           return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'not_found' }) }] };
         }
-        return { content: [{ type: 'text', text: JSON.stringify(serializeAsset(asset)) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(assetModelView(asset)) }] };
       } catch (error) {
         if (error instanceof FieldDecryptionError) {
           return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: 'data_unreadable' }) }] };
