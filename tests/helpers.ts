@@ -154,6 +154,7 @@ export interface SessionHarness {
 }
 
 export function buildSessionHarness(deps: {
+  logger?: Logger;
   asr?: MockAsrProvider;
   tts?: TtsProvider;
   core?: CoreBridge;
@@ -178,7 +179,7 @@ export function buildSessionHarness(deps: {
   const sessionsRepo = deps.sessionsRepo ?? new CallSessionsRepository(db!);
   const session = new CallSession({
     config: deps.config ?? testConfig(),
-    logger: silentLogger,
+    logger: deps.logger ?? silentLogger,
     callId: deps.callId ?? 'call-test-1',
     conversationId: deps.conversationId ?? 'conv-test',
     profile: TEST_PROFILE,

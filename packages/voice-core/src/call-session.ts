@@ -463,7 +463,7 @@ export class CallSession {
       if (result.kind === 'core' && turn.receivedText) {
         turn.fullText = turn.receivedText;
       }
-      this.log.warn('turn_failed', {
+      this.log.warn('reply_generation_failed', {
         ...errorFields(result.error),
         stage: 'reply',
         turn_index: turn.index
@@ -494,25 +494,28 @@ export class CallSession {
         this.log.debug('playback_drain_fallback_listening', { stream_id: turn.outputStreamId });
       }
     }
-    // completed 落库/metrics 在 drain 最终结果之后：被打断时由 handleAbort 写
+    // 终态落库/metrics 在 drain 最终结果之后：被打断时由 handleAbort 写
     // interrupted 并只发一份 interrupted metrics（不会出现两份矛盾记录）
-    this.finalizeCompletedTurn(turn);
+    this.finalizeReplyTurn(turn, result.status === 'failed' ? `${result.kind}_failed` : 'completed');
     if (this.closed || this.closing) return;
     this.backToListening();
   }
 
-  /** 轮次正常收尾：completed 落库 + 单份 completed metrics（drain 之后调用） */
-  private finalizeCompletedTurn(turn: ActiveTurn): void {
-    this.writeTurn(turn, 'completed');
+  /** Preserve failure at the terminal boundary; a metrics frame is not success. */
+  private finalizeReplyTurn(turn: ActiveTurn, outcome: 'completed' | 'core_failed' | 'tts_failed'): void {
+    this.writeTurn(turn, outcome);
     turn.metrics.markEnd();
     const metrics = turn.metrics.compute();
     this.sendJson({ t: 'metrics', metrics });
-    this.log.info('turn_completed', {
+    const fields = {
       turn_index: turn.index,
+      outcome,
       ...metrics,
       user_len: turn.userText.length,
       assistant_len: turn.fullText.length
-    });
+    };
+    if (outcome === 'completed') this.log.info('turn_completed', fields);
+    else this.log.warn('turn_failed', fields);
   }
 
   // -------------------------------------------------------------------------
