@@ -17,4 +17,15 @@ export function addCallTurnOutcomeColumn(db: Database.Database): void {
   if (!existing.has('outcome')) {
     db.exec('ALTER TABLE call_turns ADD COLUMN outcome TEXT');
   }
+  // RE-17（2026-10-24 返修）：outcome 值域 DB 级约束（触发器——裸 SQL 插入也拦；
+  // 上轮拼错枚举（asr_empyt）被静默当 unknown）。历史 NULL=unknown 仍合法。
+  const VALID = "('completed','interrupted','asr_failed','asr_timeout','core_failed','tts_failed','asr_empty')";
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_call_turns_outcome_insert
+    BEFORE INSERT ON call_turns
+    WHEN NEW.outcome IS NOT NULL AND NEW.outcome NOT IN ${VALID}
+    BEGIN SELECT RAISE(ABORT, 'invalid outcome'); END;`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_call_turns_outcome_update
+    BEFORE UPDATE OF outcome ON call_turns
+    WHEN NEW.outcome IS NOT NULL AND NEW.outcome NOT IN ${VALID}
+    BEGIN SELECT RAISE(ABORT, 'invalid outcome'); END;`);
 }

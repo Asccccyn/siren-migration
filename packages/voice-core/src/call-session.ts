@@ -538,8 +538,13 @@ export class CallSession {
       };
     }
     if (this.stateMachine.is('idle', 'listening')) {
-      // 收回未提交的输入：丢弃当前 utterance
-      if (this.turn) this.turn.aborted = true;
+      // 收回未提交的输入：丢弃当前 utterance。
+      // RE-17（2026-10-24 返修）：已接纳的 start 也留唯一终态行（interrupted）——
+      // 上轮两次 start→abort 只落 1 行，接纳分母丢行；落行后取消不消失
+      if (this.turn) {
+        this.turn.aborted = true;
+        this.writeTurn(this.turn, 'interrupted');
+      }
       this.turn?.asr.abort();
       this.turn = null;
       this.lastPartialText = '';

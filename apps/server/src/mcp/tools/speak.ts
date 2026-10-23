@@ -48,8 +48,9 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
         // R3″（2026-10-24，RE-16）：模型面回执最小化——完整 text 本就在模型自己的工具调用
         // 参数里（回显=大正文双份：上轮实测 12261B/双份 24941B）。content 只带 spoken+摘录；
         // 播放器展示正文走 structuredContent（单份，不进模型正文），全文分页走 voice_get。
-        const chars = [...asset.text];
-        const excerpt = chars.length > 120 ? chars.slice(0, 120).join('') + '…' : asset.text;
+        const spokenText = asset.text ?? '';
+        const chars = [...spokenText];
+        const excerpt = chars.length > 120 ? chars.slice(0, 120).join('') + '…' : spokenText;
         const modelPayload = {
           voice_message_id: asset.id,
           audio_url: asset.audioUrl,

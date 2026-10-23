@@ -55,7 +55,7 @@ let rows;
 try {
   rows = db
     .prepare(
-      `SELECT first_audio_ms, first_content_audio_ms, outcome FROM call_turns
+      `SELECT first_audio_ms, first_content_audio_ms, outcome, assistant_text FROM call_turns
        ORDER BY created_at DESC, rowid DESC ${args.limit ? 'LIMIT ?' : ''}`
     )
     .all(...(args.limit ? [args.limit] : []));
@@ -107,16 +107,23 @@ for (const row of rows) {
   const key = OUTCOMES.includes(row.outcome) ? row.outcome : 'unknown_or_null';
   outcomeCounts[key] = (outcomeCounts[key] ?? 0) + 1;
 }
-const recognizedOutcomes = new Set(['completed', 'interrupted', 'core_failed', 'tts_failed']);
-const replyRows = rows.filter((row) => recognizedOutcomes.has(row.outcome));
+const recognizedOutcomes = new Set(['completed', 'core_failed', 'tts_failed']);
+// RE-17（2026-10-24 返修）：recognized=真实进入回复链（Core 被调用或已有助手正文）——
+// interrupted 分两轴：有助手正文=回复链内被打断；无=接纳/识别阶段取消（不算识别完成，
+// 上轮反例：ENDING 未采纳即取消被算进识别轮，而 Core 调用为 0）
+const replyRows = rows.filter((row) => recognizedOutcomes.has(row.outcome)
+  || (row.outcome === 'interrupted' && typeof row.assistant_text === 'string' && row.assistant_text.length > 0));
 const technicalFailures = rows.filter((row) => row.outcome === 'asr_failed' || row.outcome === 'asr_timeout' || row.outcome === 'core_failed' || row.outcome === 'tts_failed').length;
+// RE-17：无已知 outcome≠零故障——unknown 样本上故障率不可知，如实 null+覆盖率
+const knownRows = rows.filter((row) => row.outcome !== null && row.outcome !== undefined).length;
 const outcome = {
   distribution: outcomeCounts,
   accepted_turns: rows.length,
   recognized_turns: replyRows.length,
   asr_empty_turns: outcomeCounts['asr_empty'] ?? 0,
-  technical_failure_rate: technicalFailures === 0 && rows.length === 0 ? null : Number((technicalFailures / rows.length).toFixed(4)),
-  denominator_note: 'accepted=全部行（技术失败率分母）；recognized=进入回复链（completed/interrupted/core_failed/tts_failed，延迟统计分母）；asr_empty 中性不计故障'
+  known_outcome_coverage: rows.length === 0 ? null : Number((knownRows / rows.length).toFixed(4)),
+  technical_failure_rate: knownRows === 0 ? null : Number((technicalFailures / rows.length).toFixed(4)),
+  denominator_note: 'accepted=全部行（技术失败率分母）；recognized=进入回复链（completed/core_failed/tts_failed 或 interrupted 且已有助手正文——Core 被调用或回复已开始）；asr_empty 中性不计故障；历史 NULL=unknown：无已知样本时故障率=null（不是 0），known_outcome_coverage 给已知覆盖率'
 };
 
 const output = {

@@ -126,18 +126,23 @@ describe('aggregate-turn-latency（R7 outcome 分母）', () => {
       started_at, ended_at, interrupted, asr_latency_ms, llm_first_token_ms, tts_first_audio_ms,
       first_audio_ms, first_content_audio_ms, outcome, created_at)
       VALUES (?, 'call-o', ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, ?, ?)`);
-    // 4 completed + 1 interrupted + 1 core_failed + 2 asr_empty + 1 asr_failed + 1 NULL（历史）
-    const plan: Array<string | null> = ['completed', 'completed', 'completed', 'completed', 'interrupted', 'core_failed', 'asr_empty', 'asr_empty', 'asr_failed', null];
+    // 4 completed + 1 interrupted（回复链内：已有助手正文）+ 1 core_failed + 2 asr_empty
+    // + 1 asr_failed + 1 NULL（历史）+ 1 interrupted（ENDNING 未采纳即取消：无助手正文，
+    // RE-17 后不计识别轮）
+    const plan: Array<string | null> = ['completed', 'completed', 'completed', 'completed', 'interrupted', 'core_failed', 'asr_empty', 'asr_empty', 'asr_failed', null, 'interrupted'];
     plan.forEach((outcome, i) => insert.run(`t-${i}`, i + 1, outcome, 1_700_000_000_000 + i));
+    db.prepare("UPDATE call_turns SET assistant_text='被打断前已生成的正文' WHERE id='t-4'").run();
     db.close();
     const result = await aggregate(['--db', path]);
-    expect(result.sampled_rows).toBe(10);
-    expect(result.outcome.accepted_turns).toBe(10);
-    // 识别轮=回复链：completed(4)+interrupted(1)+core_failed(1)=6
+    expect(result.sampled_rows).toBe(11);
+    expect(result.outcome.accepted_turns).toBe(11);
+    // 识别轮=真实回复链：completed(4)+interrupted(有正文,1)+core_failed(1)=6；
+    // 无正文的 interrupted（t-10）与 NULL/asr 类不进
     expect(result.outcome.recognized_turns).toBe(6);
     expect(result.outcome.asr_empty_turns).toBe(2);
-    // 技术失败=asr_failed(1)+core_failed(1)=2 / 接纳 10 = 0.2（asr_empty 中性不计）
-    expect(result.outcome.technical_failure_rate).toBe(0.2);
+    // 技术失败=asr_failed(1)+core_failed(1)=2 / 接纳 11 ≈0.1818（asr_empty 中性不计）
+    expect(result.outcome.technical_failure_rate).toBeCloseTo(2 / 11, 4);
     expect(result.outcome.distribution['unknown_or_null']).toBe(1);
+    expect(result.outcome.known_outcome_coverage).toBeCloseTo(10 / 11, 4);
   });
 });
