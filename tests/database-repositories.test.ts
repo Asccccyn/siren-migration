@@ -84,7 +84,7 @@ describe('SQLite 仓储', () => {
     // （C11 起含 002 可重入补列迁移，版本数 = 已应用迁移条数）
     const { migrate } = await import('@siren/storage');
     migrate(db);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 2 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 3 }); /* R7(1023)：003-turn-outcome 注册后迁移数=3 */
   });
 
   it('C11 迁移：旧库（001 后无新列）补列可重入，新列缺省 NULL', async () => {
@@ -181,3 +181,22 @@ function makeAsset(
     createdAt
   };
 }
+
+describe('R7 outcome 列（migration 003）', () => {
+  it('旧库（仅 001+002 形状）补列幂等；outcome 落库/读回往返', () => {
+    const db = openDatabase(':memory:');
+    // 迁移已随 openDatabase 执行（version 3 补列）；重复执行 migrate 不报错（可重入）
+    db.exec('SELECT outcome FROM call_turns LIMIT 1');
+    db.prepare(`INSERT INTO call_sessions (id, conversation_id, voice_profile, started_at, ended_at,
+      status, asr_provider, tts_provider, created_at)
+      VALUES ('c1', NULL, 'main', NULL, NULL, 'ended', NULL, NULL, 0)`).run();
+    const repo = new CallTurnsRepository(db);
+    repo.insert({ id: 't-out', call_id: 'c1', turn_index: 1, user_text: null, assistant_text: null, started_at: null, ended_at: null, interrupted: 0, asr_latency_ms: null, llm_first_token_ms: null, tts_first_audio_ms: null, first_audio_ms: null, first_content_audio_ms: null, outcome: 'asr_empty', created_at: 1 });
+    const rows = repo.listByCall('c1');
+    expect(rows[0]?.outcome).toBe('asr_empty');
+    // 未传 outcome → NULL（历史/未知口径），不为空串
+    repo.insert({ id: 't-null', call_id: 'c1', turn_index: 2, user_text: null, assistant_text: null, started_at: null, ended_at: null, interrupted: 0, asr_latency_ms: null, llm_first_token_ms: null, tts_first_audio_ms: null, created_at: 2 });
+    expect(repo.listByCall('c1')[1]?.outcome).toBeNull();
+    db.close();
+  });
+});

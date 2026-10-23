@@ -396,6 +396,9 @@ export class CallSession {
         partials: turn.asrPartials
       });
       this.sendJson({ t: 'notice', code: 'empty_transcript', message: '没听清，请再说一遍' });
+      // R7（2026-10-23，她 D6 裁定）：空转写轮如实落库 outcome='asr_empty'（中性——
+      // 用户说了话但无文本，此前直接丢弃致失败率分母不可还原）；文本两列为 NULL
+      this.writeTurn(turn, 'asr_empty');
       this.backToListening();
       return;
     }

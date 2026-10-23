@@ -23,6 +23,13 @@ interface AggResult {
   sampled_rows: number;
   first_audio_ms: { count: number; p50: number | null; p95: number | null };
   first_content_audio_ms: { count: number; p50: number | null; p95: number | null };
+  outcome: {
+    distribution: Record<string, number>;
+    accepted_turns: number;
+    recognized_turns: number;
+    asr_empty_turns: number;
+    technical_failure_rate: number | null;
+  };
 }
 
 /** 100 行：first_audio_ms = 1..100（全非空）；first_content_audio_ms = 1..90 + 10 个 null。
@@ -103,5 +110,34 @@ describe('aggregate-turn-latency（C11 首音 p50/p95）', () => {
   it('库文件不存在：非 0 退出', async () => {
     const result = await run(process.execPath, [script, '--db', '/nonexistent/siren-agg.db']).catch((error) => error);
     expect(result.code).not.toBe(0);
+  });
+});
+
+describe('aggregate-turn-latency（R7 outcome 分母）', () => {
+  it('outcome 分布与三口径分母：asr_empty 中性、识别轮=回复链、NULL=unknown', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'siren-agg-outcome-'));
+    scratch.push(dir);
+    const path = join(dir, 'outcome.db');
+    const db = openDatabase(path);
+    db.prepare(`INSERT INTO call_sessions (id, conversation_id, voice_profile, started_at, ended_at,
+      status, asr_provider, tts_provider, created_at)
+      VALUES ('call-o', NULL, 'main', NULL, NULL, 'ended', NULL, NULL, 0)`).run();
+    const insert = db.prepare(`INSERT INTO call_turns (id, call_id, turn_index, user_text, assistant_text,
+      started_at, ended_at, interrupted, asr_latency_ms, llm_first_token_ms, tts_first_audio_ms,
+      first_audio_ms, first_content_audio_ms, outcome, created_at)
+      VALUES (?, 'call-o', ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, ?, ?)`);
+    // 4 completed + 1 interrupted + 1 core_failed + 2 asr_empty + 1 asr_failed + 1 NULL（历史）
+    const plan: Array<string | null> = ['completed', 'completed', 'completed', 'completed', 'interrupted', 'core_failed', 'asr_empty', 'asr_empty', 'asr_failed', null];
+    plan.forEach((outcome, i) => insert.run(`t-${i}`, i + 1, outcome, 1_700_000_000_000 + i));
+    db.close();
+    const result = await aggregate(['--db', path]);
+    expect(result.sampled_rows).toBe(10);
+    expect(result.outcome.accepted_turns).toBe(10);
+    // 识别轮=回复链：completed(4)+interrupted(1)+core_failed(1)=6
+    expect(result.outcome.recognized_turns).toBe(6);
+    expect(result.outcome.asr_empty_turns).toBe(2);
+    // 技术失败=asr_failed(1)+core_failed(1)=2 / 接纳 10 = 0.2（asr_empty 中性不计）
+    expect(result.outcome.technical_failure_rate).toBe(0.2);
+    expect(result.outcome.distribution['unknown_or_null']).toBe(1);
   });
 });

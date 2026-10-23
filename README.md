@@ -9,6 +9,8 @@
 
 ## 当前基线与接手摘要
 
+- 2026-10-23（分支 `audit-fix-joint-voice-20261023` 叠加，未部署）：R7 轮次终态批（她 D6 裁定）：migration 003 `call_turns.outcome`（历史行 NULL=unknown 不回填）；新写入区分 completed/interrupted/asr_failed/asr_timeout/core_failed/tts_failed/**asr_empty（中性，空转写轮如实落库不再丢弃）**；聚合脚本新增 outcome 分布与三口径分母（接纳轮=全部行/识别轮=回复链四值/asr_empty 单列不计故障）。全套 392 绿+2 跳过、tsc 0。设备/真实供应商维维持 NOT_EXECUTED。
+
 2026-10-13 更新交接说明；本次仅维护文档，未重跑代码测试。
 
 | 项目 | 当前记录 |

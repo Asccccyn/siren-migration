@@ -6,13 +6,15 @@ import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { MIGRATION_001 } from './migrations/001-init.ts';
 import { addCallTurnLatencyColumns } from './migrations/002-turn-latency-columns.ts';
+import { addCallTurnOutcomeColumn } from './migrations/003-turn-outcome.ts';
 
 export type SqliteDatabase = Database.Database;
 
 /** sql 为纯 DDL 字符串；run 用于需要探测旧结构的可重入迁移（如 ADD COLUMN） */
 const MIGRATIONS: { version: number; sql?: string; run?: (db: SqliteDatabase) => void }[] = [
   { version: 1, sql: MIGRATION_001 },
-  { version: 2, run: addCallTurnLatencyColumns }
+  { version: 2, run: addCallTurnLatencyColumns },
+  { version: 3, run: addCallTurnOutcomeColumn }
 ];
 
 export function openDatabase(path: string): SqliteDatabase {

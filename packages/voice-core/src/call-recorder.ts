@@ -5,7 +5,9 @@ import type { CallTurnsRepository } from '@siren/storage';
 import { errorFields, type Logger } from '@siren/telemetry';
 import type { ActiveTurn } from './reply-pipeline.ts';
 
-export type TurnOutcome = 'completed' | 'interrupted' | 'asr_failed' | 'asr_timeout' | 'core_failed' | 'tts_failed';
+export type TurnOutcome = 'completed' | 'interrupted' | 'asr_failed' | 'asr_timeout' | 'core_failed' | 'tts_failed' | 'asr_empty';
+// R7（2026-10-23，她 D6 裁定）：asr_empty=中性事实（空转写轮，用户说了话但无文本）——
+// 不算 ASR 故障、不进回复链分母；其余六值维持既有语义。
 
 export class CallTurnRecorder {
   constructor(
@@ -22,8 +24,8 @@ export class CallTurnRecorder {
         id: turn.turnId,
         call_id: callId,
         turn_index: turn.index,
-        user_text: outcome === 'asr_failed' ? null : turn.userText,
-        assistant_text: outcome === 'asr_failed' ? null : turn.fullText,
+        user_text: outcome === 'asr_failed' || outcome === 'asr_empty' ? null : turn.userText,
+        assistant_text: outcome === 'asr_failed' || outcome === 'asr_empty' ? null : turn.fullText,
         started_at: turn.startedAt,
         ended_at: Date.now(),
         interrupted: outcome === 'interrupted' ? 1 : 0,
@@ -33,6 +35,7 @@ export class CallTurnRecorder {
         // C11：首音两列（first_audio_ms 为 filler 计入历史口径，first_content_audio_ms 只算正文）
         first_audio_ms: metrics.first_audio_ms,
         first_content_audio_ms: metrics.first_content_audio_ms,
+        outcome,
         created_at: Date.now()
       });
     } catch (error) {

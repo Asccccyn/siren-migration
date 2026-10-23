@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { PrebufferedAsrSession } from '../packages/voice-core/src/asr-prebuffer.ts';
 import { MockAsrProvider } from '@siren/provider-mock';
 import { buildSessionHarness, testConfig } from './helpers.ts';
+import { CallSessionsRepository, CallTurnsRepository, openDatabase } from '@siren/storage';
 
 describe('PrebufferedAsrSession：建连超时与喂入计数', () => {
   it('connect 永不落定时 end() 在限时内抛错（不再等宽限赛跑变空文本）', async () => {
@@ -85,6 +86,31 @@ describe('CallSession：空转写可见化', () => {
       expect(states.at(-1)?.state).toBe('listening');
     } finally {
       harness.session.destroy('test-done');
+    }
+  });
+
+  it('R7：空转写轮如实落库 outcome=asr_empty（中性；文本两列 NULL，不再丢弃）', async () => {
+    const db = openDatabase(':memory:');
+    db.prepare(`INSERT INTO call_sessions (id, conversation_id, voice_profile, started_at, ended_at,
+      status, asr_provider, tts_provider, created_at)
+      VALUES ('call-test-1', NULL, 'main', NULL, NULL, 'active', NULL, NULL, 0)`).run();
+    const turnsRepo = new CallTurnsRepository(db);
+    const sessionsRepo = new CallSessionsRepository(db);
+    const harness = buildSessionHarness({ asr: new MockAsrProvider({ final: '', finalDelayMs: 5 }), turnsRepo, sessionsRepo });
+    try {
+      harness.session.handleMessage({ t: 'start' });
+      harness.session.handleBinary(Buffer.alloc(3200, 0));
+      harness.session.handleMessage({ t: 'end' });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const rows = turnsRepo.listByCall('call-test-1');
+      expect(rows.length).toBe(1); // R7：空转写轮必须落库（此前直接丢弃）
+      expect(rows[0]?.outcome).toBe('asr_empty');
+      expect(rows[0]?.user_text).toBeNull();
+      expect(rows[0]?.assistant_text).toBeNull();
+      expect(rows[0]?.interrupted).toBe(0);
+    } finally {
+      harness.session.destroy('test-done');
+      db.close();
     }
   });
 });
