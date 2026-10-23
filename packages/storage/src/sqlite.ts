@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { MIGRATION_001 } from './migrations/001-init.ts';
 import { addCallTurnLatencyColumns } from './migrations/002-turn-latency-columns.ts';
 import { addCallTurnOutcomeColumn } from './migrations/003-turn-outcome.ts';
+import { createCallInvites } from './migrations/004-call-invites.ts';
 
 export type SqliteDatabase = Database.Database;
 
@@ -14,7 +15,8 @@ export type SqliteDatabase = Database.Database;
 const MIGRATIONS: { version: number; sql?: string; run?: (db: SqliteDatabase) => void }[] = [
   { version: 1, sql: MIGRATION_001 },
   { version: 2, run: addCallTurnLatencyColumns },
-  { version: 3, run: addCallTurnOutcomeColumn }
+  { version: 3, run: addCallTurnOutcomeColumn },
+  { version: 4, run: createCallInvites }
 ];
 
 export function openDatabase(path: string): SqliteDatabase {

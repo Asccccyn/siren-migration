@@ -28,6 +28,7 @@ interface AggResult {
     accepted_turns: number;
     recognized_turns: number;
     asr_empty_turns: number;
+    known_outcome_coverage: number | null;
     technical_failure_rate: number | null;
   };
 }

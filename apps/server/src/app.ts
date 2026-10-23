@@ -11,7 +11,7 @@ import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { SqliteDatabase } from '@siren/storage';
-import { deriveFieldCipher, FieldDecryptionError } from '@siren/storage';
+import { deriveFieldCipher, FieldDecryptionError, CallInvitesRepository } from '@siren/storage';
 import {
   CallSessionsRepository,
   CallTurnsRepository,
@@ -37,6 +37,7 @@ import { createOAuth } from './oauth/index.ts';
 import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
 import { registerCallSessionRoutes } from './routes/call-session.ts';
+import { registerCallInviteRoutes, startInviteExpirySweeper } from './routes/call-invites.ts';
 import { registerAssetsRoute } from './routes/assets.ts';
 import { registerWebAuthRoute } from './routes/web-auth.ts';
 import { registerCallWebSocket } from './websocket/call-handler.ts';
@@ -189,6 +190,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   });
   registerVoiceMessageRoutes(app, { config, logger, voice, pipeline });
   registerCallSessionRoutes(app, { callCenter });
+  // B5/P1（2026-10-24）：来电邀请持久状态 + 服务端过期回收（重启即恢复扫描）
+  const invites = new CallInvitesRepository(db);
+  registerCallInviteRoutes(app, { invites });
+  const stopInviteSweeper = startInviteExpirySweeper(invites);
+  app.addHook('onClose', async () => stopInviteSweeper());
   registerAssetsRoute(app, {
     config,
     store: providers.store instanceof LocalObjectStore ? providers.store : null
