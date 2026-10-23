@@ -76,16 +76,6 @@ export class VoiceTurnCoordinator {
     if (this.acknowledged) this.deps.sendJson({ t: 'end', input_id: this.current });
   }
 
-  /**
-   * C05 短输入收尾：已 begin 的输入无论客户端 VAD minSpeech 是否达标都发 end，
-   * 把已缓冲 PCM 正常送 ASR（服务端终态与 empty_transcript 处理已有）；
-   * abort 只保留给从未 begin 的输入与手动取消。等价于 finish(true) 的
-   * end 路径，独立命名以显式区分语义。
-   */
-  endInput(): void {
-    this.finish(true);
-  }
-
   abort(): void {
     this.outputAllowed = false;
     const playback = this.deps.invalidateOutput();

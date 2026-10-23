@@ -23,8 +23,6 @@ export interface UtteranceUplinkDeps {
   canInterrupt?: () => boolean;
   startInput?: () => void;
   finishInput?: (valid: boolean) => void;
-  /** C05：已 begin 输入的短收尾入口（发 end 送 ASR）；缺省回退 finishInput(true)。 */
-  endInput?: () => void;
   log?: (message: string) => void;
 }
 
@@ -198,25 +196,12 @@ export class UtteranceUplink {
   }
 
   private finishInput(valid: boolean): void {
-    // C05 短输入语义：旧行为——VAD 静音断句 spokenMs < minSpeechMs 时 finishInput(false)
-    // -> abort。起声已确认的短句（interrupt/start 已发出、pre-roll 已 drain）被 abort 后
-    // 既不进 ASR 也不恢复旧播放，等于普遍丢弃短输入。新行为：本轮 input 已 begin 的
-    // 短输入改发 end 正常收尾，把已缓冲 PCM 交服务端 ASR 判定（服务端已有
-    // adopted/partial/unrecognized 终态与 empty_transcript 处理）；只有从未 begin 的
-    // 假候选才保留 abort。VadMachine 的 minSpeech 校验不变——invalid 的含义从
-    // "丢弃"改为"短于最短语音门，交由服务端判定"。
-    if (!valid && this.inputBegan) {
-      this.inputBegan = false;
-      if (this.deps.endInput) {
-        this.deps.endInput();
-        return;
-      }
-      this.deps.sendJson({ t: 'end' });
-      return;
-    }
+    // C05: confirmed short input still reaches ASR. Always use the same
+    // coordinator so end retains its input identity and waits behind ACK/PCM.
+    const submit = valid || this.inputBegan;
     this.inputBegan = false;
-    if (this.deps.finishInput) this.deps.finishInput(valid);
-    else this.deps.sendJson({ t: valid ? 'end' : 'abort' });
+    if (this.deps.finishInput) this.deps.finishInput(submit);
+    else this.deps.sendJson({ t: submit ? 'end' : 'abort' });
   }
 
   private sendFrames(samples: Float32Array): void {

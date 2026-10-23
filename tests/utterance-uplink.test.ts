@@ -5,7 +5,7 @@
  *   ——不 abort、不 start、不上行（回声误触发与自动打断故障区收敛）；
  *   回 listening 且用户仍在说话时自动接上，句首来自 pre-roll
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { VadMachine, type VadParams } from '../apps/web/src/vad.ts';
 import { AudioPreRollBuffer } from '../apps/web/src/pre-roll-buffer.ts';
 import { Pcm16Framer } from '../apps/web/src/uplink-encoder.ts';
@@ -14,6 +14,8 @@ import { VoiceTurnCoordinator } from '../apps/web/src/voice-turn-coordinator.ts'
 import { StreamRouter } from '../apps/web/src/stream-router.ts';
 
 const BLOCK = 160; // 10ms @16k
+const coordinators: VoiceTurnCoordinator[] = [];
+afterEach(() => { for (const coordinator of coordinators.splice(0)) coordinator.reset(); });
 
 interface Harness {
   uplink: UtteranceUplink;
@@ -262,6 +264,7 @@ function negotiatedHarness() {
     }
   });
   turns.negotiate(true);
+  coordinators.push(turns);
   let aiActive = false;
   const uplink = new UtteranceUplink({
     vad: new VadMachine(
@@ -275,8 +278,7 @@ function negotiatedHarness() {
     isAiActive: () => aiActive,
     canInterrupt: () => turns.supported,
     startInput: () => turns.begin(),
-    finishInput: (valid) => turns.finish(valid),
-    endInput: () => turns.endInput()
+    finishInput: (valid) => turns.finish(valid)
   });
   return {
     json, frames, dropped, turns, router, uplink,

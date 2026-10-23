@@ -292,8 +292,6 @@ async function setupCapture(): Promise<void> {
     sendFrame: (frame) => turns?.sendFrame(frame),
     startInput: () => turns?.begin(),
     finishInput: (valid) => turns?.finish(valid),
-    // C05：已 begin 的短输入（VAD minSpeech 不达标）以 end 提交送 ASR，不再 abort 丢弃
-    endInput: () => turns?.endInput(),
     canInterrupt: () => turns?.supported ?? false,
     isAiActive: hasResponse,
     log: (message) => logEvent(message)
