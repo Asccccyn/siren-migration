@@ -79,10 +79,21 @@ function percentile(sorted, q) {
 function summary(column) {
   const values = rows
     .map((row) => row[column])
-    .filter((value) => Number.isFinite(value))
+    .filter((value) => Number.isFinite(value) && value >= 0)
     .sort((a, b) => a - b);
   if (values.length === 0) return { count: 0, p50: null, p95: null };
   return { count: values.length, p50: percentile(values, 50), p95: percentile(values, 95) };
+}
+
+function quality(column) {
+  const values = rows.map((row) => row[column]);
+  const valid = values.filter((value) => Number.isFinite(value) && value >= 0);
+  return {
+    total: rows.length,
+    missing: values.filter((value) => value === null || value === undefined).length,
+    invalid: values.filter((value) => value !== null && value !== undefined && (!Number.isFinite(value) || value < 0)).length,
+    max: valid.length ? valid.reduce((max, value) => Math.max(max, value), 0) : null
+  };
 }
 
 const output = {
@@ -91,10 +102,17 @@ const output = {
   sampled_rows: rows.length,
   first_audio_ms: summary('first_audio_ms'),
   first_content_audio_ms: summary('first_content_audio_ms'),
+  measurement_basis: 'server_end_received_to_pcm_send_request',
+  quality: {
+    first_audio_ms: quality('first_audio_ms'),
+    first_content_audio_ms: quality('first_content_audio_ms')
+  },
   notes: [
+    '服务端接到 end 至请求发送 PCM；不是用户真实停声、浏览器播放或设备实际可听延迟',
     '冷热轮不分：全部轮次（含首轮冷启动与后续热轮）合并统计',
-    'null 不计入对应字段样本（NULL=该轮无此口径数据，如只有 filler 的轮次 first_content_audio_ms 为空）',
-    'p50/p95 为 nearest-rank：升序第 ceil(q/100*n) 个值'
+    'null/非法值不参与百分位；quality 保留其数量和完整分母，缺失不是零延迟或成功',
+    '现存表未保存完整终态，不能从缺失推断失败率；空转写等未落库轮次亦不在此分母',
+    'p50/p95 为 nearest-rank：升序第 ceil(q/100*n) 个值；小样本 p95 不稳定'
   ]
 };
 process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);

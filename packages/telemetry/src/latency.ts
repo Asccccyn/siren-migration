@@ -9,16 +9,19 @@ export class LatencyTracker {
   private interrupted = false;
   private fillerPlayed = false;
 
-  mark(mark: LatencyMark, at: number = Date.now()): void {
+  // Every automatic mark shares this process's monotonic clock. Wall time is
+  // reserved for stored timestamps, never elapsed-time subtraction.
+  mark(mark: LatencyMark, at: number = performance.now()): void {
+    if (!Number.isFinite(at)) throw new RangeError('latency mark must be finite');
     if (!this.marks.has(mark)) this.marks.set(mark, at);
   }
 
-  markOnce(mark: LatencyMark, at: number = Date.now()): void {
+  markOnce(mark: LatencyMark, at: number = performance.now()): void {
     this.mark(mark, at);
   }
 
-  markEnd(at: number = Date.now()): void {
-    if (!this.marks.has('turn_end')) this.marks.set('turn_end', at);
+  markEnd(at: number = performance.now()): void {
+    this.mark('turn_end', at);
   }
 
   setInterrupted(): void {
@@ -38,7 +41,8 @@ export class LatencyTracker {
       const av = this.marks.get(a);
       const bv = this.marks.get(b);
       if (av === undefined || bv === undefined) return null;
-      return Math.max(bv - av, 0);
+      const elapsed = bv - av;
+      return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : null;
     };
     return {
       asr_latency_ms: diff('speech_end', 'asr_final'),
