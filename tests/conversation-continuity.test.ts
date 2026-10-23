@@ -34,6 +34,7 @@ class SlowMockTts implements TtsProvider {
 /** 记录全部 turn 输入的 Core 桩：模拟"同一个Peer Core / 同一个 conversation" */
 class RecordingCoreBridge implements CoreBridge {
   readonly inputs: CoreTurnInput[] = [];
+  generatedText = '';
   /** 模拟 typed message（网页文字链路）直接写进同一 conversation 的旁路记录 */
   readonly typedMessages: { conversationId: string; text: string }[] = [];
 
@@ -42,7 +43,9 @@ class RecordingCoreBridge implements CoreBridge {
   async *streamReply(input: CoreTurnInput): AsyncGenerator<CoreDelta> {
     this.inputs.push(input);
     for (let i = 0; i < this.reply.length; i += 3) {
-      yield { text: this.reply.slice(i, i + 3) };
+      const text = this.reply.slice(i, i + 3);
+      this.generatedText += text;
+      yield { text };
     }
   }
 
@@ -179,8 +182,8 @@ describe('Conversation 连续性（P0-4.5 电话与网页共享同一 conversati
     expect(turnsRepo.listByCall('call-dup').length).toBe(1);
   });
 
-  it('被打断的 assistant turn 保留已下发句子前缀并标记 interrupted（不声称用户已听）', async () => {
-    const { harness, turnsRepo } = buildRecording({
+  it('被打断的 assistant turn 保留实际已生成原文并标记 interrupted（不声称用户已听）', async () => {
+    const { harness, turnsRepo, core } = buildRecording({
       conversationId: 'conv-int',
       callId: 'call-int',
       reply: '第一句话说完。第二句话也说完了。第三句话继续。第四句还没说。',
@@ -192,13 +195,19 @@ describe('Conversation 连续性（P0-4.5 电话与网页共享同一 conversati
     session.handleMessage({ t: 'end' });
     await waitFor(() => harness.texts().some((m) => m.t === 'pcm'));
     await new Promise((resolve) => setTimeout(resolve, 30));
+    const generatedAtAbort = core.generatedText;
     session.handleMessage({ t: 'abort' });
     await waitFor(() => harness.texts().some((m) => m.t === 'interrupted'));
 
     const turns = turnsRepo.listByCall('call-int');
     expect(turns.length).toBe(1);
     expect(turns[0].interrupted).toBe(1);
-    // 只记录已完整下发的句子前缀；客户端播放进度有独立的 client_reported/unknown 合同。
-    expect(turns[0].assistant_text ?? '').not.toContain('第四句还没说');
+    // 联合审计任务 §4.1：已生成原文必须保留；旧“未下发就不保存”断言与最新合同冲突。
+    // 使用实际 Core delta witness，不能拿预设整篇答案冒充已生成内容。
+    expect(generatedAtAbort.length).toBeGreaterThan(0);
+    expect(turns[0].assistant_text).toBe(generatedAtAbort);
+    expect(harness.texts().filter((m) => m.t === 'reply')).toEqual([
+      expect.objectContaining({ text: generatedAtAbort })
+    ]);
   });
 });

@@ -558,7 +558,7 @@ export class CallSession {
       // 旧输出流永久失效（P0-3）：客户端凭 stream_id 丢弃迟到 chunk，且不再要求 drained
       this.clearPendingDrain('interrupted');
       this.sendJson({ t: 'interrupted', stream_id: turn.outputStreamId });
-      // 只保留已完整下发的句子前缀；客户端实际播放另有证据字段。
+      // 保留已生成的原文；音频下发与客户端播放事实由独立字段表达。
       if (turn.fullText) {
         this.sendJson({ t: 'reply', text: turn.fullText });
       }
@@ -584,9 +584,9 @@ export class CallSession {
     turn.asr.abort();
     // 立即终止 TTS provider 上游流（P0-2/P0-9：不是只停止消费）
     if (!turn.ttsAbort.signal.aborted) turn.ttsAbort.abort();
-    // This prefix was sent, not necessarily played. Core receives separate
-    // explicitly client-reported/unknown playback evidence on the next turn.
-    turn.fullText = turn.sentText;
+    // Generated text is durable even when its sentence has only partly reached
+    // TTS. sentText remains the separate fully-sent prefix; neither is heard text.
+    turn.fullText = turn.receivedText;
     void this.deps.core.cancel(turn.turnId).catch(() => undefined);
     this.log.debug('turn_abort', { reason, turn_index: turn.index });
   }
