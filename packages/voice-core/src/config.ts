@@ -79,6 +79,10 @@ export interface SirenConfig {
   callTokenTtlS: number;
   /** 客户端 playback_drained ACK 超时（P0-4，0 = 不等待） */
   playbackDrainTimeoutMs: number;
+  /** A11 柔性挂断 linger（2026-10-24）：模型挂断意图→正文 drain 后的等待窗口，
+   *  新用户输入取消；0 = drain 后立即结束。默认 15s 为产品试验值（CallHome 作者
+   *  数值仅参考，非她裁定）。 */
+  hangupLingerMs: number;
   /** 客户端 jitter buffer 建议（ready 帧下发） */
   jitterBufferMs: number;
   signedUrlTtlS: number;
@@ -240,6 +244,7 @@ function resolveRealtimeTunables(env: EnvSource) {
     partialGraceMs: num(env, 'PARTIAL_GRACE_MS', 450),
     callTokenTtlS: num(env, 'CALL_TOKEN_TTL_S', 120),
     playbackDrainTimeoutMs: num(env, 'PLAYBACK_DRAIN_TIMEOUT_MS', 4000),
+    hangupLingerMs: num(env, 'HANGUP_LINGER_MS', 15_000),
     signedUrlTtlS: num(env, 'SIGNED_URL_TTL_S', 3600),
     maxUploadBytes: num(env, 'MAX_UPLOAD_MB', 25) * 1024 * 1024,
     wsMaxPayloadBytes: num(env, 'WS_MAX_PAYLOAD_MB', 2) * 1024 * 1024,

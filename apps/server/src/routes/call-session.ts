@@ -14,6 +14,16 @@ export interface CallSessionRoutesDeps {
 }
 
 export function registerCallSessionRoutes(app: FastifyInstance, deps: CallSessionRoutesDeps): void {
+  /** A11（2026-10-24）：模型提出挂断——est call_control(end) 服务间调用；立即回执
+   *  accepted（不等整通结束，防 Siren↔est 互等死锁）；真正结束由 drain→linger 决定。 */
+  app.post('/v1/calls/:callId/hangup-request', async (request, reply) => {
+    const { callId } = request.params as { callId: string };
+    const session = deps.callCenter.getSession(callId);
+    if (!session) { await reply.code(404).send({ error: 'call_not_found' }); return; }
+    const out = session.requestHangup();
+    await reply.code(200).send({ call_id: callId, ...out, note: '已接受结束意图；等待最后正文播放完成后按 linger 收口，她开口则取消' });
+  });
+
   app.post('/v1/calls', async (request, reply) => {
     const parsed = createCallBodySchema.safeParse(request.body ?? {});
     if (!parsed.success) {

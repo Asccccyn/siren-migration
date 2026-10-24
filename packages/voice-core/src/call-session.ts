@@ -68,6 +68,13 @@ export class CallSession {
   private readonly knownInputIds = new Set<string>();
   private lastInputId: string | undefined;
   private pendingInterruption: CoreInterruption | undefined;
+  /** A11 柔性挂断（2026-10-24）：模型结束意图——等最后正文真实 drain（或兜底 unknown）→
+   *  linger 计时（默认 15s 试验值）→ 期间无新有效输入才真正结束；新输入取消；用户挂断不受限。
+   *  唯一计时器带 generation，teardown 清理。 */
+  private hangupRequest: { lingerMs: number; generation: number } | null = null;
+  private hangupGeneration = 0;
+  private hangupTimer: ReturnType<typeof setTimeout> | null = null;
+
   /** 等待客户端 playback_drained ACK 的输出流（P0-4） */
   private pendingDrain: { streamId: string; timer: NodeJS.Timeout; sentAt: number; settle: (drained: boolean) => void } | null = null;
 
@@ -177,6 +184,51 @@ export class CallSession {
 
   /** 连接关闭/服务停止/背压超限：幂等 finalize（P0-6）。cleanup 完成前
    * 不置 terminal flag，保证 abort/落库/token 吊销/注册表移除一定发生 */
+  /** A11（2026-10-24）：模型提出挂断——立即回执（本方法同步返回，不等整通结束，防
+   *  Siren↔est 互等死锁）；真正的结束等最后正文 drain 后 linger 到期，且新输入可取消。 */
+  requestHangup(lingerMs?: number): { accepted: boolean; state: string } {
+    if (this.closed || this.closing) return { accepted: false, state: 'ended' };
+    const linger = lingerMs ?? this.deps.config.hangupLingerMs ?? 15_000;
+    this.hangupRequest = { lingerMs: linger, generation: ++this.hangupGeneration };
+    this.sendJson({ t: 'notice', code: 'hangup_pending', message: `他想挂电话了：等这段说完（约 ${Math.round(linger / 1000)} 秒内不开口就结束），你要是想再说就开口。` });
+    this.log.info('hangup_requested', { linger_ms: linger, state: this.state });
+    // 已回 listening（无在途正文）→ 立即进入 linger；speaking/ending → 挂起，
+    // 由 drain settle 之后的 maybeStartHangupLinger 接管（兜底超时也是 settle）
+    if (this.stateMachine.is('listening') && !this.pendingDrain) this.startHangupLinger();
+    return { accepted: true, state: this.state };
+  }
+
+  /** 新用户输入取消柔性挂断（合同：新的人声取消 linger；噪声不无限续命由 VAD 层负责） */
+  private cancelHangup(reason: string): void {
+    if (!this.hangupRequest) return;
+    this.hangupRequest = null;
+    if (this.hangupTimer) { clearTimeout(this.hangupTimer); this.hangupTimer = null; }
+    this.log.info('hangup_cancelled', { reason, generation: this.hangupGeneration });
+  }
+
+  private maybeStartHangupLinger(): void {
+    if (!this.hangupRequest || this.hangupTimer || this.pendingDrain) return;
+    this.startHangupLinger();
+  }
+
+  private startHangupLinger(): void {
+    const req = this.hangupRequest;
+    if (!req || this.hangupTimer) return;
+    const gen = req.generation;
+    // linger 不是媒体状态（窗口内仍是 listening 可收新输入）：用 notice 告知等待窗口，
+    // 不动状态机——同一事实（能否接收输入）唯一权威是 listening 态
+    this.sendJson({ t: 'notice', code: 'hangup_linger', message: `正文已播完，${Math.round(req.lingerMs / 1000)} 秒内不开口就挂断。` });
+    this.hangupTimer = setTimeout(() => {
+      this.hangupTimer = null;
+      // generation 校验：旧计时器不能结束新一通/新一轮意图
+      if (!this.hangupRequest || this.hangupRequest.generation !== gen) return;
+      this.hangupRequest = null;
+      this.log.info('call_hangup_linger_elapsed', { generation: gen });
+      this.destroy('model_hangup', { code: 1000, reason: 'linger elapsed without new speech' });
+    }, req.lingerMs);
+    this.hangupTimer.unref?.();
+  }
+
   destroy(reason = 'closed', closeInfo?: { code: number; reason: string }): void {
     if (this.closed || this.closing) return;
     this.closing = true;
@@ -184,6 +236,8 @@ export class CallSession {
       const turn = this.turn;
       this.abortTurn(`destroy:${reason}`);
       this.clearPendingDrain('destroy');
+      if (this.hangupTimer) { clearTimeout(this.hangupTimer); this.hangupTimer = null; }
+      this.hangupRequest = null;
       if (turn && !turn.written && (turn.userText || turn.fullText || this.lastPartialText)) {
         // F10：销毁（断线/背压/关停）不丢当前轮——已识别/已产出内容的轮次幂等落库；
         // ending 阶段仅有 partial 时也保留（文字不丢），outcome 记 interrupted
@@ -321,6 +375,7 @@ export class CallSession {
     const nextInputId = inputId ?? randomUUID();
     this.knownInputIds.add(nextInputId);
     this.lastInputId = nextInputId;
+    this.cancelHangup('new_input'); // A11：她又开口了——取消模型挂断的 linger
     const turn: ActiveTurn = {
       index: this.turnIndex,
       turnId: randomUUID(),
@@ -544,6 +599,7 @@ export class CallSession {
     this.finalizeReplyTurn(turn, result.status === 'failed' ? `${result.kind}_failed` : 'completed');
     if (this.closed || this.closing) return;
     this.backToListening();
+    this.maybeStartHangupLinger(); // A11：正文已 drain（真 ACK 或有界兜底）→ 进入 linger
   }
 
   /** Preserve failure at the terminal boundary; a metrics frame is not success. */
