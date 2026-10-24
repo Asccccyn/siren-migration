@@ -60,4 +60,9 @@ export class CallInvitesRepository {
   activeFor(conversationId: string): CallInviteRow | undefined {
     return this.db.prepare(`SELECT * FROM call_invites WHERE conversation_id = ? AND state = 'pending' ORDER BY created_at DESC LIMIT 1`).get(conversationId) as CallInviteRow | undefined;
   }
+
+  /** 协议①（2026-10-24）：近 N 条邀请（pending 优先置前）——est 卡片投影数据源 */
+  recentFor(conversationId: string, limit: number): CallInviteRow[] {
+    return this.db.prepare(`SELECT * FROM call_invites WHERE conversation_id = ? ORDER BY CASE WHEN state='pending' THEN 0 ELSE 1 END, created_at DESC LIMIT ?`).all(conversationId, limit) as CallInviteRow[];
+  }
 }

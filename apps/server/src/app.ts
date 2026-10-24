@@ -38,6 +38,7 @@ import { registerHealthRoute } from './routes/health.ts';
 import { registerVoiceMessageRoutes } from './routes/voice-message.ts';
 import { registerCallSessionRoutes } from './routes/call-session.ts';
 import { registerCallInviteRoutes, startInviteExpirySweeper } from './routes/call-invites.ts';
+import { registerVoiceAssetAudioRoute } from './routes/voice-asset-audio.ts';
 import { registerAssetsRoute } from './routes/assets.ts';
 import { registerWebAuthRoute } from './routes/web-auth.ts';
 import { registerCallWebSocket } from './websocket/call-handler.ts';
@@ -146,7 +147,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     sessionsRepo,
     turnsRepo,
     asrName: providers.active.asr,
-    ttsName: providers.active.realtimeTts
+    ttsName: providers.active.realtimeTts,
+    // 协议②（2026-10-24）：通话用户原声资产化（失败不阻断通话，audio_ref 缺省=纯文本轮）
+    userAudio: { assetsRepo, store: providers.store }
   });
 
   const app = Fastify({
@@ -195,6 +198,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   registerCallInviteRoutes(app, { invites });
   const stopInviteSweeper = startInviteExpirySweeper(invites);
   app.addHook('onClose', async () => stopInviteSweeper());
+  // 协议②（2026-10-24）：通话用户原声字节（est 服务间取回；只读）
+  registerVoiceAssetAudioRoute(app, { assetsRepo, store: providers.store instanceof LocalObjectStore ? providers.store : null });
   registerAssetsRoute(app, {
     config,
     store: providers.store instanceof LocalObjectStore ? providers.store : null

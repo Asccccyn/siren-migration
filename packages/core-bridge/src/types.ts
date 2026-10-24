@@ -9,6 +9,9 @@ export interface CoreTurnInput {
   turnId: string;
   text: string;
   modality: 'voice_call';
+  /** 2026-10-24 协议②：本轮用户原声资产引用（siren:<voice_asset_id>）——est 取回字节绑
+   *  消息附件，供 oído 快证据/按需深听；缺省=该轮无原声（纯文本轮）。 */
+  audioRef?: string;
   /** Prior interrupted reply, with explicitly limited playback evidence. */
   interruptedTurn?: CoreInterruption;
 }

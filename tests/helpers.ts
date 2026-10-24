@@ -167,6 +167,8 @@ export function buildSessionHarness(deps: {
   onDestroyed?: (session: CallSession) => void;
   /** 缺省为不可用 FillerManager；filler 相关用例注入真实实例 */
   fillers?: FillerManager;
+  /** 协议②（2026-10-24）：用户原声资产化注入 */
+  userAudio?: import('@siren/voice-core').CallSessionDeps['userAudio'];
 }): SessionHarness {
   const frames: (string | Buffer)[] = [];
   const closeCalls: { code: number; reason: string }[] = [];
@@ -188,6 +190,7 @@ export function buildSessionHarness(deps: {
     fillers: deps.fillers ?? new FillerManager('Z:\\nonexistent-fillers', false, silentLogger),
     turnsRepo,
     sessionsRepo,
+    userAudio: deps.userAudio,
     send: (data, binary) => {
       frames.push(binary ?? data);
     },

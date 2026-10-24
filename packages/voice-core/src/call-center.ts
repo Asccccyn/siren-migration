@@ -27,6 +27,11 @@ export interface CallCenterDeps {
   profiles: VoiceProfileRegistry;
   sessionsRepo?: CallSessionsRepository;
   turnsRepo?: CallTurnsRepository;
+  /** 协议②（2026-10-24）：用户原声资产化（透传 CallSession） */
+  userAudio?: {
+    assetsRepo: import('@siren/storage').VoiceAssetsRepository;
+    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown> };
+  };
   /** 元数据用：实际生效的 provider 名（写入 call_sessions） */
   asrName?: string;
   ttsName?: string;
@@ -144,6 +149,7 @@ export class CallCenter {
       fillers: this.deps.fillers,
       turnsRepo: this.deps.turnsRepo,
       sessionsRepo: this.deps.sessionsRepo,
+      userAudio: this.deps.userAudio,
       send: params.send,
       bufferedAmount: params.bufferedAmount,
       close: params.close,

@@ -80,6 +80,20 @@ export function registerCallInviteRoutes(app: FastifyInstance, deps: CallInviteR
     if (!row) { await reply.code(404).send({ error: 'no_active_invite' }); return; }
     await reply.code(200).send({ invite_id: row.id, state: row.state, expires_at: row.expires_at });
   });
+  // 协议①（2026-10-24）：est 卡片投影数据源——当前有效邀请 + 近期终态（未接/拒接/取消）。
+  // 期限回收仍由 sweeper 服务端完成，本端点只读。
+  app.get('/v1/conversations/:conversation_id/invites', async (request, reply) => {
+    const { conversation_id } = request.params as { conversation_id: string };
+    const rows = deps.invites.recentFor(conversation_id, 10);
+    await reply.code(200).send({
+      conversation_id,
+      active: rows.find((r) => r.state === 'pending') ?? null,
+      recent: rows.filter((r) => r.state !== 'pending').map((r) => ({
+        invite_id: r.id, state: r.state, expires_at: r.expires_at, created_at: r.created_at,
+        updated_at: r.updated_at, ended_reason: r.ended_reason
+      }))
+    });
+  });
 }
 
 /** 服务端过期 sweeper（app 启动恢复=立即一跳；此后周期回收）。不占请求路径。 */

@@ -41,6 +41,11 @@ export interface CallSessionDeps {
   fillers: FillerManager;
   turnsRepo?: CallTurnsRepository;
   sessionsRepo?: CallSessionsRepository;
+  /** 2026-10-24 协议②：用户原声资产化（可选——未装配=该通话轮不带 audio_ref，不阻断通话） */
+  userAudio?: {
+    assetsRepo: import('@siren/storage').VoiceAssetsRepository;
+    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown> };
+  };
   send: (data: string, binary?: Buffer) => void;
   bufferedAmount: () => number;
   close: (code: number, reason: string) => void;
@@ -166,6 +171,7 @@ export class CallSession {
       this.backToListening();
       return;
     }
+    turn.pcmChunks.push(pcm); // 协议②：原声留档（与 audioBytes 同限；超限整轮已在上方终止）
     turn.asr.feed(pcm);
   }
 
@@ -325,6 +331,7 @@ export class CallSession {
       userText: '',
       receivedText: '',
       audioBytes: 0,
+      pcmChunks: [],
       asrPartials: 0,
       asr: createAsrSession(
         { asr: this.deps.voice, profile: this.deps.profile, prebufferMaxBytes: this.deps.config.prebufferMaxBytes },
@@ -449,6 +456,41 @@ export class CallSession {
 
   private async runReplyPhase(turn: ActiveTurn): Promise<void> {
     if (turn.aborted || this.turn !== turn) return;
+    // 协议②（2026-10-24）：采纳后、派发 Core 前落本轮原声资产（PCM16/16k mono → WAV）。
+    // 失败不阻断通话（audio_ref 缺省=纯文本轮，如实降级）；写成功后随 CoreTurnInput 上桥。
+    const ua = this.deps.userAudio;
+    if (ua && turn.pcmChunks.length > 0 && turn.userText) {
+      try {
+        const wav = encodeWavPcm16Mono(turn.pcmChunks, this.deps.voice.inputSampleRate);
+        const assetId = randomUUID();
+        const messageId = `call-${this.deps.callId}-t${turn.index}`;
+        const objectKey = `voice/calls/${this.deps.callId}/${messageId}/${assetId}/audio.wav`;
+        await ua.store.put(objectKey, wav, 'audio/wav');
+        ua.assetsRepo.insert({
+          id: assetId,
+          conversationId: this.deps.conversationId,
+          messageId,
+          direction: 'user',
+          voiceProfile: this.deps.profile.id,
+          provider: 'call',
+          providerVoiceId: null,
+          audioFormat: 'wav',
+          sampleRate: this.deps.voice.inputSampleRate,
+          durationMs: Math.round((wav.length - 44) / 2 / this.deps.voice.inputSampleRate * 1000),
+          language: 'zh-CN',
+          emotion: null,
+          text: null,
+          ttsScript: null,
+          transcript: turn.userText,
+          objectKey,
+          checksum: null,
+          createdAt: Date.now()
+        });
+        turn.audioRef = `siren:${assetId}`;
+      } catch (err) {
+        this.log.warn('user_audio_asset_failed', { ...errorFields(err as Error), turn_index: turn.index });
+      }
+    }
     this.stateMachine.transition('thinking');
     if (this.pendingInterruption === turn.interruptedTurn) this.pendingInterruption = undefined;
     this.sendJson({ t: 'state', state: 'thinking' });
@@ -695,4 +737,24 @@ export class CallSession {
   private writeTurn(turn: ActiveTurn, outcome: TurnOutcome): void {
     this.recorder.write(this.deps.callId, turn, outcome);
   }
+}
+
+/** 协议②（2026-10-24）：PCM16/mono 分片 → 单文件 WAV（44B 头 + 小端载荷）。 */
+function encodeWavPcm16Mono(chunks: Buffer[], sampleRate: number): Buffer {
+  const payload = Buffer.concat(chunks);
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + payload.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34); // bits
+  header.write('data', 36);
+  header.writeUInt32LE(payload.length, 40);
+  return Buffer.concat([header, payload]);
 }

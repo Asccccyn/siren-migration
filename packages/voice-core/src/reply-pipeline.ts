@@ -56,6 +56,10 @@ export interface ActiveTurn {
   receivedText: string;
   /** 本轮已上行音频字节（S1011-025 预算计量） */
   audioBytes: number;
+  /** 2026-10-24 协议②音频链：本轮上行 PCM 分片（有界，随 audioBytes 同限）——采纳后落原声资产 */
+  pcmChunks: Buffer[];
+  /** 已落原声资产引用（siren:<asset_id>）——随 CoreTurnInput 上桥，est 取回绑消息供 oído */
+  audioRef?: string;
   asr: PrebufferedAsrSession;
   /** 本轮收到的 ASR partial 数（1002 空转写排障：0=火山侧全聋） */
   asrPartials: number;
@@ -185,6 +189,7 @@ export class ReplyPipeline {
       turnId: turn.turnId,
       text: turn.userText,
       modality: 'voice_call' as const,
+      ...(turn.audioRef ? { audioRef: turn.audioRef } : {}),
       ...(turn.interruptedTurn ? { interruptedTurn: turn.interruptedTurn } : {})
     };
     return (async function* () {

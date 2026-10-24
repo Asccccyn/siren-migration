@@ -44,6 +44,7 @@ export class HttpCoreBridge implements CoreBridge {
           turn_id: input.turnId,
           modality: input.modality,
           text: input.text,
+        ...(input.audioRef ? { audio_ref: input.audioRef } : {}),
           ...(input.interruptedTurn ? {
             interrupted_turn: {
               turn_id: input.interruptedTurn.turnId,
