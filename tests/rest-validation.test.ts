@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildTestApp } from './helpers.ts';
+import { buildTestApp, waitFor } from './helpers.ts';
 
 describe('REST 校验与鉴权', () => {
   it('POST /v1/voice/synthesize：非法 body 返回 400', async () => {
@@ -36,6 +36,114 @@ describe('REST 校验与鉴权', () => {
       expect(res.headers['content-type']).toContain('audio/');
       expect(Number(res.headers['x-siren-duration-ms'])).toBeGreaterThan(0);
       expect(res.body.length).toBeGreaterThan(0);
+    } finally {
+      await siren.dispose();
+    }
+  });
+
+  it('联合审计 A01：真实 HTTP 客户端断开 → 取消直达 provider；正常请求不被误取消', async () => {
+    const seen: Array<{ signal: AbortSignal | undefined; abortedAtReturn: boolean }> = [];
+    let hold = false;
+    let entered!: () => void;
+    const providerEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const siren = await buildTestApp({}, (providers) => {
+      const mock = providers.asyncTts;
+      providers.asyncTts = {
+        synthesize: async (request, signal) => {
+          const record = { signal, abortedAtReturn: false };
+          seen.push(record);
+          if (hold) {
+            entered();
+            await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+            record.abortedAtReturn = signal?.aborted ?? false;
+            signal?.throwIfAborted();
+          }
+          const result = await mock.synthesize(request, signal);
+          record.abortedAtReturn = signal?.aborted ?? false;
+          return result;
+        }
+      };
+    });
+    await siren.app.listen({ host: '127.0.0.1', port: 0 });
+    const { port } = siren.app.server!.address() as { port: number };
+    const url = `http://127.0.0.1:${port}/v1/voice/synthesize`;
+    try {
+      const ok = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: '正常合成。' }) });
+      expect(ok.status).toBe(200);
+      expect((await ok.arrayBuffer()).byteLength).toBeGreaterThan(0);
+      expect(seen[0]!.signal).toBeDefined();
+      expect(seen[0]!.abortedAtReturn).toBe(false); // 请求体正常读完不等于取消
+
+      hold = true;
+      const client = new AbortController();
+      const pending = fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: '断开前在合成。' }), signal: client.signal }).catch((error: unknown) => error);
+      await providerEntered;
+      client.abort();
+      await waitFor(() => seen[1]?.abortedAtReturn === true);
+      expect(await pending).toBeInstanceOf(Error);
+      expect(seen).toHaveLength(2); // 断开不触发任何补偿重合成
+    } finally {
+      await siren.dispose();
+    }
+  });
+
+  it('联合审计 A01-F02/F04：operation_id 合成——生成即持久；同键重放同一资产不重付；异参冲突；独立发言不合并', async () => {
+    let synthCount = 0;
+    const siren = await buildTestApp({}, (providers) => {
+      const mock = providers.asyncTts;
+      providers.asyncTts = {
+        synthesize: async (request, signal) => {
+          synthCount++;
+          return mock.synthesize(request, signal);
+        }
+      };
+    });
+    const opKey = 'voice-say:aaaaaaaaaaaaaaaaaaaaaaaa';
+    try {
+      const first = await siren.app.inject({
+        method: 'POST',
+        url: '/v1/voice/synthesize',
+        payload: { text: '同一个操作。', operation_id: opKey }
+      });
+      expect(first.statusCode).toBe(200);
+      expect(synthCount).toBe(1);
+      expect(first.headers['x-siren-replayed']).toBe('false');
+      const assetId = first.headers['x-siren-voice-asset-id'];
+      expect(typeof assetId).toBe('string');
+      // 生成即持久：资产已可按操作身份查回（响应丢失前就处于该状态）
+      const listed = await siren.app.inject({ method: 'GET', url: `/v1/voice/messages?message_id=${opKey}` });
+      expect(listed.statusCode).toBe(200);
+      expect((listed.json() as { items: Array<{ id: string }> }).items.some((i) => i.id === assetId)).toBe(true);
+      // F02：响应在 est 保存前丢失 → 同操作恢复拿到同一资产同一字节，provider 不再调用
+      const second = await siren.app.inject({
+        method: 'POST',
+        url: '/v1/voice/synthesize',
+        payload: { text: '同一个操作。', operation_id: opKey }
+      });
+      expect(second.statusCode).toBe(200);
+      expect(second.headers['x-siren-replayed']).toBe('true');
+      expect(second.headers['x-siren-voice-asset-id']).toBe(assetId);
+      expect(second.body).toEqual(first.body);
+      expect(synthCount).toBe(1);
+      // 同键异参（speed 变了）：明确冲突，不静默返回不匹配音频，不再合成
+      const conflict = await siren.app.inject({
+        method: 'POST',
+        url: '/v1/voice/synthesize',
+        payload: { text: '同一个操作。', operation_id: opKey, speed: 1.5 }
+      });
+      expect(conflict.statusCode).toBe(409);
+      expect((conflict.json() as { error: string }).error).toBe('operation_conflict');
+      expect((conflict.json() as { differs: string[] }).differs).toContain('speed');
+      expect(synthCount).toBe(1);
+      // F04：两次独立同文语音各有独立身份——不按文本 hash 全局去重
+      const other = await siren.app.inject({
+        method: 'POST',
+        url: '/v1/voice/synthesize',
+        payload: { text: '同一个操作。', operation_id: 'voice-say:bbbbbbbbbbbbbbbbbbbbbbbb' }
+      });
+      expect(other.statusCode).toBe(200);
+      expect(other.headers['x-siren-voice-asset-id']).not.toBe(assetId);
+      expect(synthCount).toBe(2);
     } finally {
       await siren.dispose();
     }

@@ -67,6 +67,11 @@ export interface AssetMetaInput {
   direction: 'user' | 'assistant';
   voiceProfileId: string;
   emotion?: string | null;
+  /** 实际生效语速（A01 操作指纹用：speed 不入 DB 正本，只落在 sidecar 供重放校验） */
+  speed?: number | null;
+  /** A01：调用方请求的容器格式——DB 正本的 audio_format 是 provider 实际产出格式
+   *  （如 mock 恒 wav），重放指纹校验要以请求为准 */
+  requestedFormat?: string | null;
   durationMs: number;
   format: string;
   sampleRate: number;
@@ -87,6 +92,8 @@ export function buildAssetMeta(input: AssetMetaInput): Buffer {
         direction: input.direction,
         voice_profile: input.voiceProfileId,
         emotion: input.emotion ?? null,
+        speed: input.speed ?? null,
+        requested_format: input.requestedFormat ?? null,
         duration_ms: input.durationMs,
         format: input.format,
         sample_rate: input.sampleRate,

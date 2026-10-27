@@ -56,6 +56,9 @@ export interface SpeakParams {
   messageId?: string;
   language?: string;
   direction?: 'user' | 'assistant';
+  /** A01（联合审计 2026-10-27）：操作身份合成路径可指定容器格式；speak 既有消费者缺省 mp3 不变 */
+  format?: AudioFormat;
+  signal?: AbortSignal;
 }
 
 export interface SynthesizeParams {
@@ -68,9 +71,18 @@ export interface SynthesizeParams {
   language?: string;
 }
 
+/** A01：同 operation_id 重放但关键合成输入与已持久资产不一致——不能静默返回错音频 */
+export class OperationFingerprintConflictError extends Error {
+  constructor(readonly operationId: string, readonly mismatches: string[]) {
+    super(`operation_conflict: ${operationId} differs in ${mismatches.join(',')}`);
+    this.name = 'OperationFingerprintConflictError';
+  }
+}
+
 export class VoiceService {
-  /** S1011-020：同 message_id 的在途任务（speak / storeUserVoice 各一条道）——并发请求共享结果 */
-  private readonly speakInflight = new Map<string, Promise<VoiceAssetWithUrl>>();
+  /** S1011-020：同 message_id（含 A01 operation_id）的在途任务（speak / 操作合成各一条道）——
+   *  并发请求共享结果；值携带已合成字节，恢复路径免二次对象读 */
+  private readonly speakInflight = new Map<string, Promise<{ record: VoiceAssetRecord; audio: Buffer }>>();
   private readonly userVoiceInflight = new Map<string, Promise<{ transcript: TranscriptResult; asset: VoiceAssetWithUrl }>>();
 
   constructor(protected readonly deps: VoiceServiceDeps) {}
@@ -88,7 +100,8 @@ export class VoiceService {
     return result;
   }
 
-  async synthesizeAudio(params: SynthesizeParams): Promise<TtsAudioResult & { profile: VoiceProfile }> {
+  /** signal：调用方取消（REST 客户端断开）直达 provider，不在取消后继续收费合成。 */
+  async synthesizeAudio(params: SynthesizeParams, signal?: AbortSignal): Promise<TtsAudioResult & { profile: VoiceProfile }> {
     const profile = this.resolveProfile(params.voiceProfileId);
     assertTtsProfileCompatible(profile, this.deps.asyncTtsName);
     const emotion = parseEmotion(params.emotion) ?? profile.defaultEmotion;
@@ -101,7 +114,7 @@ export class VoiceService {
       format: params.format ?? 'mp3',
       sampleRate: 24000,
       language: params.language ?? profile.language
-    });
+    }, signal);
     this.deps.logger.info('tts_batch_completed', {
       profile: profile.id,
       emotion,
@@ -126,28 +139,95 @@ export class VoiceService {
       // S1011-020：并发同 message_id 共享在途任务——收费副作用（TTS）只发生一次；
       // DB 唯一索引仍作跨进程兜底
       const inflight = this.speakInflight.get(params.messageId);
-      if (inflight) return inflight;
+      if (inflight) return this.withAudioUrl((await inflight).record);
       const job = this.speakNow(params).finally(() => this.speakInflight.delete(params.messageId!));
       this.speakInflight.set(params.messageId, job);
-      return job;
+      return this.withAudioUrl((await job).record);
     }
-    return this.speakNow(params);
+    return this.withAudioUrl((await this.speakNow(params)).record);
   }
 
-  private async speakNow(params: SpeakParams): Promise<VoiceAssetWithUrl> {
+  /**
+   * A01（联合审计 2026-10-27）：带稳定操作身份的合成——复用 speak(message_id) 的既有持久
+   * 资产/幂等机制（DB 唯一索引 + 在途共享），不是第二套合成状态：
+   * - 生成成功**先落 voice_assets（对象+DB）再交付响应**：响应丢失后可按 operation_id 找回；
+   * - 同 operation_id 重放/并发只发生一次收费合成，直接取回同一资产；
+   * - 同键但关键输入（文本/音色/情绪/语速/格式/语言/tts_script）不一致=明确冲突，不串音。
+   * operation_id 是调用方（est）的操作身份，Siren 不读取 est 表、不创建聊天对象。
+   */
+  async synthesizeWithOperation(
+    params: SynthesizeParams & { operationId: string },
+    signal?: AbortSignal
+  ): Promise<{ audio: Buffer; asset: VoiceAssetWithUrl; replayed: boolean }> {
+    const existing = this.deps.assetsRepo.findByMessageId(params.operationId);
+    if (existing) {
+      await this.assertOperationFingerprint(existing, params);
+      const audio = await this.deps.store.get(existing.objectKey);
+      if (!audio) throw new Error(`voice_asset_object_missing:${existing.id}`);
+      return { audio, asset: await this.withAudioUrl(existing), replayed: true };
+    }
+    const inflight = this.speakInflight.get(params.operationId);
+    if (inflight) {
+      const joined = await inflight;
+      return { audio: joined.audio, asset: await this.withAudioUrl(joined.record), replayed: true };
+    }
+    const job = this.speakNow({
+      text: params.text,
+      ttsScript: params.ttsScript,
+      voiceProfileId: params.voiceProfileId,
+      emotion: parseEmotion(params.emotion),
+      speed: params.speed,
+      language: params.language,
+      messageId: params.operationId,
+      direction: 'assistant',
+      format: params.format ?? 'mp3',
+      signal
+    }).finally(() => this.speakInflight.delete(params.operationId));
+    this.speakInflight.set(params.operationId, job);
+    const done = await job;
+    return { audio: done.audio, asset: await this.withAudioUrl(done.record), replayed: false };
+  }
+
+  /** A01：重放命中后校验请求指纹与已持久资产一致（speed 只在 meta sidecar，操作路径资产必有） */
+  private async assertOperationFingerprint(
+    existing: VoiceAssetRecord,
+    params: SynthesizeParams & { operationId: string }
+  ): Promise<void> {
+    const profile = this.resolveProfile(params.voiceProfileId);
+    const emotion = parseEmotion(params.emotion) ?? profile.defaultEmotion;
+    const style = resolveStyle(profile, { emotion, speed: params.speed });
+    const format: AudioFormat = params.format ?? 'mp3';
+    const mismatches: string[] = [];
+    if (existing.text !== null && existing.text !== params.text) mismatches.push('text');
+    if (existing.voiceProfile !== profile.id) mismatches.push('voice_profile');
+    if (existing.emotion !== null && existing.emotion !== emotion) mismatches.push('emotion');
+    if (existing.language !== null && existing.language !== (params.language ?? profile.language)) mismatches.push('language');
+    if ((existing.ttsScript ?? null) !== (params.ttsScript ?? null)) mismatches.push('tts_script');
+    // speed 与请求格式不在 DB 正本（DB audio_format=provider 实际产出格式，如 mock 恒 wav）：
+    // 查 meta sidecar（操作路径资产必然写入）；sidecar 不可读/缺字段=无法证明一致，如实冲突
+    const metaRaw = await this.deps.store.get(metaObjectKey(existing.objectKey)).catch(() => undefined);
+    const meta = metaRaw ? (JSON.parse(metaRaw.toString('utf8')) as { speed?: unknown; requested_format?: unknown }) : undefined;
+    if (meta?.speed !== style.speed) mismatches.push('speed');
+    const requestFormat = meta?.requested_format ?? existing.audioFormat;
+    if (requestFormat !== format) mismatches.push('format');
+    if (mismatches.length > 0) throw new OperationFingerprintConflictError(params.operationId, mismatches);
+  }
+
+  private async speakNow(params: SpeakParams): Promise<{ record: VoiceAssetRecord; audio: Buffer }> {
     const profile = this.resolveProfile(params.voiceProfileId);
     assertTtsProfileCompatible(profile, this.deps.asyncTtsName);
     const emotion = params.emotion ?? profile.defaultEmotion;
     const style = resolveStyle(profile, { emotion, speed: params.speed });
+    const format: AudioFormat = params.format ?? 'mp3';
     const synthesized = await this.deps.asyncTts.synthesize({
       text: params.text,
       ttsScript: params.ttsScript,
       profile,
       style,
-      format: 'mp3',
+      format,
       sampleRate: 24000,
       language: params.language ?? profile.language
-    });
+    }, params.signal);
 
     const assetId = randomUUID();
     const messageId = params.messageId ?? assetId;
@@ -163,6 +243,8 @@ export class VoiceService {
         direction: params.direction ?? 'assistant',
         voiceProfileId: profile.id,
         emotion,
+        speed: style.speed,
+        requestedFormat: format,
         durationMs: synthesized.durationMs,
         format: synthesized.format,
         sampleRate: synthesized.sampleRate
@@ -205,7 +287,7 @@ export class VoiceService {
       duration_ms: finalRecord.durationMs,
       object_key: finalRecord.objectKey
     });
-    return this.withAudioUrl(finalRecord);
+    return { record: finalRecord, audio: synthesized.audio };
   }
 
   /** 用户 -> 对方：录音转写并可入库 user 方向资产（规范第 10/42 节） */

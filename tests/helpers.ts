@@ -26,6 +26,7 @@ import {
   VoiceProfileRegistry,
   VoiceService,
   loadConfig,
+  type ProviderBundle,
   type SirenConfig
 } from '@siren/voice-core';
 import { buildApp, type SirenApp } from '../apps/server/src/app.ts';
@@ -103,17 +104,20 @@ export function buildTestVoice(options: {
   return { voice, asr, tts, core, store, db, assetsRepo, sessionsRepo, turnsRepo };
 }
 
-export async function buildTestApp(extraEnv: Record<string, string> = {}): Promise<
-  SirenApp & { app: FastifyInstance }
-> {
+export async function buildTestApp(
+  extraEnv: Record<string, string> = {},
+  customizeProviders?: (providers: ProviderBundle) => void
+): Promise<SirenApp & { app: FastifyInstance }> {
   const config = testConfig(extraEnv);
   const db = openDatabase(':memory:');
   const { buildMemoryProviders } = await import('@siren/voice-core');
+  const providers = buildMemoryProviders();
+  customizeProviders?.(providers);
   return buildApp({
     config,
     logger: silentLogger,
     db,
-    providers: buildMemoryProviders(),
+    providers,
     profiles: testProfiles(),
     fillers: new FillerManager(join(await mkdtemp(join(tmpdir(), 'siren-fillers-'))), false, silentLogger)
   });

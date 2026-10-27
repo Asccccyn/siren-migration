@@ -209,18 +209,21 @@ export class CallSession {
     this.log.info('hangup_cancelled', { reason, generation: this.hangupGeneration });
   }
 
-  private maybeStartHangupLinger(): void {
+  private maybeStartHangupLinger(playbackConfirmed = false): void {
     if (!this.hangupRequest || this.hangupTimer || this.pendingDrain) return;
-    this.startHangupLinger();
+    this.startHangupLinger(playbackConfirmed);
   }
 
-  private startHangupLinger(): void {
+  /** playbackConfirmed：本轮正文收到客户端 playback_drained ACK。超时兜底/客户端不支持 drain/
+   *  无在途正文都不是播完证据——提示只说等待时限，不声称"已播完"。 */
+  private startHangupLinger(playbackConfirmed = false): void {
     const req = this.hangupRequest;
     if (!req || this.hangupTimer) return;
     const gen = req.generation;
     // linger 不是媒体状态（窗口内仍是 listening 可收新输入）：用 notice 告知等待窗口，
     // 不动状态机——同一事实（能否接收输入）唯一权威是 listening 态
-    this.sendJson({ t: 'notice', code: 'hangup_linger', message: `正文已播完，${Math.round(req.lingerMs / 1000)} 秒内不开口就挂断。` });
+    const wait = `${Math.round(req.lingerMs / 1000)} 秒内不开口就挂断。`;
+    this.sendJson({ t: 'notice', code: 'hangup_linger', message: playbackConfirmed ? `正文已播完，${wait}` : wait });
     this.hangupTimer = setTimeout(() => {
       this.hangupTimer = null;
       // generation 校验：旧计时器不能结束新一通/新一轮意图
@@ -492,10 +495,6 @@ export class CallSession {
   private async adoptTranscript(turn: ActiveTurn): Promise<string | null> {
     const outcome = await adoptTranscript(turn.asr, {
       graceMs: this.deps.config.partialGraceMs,
-      // F08：传 getter——grace 到期时读的是等待期间持续更新的最新 partial；
-      // 空 partial 不采纳（1002 实测：空宽限把建连失败/火山静音掩盖成"空转写"），
-      // 改为等 end() 落定（其内部有建连/终包限时），失败可见化
-      getLatestPartial: () => (this.turn === turn ? this.lastPartialText : '')
     });
     if (outcome.kind === 'error' || outcome.kind === 'timeout') {
       const timedOut = outcome.kind === 'timeout';
@@ -573,8 +572,10 @@ export class CallSession {
     }
     // drain 门控：pcm_end 只代表服务端发完，客户端还有尾音。v2 客户端等真正
     // 播完（或超时兜底）才收尾——期间保持 speaking，半双工门控继续吞 VAD
+    let playbackConfirmed = false;
     if (turn.pcmStarted && this.clientDrainCapable && this.deps.config.playbackDrainTimeoutMs > 0) {
       const drained = await this.armPendingDrain(turn.outputStreamId);
+      playbackConfirmed = drained;
       if (turn.aborted || this.turn !== turn) return; // 尾音被打断：interrupted 流程已接管
       if (!drained) {
         this.log.debug('playback_drain_fallback_listening', { stream_id: turn.outputStreamId });
@@ -585,7 +586,7 @@ export class CallSession {
     this.finalizeReplyTurn(turn, result.status === 'failed' ? `${result.kind}_failed` : 'completed');
     if (this.closed || this.closing) return;
     this.backToListening();
-    this.maybeStartHangupLinger(); // A11：正文已 drain（真 ACK 或有界兜底）→ 进入 linger
+    this.maybeStartHangupLinger(playbackConfirmed); // A11：正文已 drain（真 ACK 或有界兜底）→ 进入 linger
   }
 
   /** Preserve failure at the terminal boundary; a metrics frame is not success. */

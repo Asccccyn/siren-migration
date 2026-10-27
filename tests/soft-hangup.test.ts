@@ -5,7 +5,7 @@
 // ④ 用户显式挂断（WS close）不受 linger 拦截（现有 destroy 即时路径）
 // ⑤ 旧计时器不误伤：取消后再次提出→新 generation 计时
 import { describe, expect, it } from 'vitest';
-import { buildSessionHarness, waitFor } from './helpers.ts';
+import { buildSessionHarness, testConfig, waitFor } from './helpers.ts';
 import type { CallSession } from '@siren/voice-core';
 
 function harness(opts: { lingerMs?: number } = {}) {
@@ -93,5 +93,35 @@ describe('A11 柔性挂断（离线合同）', () => {
     } finally {
       session.destroy('test');
     }
+  });
+
+  // 联合审计（2026-10-27）：hangup_linger 提示须与播放证据一致——只有真实 playback_drained ACK
+  // 才可说"正文已播完"；drain 超时兜底（客户端未确认）只提示等待时限。
+  async function lingerNotice(ack: boolean): Promise<string> {
+    const h = buildSessionHarness({ config: { ...testConfig({ PLAYBACK_DRAIN_TIMEOUT_MS: '150' }), hangupLingerMs: 5000 } as never });
+    const { session } = h;
+    try {
+      session.handleMessage({ t: 'ready', protocol: 2, capabilities: { playback_drain: true } });
+      session.handleMessage({ t: 'start' });
+      session.handleBinary(Buffer.alloc(3200, 1));
+      session.handleMessage({ t: 'end' });
+      await waitFor(() => h.texts().some((m) => m.t === 'pcm_end'));
+      session.requestHangup(); // 正文仍在 drain：挂起到 settle 后才进入 linger
+      if (ack) {
+        const pcmEnd = h.texts().find((m) => m.t === 'pcm_end') as { stream_id: string };
+        session.handleMessage({ t: 'playback_drained', stream_id: pcmEnd.stream_id });
+      }
+      await waitFor(() => h.texts().some((m) => m.t === 'notice' && m.code === 'hangup_linger'), 3000);
+      return String(h.texts().find((m) => m.t === 'notice' && m.code === 'hangup_linger')!.message);
+    } finally {
+      session.destroy('test');
+    }
+  }
+
+  it('播放 ACK 才说"正文已播完"；无 ACK 超时兜底不声称已播完', async () => {
+    expect(await lingerNotice(true)).toContain('正文已播完');
+    const noAck = await lingerNotice(false);
+    expect(noAck).not.toContain('播完');
+    expect(noAck).toContain('秒内不开口就挂断');
   });
 });

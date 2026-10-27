@@ -10,7 +10,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { SIREN_EMOTIONS } from '@siren/contracts';
 import type { AsyncVoicePipeline, SirenConfig, VoiceService } from '@siren/voice-core';
-import { contentTypeFor } from '@siren/voice-core';
+import { contentTypeFor, OperationFingerprintConflictError } from '@siren/voice-core';
 import type { Logger } from '@siren/telemetry';
 import { errorFields } from '@siren/telemetry';
 import { ProviderError } from '@siren/contracts';
@@ -24,7 +24,10 @@ const synthesizeBodySchema = z.object({
   emotion: z.enum(SIREN_EMOTIONS).optional(),
   speed: z.number().min(0.5).max(2.0).optional(),
   format: z.enum(['mp3', 'wav', 'pcm']).optional(),
-  language: z.string().min(2).max(16).optional()
+  language: z.string().min(2).max(16).optional(),
+  // A01（联合审计 2026-10-27）：调用方的稳定操作身份（如 est voice-say 操作键）。带此字段时
+  // 合成先落持久资产再交付，同键重放/并发只合成一次；不带则保持原裸字节合同（独立 TTS 消费者不受影响）。
+  operation_id: z.string().regex(/^[A-Za-z0-9:_-]{8,128}$/).optional()
 });
 
 const listQuerySchema = z.object({
@@ -136,29 +139,63 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
       await reply.code(400).send({ error: 'invalid_body', details: zodDetails(parsed.error) });
       return;
     }
+    // 客户端断开=取消合成：响应在写完前关闭才算断开（正常结束同样触发 close，但 writableEnded 已真）。
+    // 不监听 request close——请求体读完也会触发，不能据此停止合成。
+    const cancel = new AbortController();
+    const onClose = (): void => {
+      if (!reply.raw.writableEnded) cancel.abort();
+    };
+    reply.raw.on('close', onClose);
     try {
-      const result = await voice.synthesizeAudio({
+      const requestParams = {
         text: parsed.data.text,
         ttsScript: parsed.data.tts_script,
         voiceProfileId: parsed.data.voice_profile,
         emotion: parsed.data.emotion,
         speed: parsed.data.speed,
-        format: parsed.data.format ?? 'mp3',
+        format: parsed.data.format ?? 'mp3' as const,
         language: parsed.data.language
-      });
-      await reply
-        .header('content-type', contentTypeFor(result.format))
-        .header('x-siren-duration-ms', result.durationMs)
-        .header('x-siren-format', result.format)
-        .header('x-siren-voice-profile', result.profile.id)
-        .send(result.audio);
+      };
+      if (parsed.data.operation_id) {
+        // A01：带操作身份 → 生成即持久（voice_assets），重放/并发同键取回同一资产不重付 TTS
+        const operationId = parsed.data.operation_id;
+        const { audio, asset, replayed } = await voice.synthesizeWithOperation({ ...requestParams, operationId }, cancel.signal);
+        await reply
+          .header('content-type', contentTypeFor(requestParams.format))
+          .header('x-siren-duration-ms', asset.durationMs)
+          .header('x-siren-format', requestParams.format)
+          .header('x-siren-voice-profile', asset.voiceProfile)
+          .header('x-siren-voice-asset-id', asset.id)
+          .header('x-siren-replayed', String(replayed))
+          .send(audio);
+      } else {
+        const result = await voice.synthesizeAudio(requestParams, cancel.signal);
+        await reply
+          .header('content-type', contentTypeFor(result.format))
+          .header('x-siren-duration-ms', result.durationMs)
+          .header('x-siren-format', result.format)
+          .header('x-siren-voice-profile', result.profile.id)
+          .send(result.audio);
+      }
     } catch (error) {
+      if (cancel.signal.aborted) {
+        logger.info('synthesize_client_closed', {});
+        await reply.code(499).send({ error: 'client_closed' }); // 连接已断，仅为结束 Fastify 回复
+        return;
+      }
+      if (error instanceof OperationFingerprintConflictError) {
+        // 同操作键但关键输入不同：诚实拒绝，不静默返回不匹配音频（调用方换新操作身份重试）
+        await reply.code(409).send({ error: 'operation_conflict', operation_id: error.operationId, differs: error.mismatches });
+        return;
+      }
       if (error instanceof ProviderError) {
         await reply.code(502).send({ error: error.code, message: error.message });
         return;
       }
       logger.warn('synthesize_route_failed', errorFields(error));
       await reply.code(500).send({ error: 'internal' });
+    } finally {
+      reply.raw.off('close', onClose);
     }
   });
 

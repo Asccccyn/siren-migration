@@ -1,8 +1,8 @@
 /**
  * 一次讲话（utterance）的 ASR 采集与结果采纳（规范第 22/23/40 节）。
  * - createAsrSession：每次讲话新建 prebuffered ASR 会话（建连期间缓冲，不丢句首）
- * - adoptTranscript：final 优先；PARTIAL_GRACE_MS 内未返回采用最新 partial；
- *   真正失败返回 kind:'error'，禁止把失败当成空文本。
+ * - adoptTranscript：final 优先；grace 到期不再采纳 partial（B02：句号不是结束凭据，
+ *   一律等 end() 的最终稿）；真正失败返回 kind:'error'，端到端期限兜底 timeout。
  */
 import type { StreamAsrProvider, VoiceProfile } from '@siren/contracts';
 import type { PrebufferedAsrSession } from './asr-prebuffer.ts';
@@ -31,7 +31,6 @@ export function createAsrSession(
 
 export type TranscriptAdoption =
   | { kind: 'final'; text: string }
-  | { kind: 'grace'; text: string }
   | { kind: 'timeout' }
   | { kind: 'error'; error: unknown };
 
@@ -47,9 +46,7 @@ export async function adoptTranscript(
   session: PrebufferedAsrSession,
   options: {
     graceMs: number;
-    /** F08：grace 到期时读取当前最新 partial——传快照会丢掉等待期间到达的新 partial */
-    getLatestPartial: () => string;
-    /** grace 到期且 partial 为空时，继续等 end() 落定的上限——默认为端到端期限（S1011-014） */
+    /** grace 到期后继续等 end() 落定的上限——默认为端到端期限（S1011-014） */
     endWaitMs?: number;
   }
 ): Promise<TranscriptAdoption> {
@@ -63,14 +60,9 @@ export async function adoptTranscript(
   const outcome = await Promise.race([endPromise, gracePromise]);
   if (outcome.kind === 'error') return { kind: 'error', error: outcome.error };
   if (outcome.kind === 'final') return { kind: 'final', text: outcome.result.text.trim() };
-  const partial = options.getLatestPartial().trim();
-  // GLM_VOICE_UNIFICATION 01§8/03§3（2026-10-26）边界修正：句号不是结束凭据——
-  // 有句号的 partial 不冒充完整原话（B02）；grace 到期一律继续等 end() 的
-  // 最终稿，端到端期限兜底（供应商真失败走可见 error/timeout，不伪装完整听取）。
-  // 话轮结束由现有 end/续说/打断路径判定（B01），不在本层用标点猜测。
-  void partial;
-  // 空 partial：不当作最终答案，等 end()（内部有建连限时与终包限时）——
-  // 建连挂起/火山静音由此变成可见的 error/空 final，而不是被空宽限静默吞掉
+  // B02（2026-10-26）边界：grace 到期一律等 end() 的最终稿，不采纳 partial——
+  // 有句号的 partial 也不冒充完整原话；端到端期限兜底（供应商真失败走可见
+  // error/timeout，不伪装完整听取）。话轮结束由 end/续说/打断路径判定。
   const settled = await Promise.race([
     endPromise,
     new Promise<null>((resolve) => setTimeout(() => resolve(null), options.endWaitMs ?? ADOPTION_END_TO_END_MS))

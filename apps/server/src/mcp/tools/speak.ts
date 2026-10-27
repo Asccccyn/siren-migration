@@ -53,7 +53,11 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           spoken: true,
           duration_ms: asset.durationMs,
           format: asset.audioFormat,
-          note: '语音已合成并绑定消息；正文与播放经 est 消息/媒体接口（鉴权）'
+          // 只报告本工具真实完成的阶段：合成并存为 Siren 语音资产。不代表已发布到聊天或设备已播放；
+          // 未传 message_id 时也没有绑定任何消息（spoken 为既有公开字段，保持兼容）。
+          note: parsed.data.message_id
+            ? '语音已合成并存为语音资产（关联所给 message_id）；不代表已发布到聊天或已播放'
+            : '语音已合成并存为语音资产；未关联消息，不代表已发布到聊天或已播放'
         };
         return {
           content: [{ type: 'text', text: JSON.stringify(payload) }]

@@ -20,7 +20,7 @@ export { CallTurnRecorder } from './call-recorder.ts';
 export type { TurnOutcome } from './call-recorder.ts';
 export { buildObjectKey, sanitizeKeyPart, contentTypeFor, normalizeContainer, buildAssetMeta, metaObjectKey } from './asset-keys.ts';
 export type { AssetMetaInput } from './asset-keys.ts';
-export { VoiceService } from './voice-service.ts';
+export { VoiceService, OperationFingerprintConflictError } from './voice-service.ts';
 export type { VoiceServiceDeps, SpeakParams, SynthesizeParams } from './voice-service.ts';
 export { AsyncVoicePipeline } from './async-voice.ts';
 export { CallCenter } from './call-center.ts';
