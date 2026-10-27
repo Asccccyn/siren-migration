@@ -72,6 +72,7 @@ export function registerTranscribeTool(
 
 function guessFormatFromMime(mime: string): string {
   const cleaned = mime.toLowerCase().split(';')[0].trim();
+  if (cleaned.includes('ogg')) return 'ogg'; // JV-19：ogg 不再落 webm（与 FORMAT 表一致）
   if (cleaned.includes('webm')) return 'webm';
   if (cleaned.includes('wav')) return 'wav';
   if (cleaned.includes('mp4') || cleaned.includes('m4a')) return 'm4a';
@@ -83,5 +84,6 @@ function guessFormatFromKey(key: string): string {
   if (key.endsWith('.wav')) return 'wav';
   if (key.endsWith('.mp3')) return 'mp3';
   if (key.endsWith('.m4a')) return 'm4a';
+  if (key.endsWith('.ogg')) return 'ogg'; // JV-19：ogg 不再落 webm
   return 'webm';
 }

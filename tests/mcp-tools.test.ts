@@ -57,18 +57,15 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
       expect(payload.voice_message_id).toBeTruthy();
       expect(String(payload.audio_url)).toContain('/v1/assets/');
       expect(Number(payload.duration_ms)).toBeGreaterThan(0);
-      // R3″（2026-10-24，RE-16）：模型面 content 不再整段回显正文（摘录≤120字）；
-      // 播放器展示正文=structuredContent 单份；全文分页走 voice_get
+      // R3″（RE-16）+ JV-16a（GLM_VOICE_UNIFICATION）：content 精简回执；整个结果面
+      // 无全文（structuredContent 已随播放器退役）、无 player meta
       expect(payload.spoken).toBe(true);
-      expect(String(payload.text_excerpt)).toContain('你，我在。'.slice(0, 5));
+      expect(payload).not.toHaveProperty('text_excerpt'); // 正文在调用参数里，回执无需摘录
       expect(payload).not.toHaveProperty('text');
       expect(payload).not.toHaveProperty('tts_script');
-      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.text).toBe('你，我在。');
-      expect((result as { structuredContent?: Record<string, unknown> }).structuredContent?.audio_url).toBe(payload.audio_url);
-      expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(8192);
-      expect((result as { _meta?: Record<string, unknown> })._meta?.['openai/outputTemplate']).toBe(
-        'ui://siren/voice-player-v1.html'
-      );
+      expect((result as { structuredContent?: unknown }).structuredContent).toBeUndefined();
+      expect(Buffer.byteLength(JSON.stringify(payload), 'utf8')).toBeLessThanOrEqual(2048); // 本包回执预算
+      expect((result as { _meta?: Record<string, unknown> })._meta?.['openai/outputTemplate']).toBeUndefined();
       // 幂等：重复调用同一 message_id
       const again = await client.callTool({
         name: 'voice_speak',
@@ -80,31 +77,6 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
     }
   });
 
-  it('暴露标准 MCP App 语音播放器 resource', async () => {
-    const bundle = buildTestVoice();
-    const server = createSirenMcpServer({
-      voice: bundle.voice,
-      store: bundle.store,
-      logger: silentLogger,
-      version: 'test'
-    });
-    const { client, close } = await connectMcpClient(server);
-    try {
-      const resources = await client.listResources();
-      const player = resources.resources.find((item) => item.uri === 'ui://siren/voice-player-v1.html');
-      expect(player?.mimeType).toBe('text/html;profile=mcp-app');
-      const read = await client.readResource({ uri: 'ui://siren/voice-player-v1.html' });
-      const content = read.contents[0] as { text?: string; mimeType?: string; _meta?: Record<string, unknown> };
-      expect(content.mimeType).toBe('text/html;profile=mcp-app');
-      expect(content.text).toContain('ui/initialize');
-      expect(content.text).toContain('ui/notifications/tool-result');
-      expect(content.text).toContain('ui/notifications/size-changed');
-      expect(content.text).toContain('openai:set_globals');
-      expect(content.text).toContain('JSON.parse');
-    } finally {
-      await close();
-    }
-  });
 
   it('voice_speak：非法输入返回 isError（MCP 输入校验）', async () => {
     const bundle = buildTestVoice();
@@ -182,4 +154,28 @@ describe('Voice MCP（走完整 MCP 协议）', () => {
       await close();
     }
   });
+});
+
+// G01（GLM_VOICE_UNIFICATION 04§5.2）：回执预算——不随正文线性增长，≤2KiB 同形
+it('voice_speak 回执预算：3000/3900 字同形且 ≤2KiB', async () => {
+  const bundle = buildTestVoice();
+  const server = createSirenMcpServer({ voice: bundle.voice, store: bundle.store, logger: silentLogger, version: 'test' });
+  const { client, close } = await connectMcpClient(server);
+  try {
+    const sizes: number[] = [];
+    for (const len of [3000, 3900]) { // 30000 超现行输入合同 text≤4000（contracts/mcp.ts）——同形验证用近上限值
+      const res = await client.callTool({ name: 'voice_speak', arguments: { text: '语'.repeat(len), conversation_id: 'conv-budget', message_id: `budget-${len}` } });
+      expect(res.isError).toBeFalsy();
+      const payload = toolPayload(res as never);
+      expect(payload.voice_message_id).toBeTruthy();
+      expect(payload).not.toHaveProperty('text');
+      sizes.push(Buffer.byteLength(JSON.stringify(payload), 'utf8'));
+    }
+    expect(sizes[0]!).toBeLessThanOrEqual(2048);
+    expect(sizes[1]!).toBeLessThanOrEqual(2048);
+    expect(Math.abs(sizes[1]! - sizes[0]!)).toBeLessThan(64); // 同形：不随正文线性增长
+  } finally {
+    await close();
+    bundle.db.close();
+  }
 });

@@ -100,5 +100,6 @@ function contentTypeForKey(key: string): string {
   if (key.endsWith('.pcm')) return 'audio/pcm';
   if (key.endsWith('.webm')) return 'audio/webm';
   if (key.endsWith('.m4a')) return 'audio/mp4';
+  if (key.endsWith('.ogg')) return 'audio/ogg'; // JV-19：ogg 不再标 audio/mpeg
   return 'audio/mpeg';
 }

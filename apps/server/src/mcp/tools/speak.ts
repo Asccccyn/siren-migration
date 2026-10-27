@@ -4,7 +4,6 @@ import { voiceSpeakInputSchema } from '@siren/contracts';
 import { errorFields, type Logger } from '@siren/telemetry';
 import { FieldDecryptionError } from '@siren/storage';
 import type { VoiceService } from '@siren/voice-core';
-import { VOICE_PLAYER_TOOL_META } from '../voice-player.ts';
 
 export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService; logger: Logger }): void {
   server.registerTool(
@@ -23,7 +22,6 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
         language: voiceSpeakInputSchema.shape.language,
         speed: voiceSpeakInputSchema.shape.speed
       },
-      _meta: VOICE_PLAYER_TOOL_META
     },
     async (args) => {
       const parsed = voiceSpeakInputSchema.safeParse(args);
@@ -45,37 +43,20 @@ export function registerSpeakTool(server: McpServer, deps: { voice: VoiceService
           language: parsed.data.language
         });
         deps.logger.info('mcp_tool_called', { tool: 'voice_speak', voice_message_id: asset.id });
-        // R3″（2026-10-24，RE-16）：模型面回执最小化——完整 text 本就在模型自己的工具调用
-        // 参数里（回显=大正文双份：上轮实测 12261B/双份 24941B）。content 只带 spoken+摘录；
-        // 播放器展示正文走 structuredContent（单份，不进模型正文），全文分页走 voice_get。
-        const spokenText = asset.text ?? '';
-        const chars = [...spokenText];
-        const excerpt = chars.length > 120 ? chars.slice(0, 120).join('') + '…' : spokenText;
-        const modelPayload = {
+        // JV-16a（GLM_VOICE_UNIFICATION 04§5，她裁定不维持现状）：整个结果面瘦身——
+        // 展示职责已迁 est（消息/媒体读接口+鉴权播放），工具回执只留必要回执/稳定引用，
+        // 不把全文藏进 structuredContent 或其他字段。3000 字与 30000 字输入回执同形
+        //（不随正文线性增长）；est 侧全文经消息接口读取，音频走既有鉴权媒体入口。
+        const payload = {
           voice_message_id: asset.id,
           audio_url: asset.audioUrl,
           spoken: true,
           duration_ms: asset.durationMs,
           format: asset.audioFormat,
-          text_excerpt: excerpt,
-          note: '语音已合成；正文以你的原话为准（摘录如上，不整段回显），全文走 voice_get'
-        };
-        const playerPayload = {
-          voice_message_id: asset.id,
-          audio_url: asset.audioUrl,
-          text: asset.text,
-          duration_ms: asset.durationMs,
-          format: asset.audioFormat
+          note: '语音已合成并绑定消息；正文与播放经 est 消息/媒体接口（鉴权）'
         };
         return {
-          structuredContent: playerPayload,
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(modelPayload)
-            }
-          ],
-          _meta: VOICE_PLAYER_TOOL_META
+          content: [{ type: 'text', text: JSON.stringify(payload) }]
         };
       } catch (error) {
         const code = error instanceof FieldDecryptionError ? 'data_unreadable' : 'tts_failed';

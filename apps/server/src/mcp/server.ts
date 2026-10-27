@@ -13,7 +13,6 @@ import { registerSpeakTool } from './tools/speak.ts';
 import { registerTranscribeTool } from './tools/transcribe.ts';
 import { registerGetVoiceTool } from './tools/get-voice.ts';
 import { registerListVoicesTool } from './tools/list-voices.ts';
-import { registerVoicePlayerResource } from './voice-player.ts';
 
 export interface McpDeps {
   voice: VoiceService;
@@ -29,7 +28,6 @@ export function createSirenMcpServer(deps: McpDeps): McpServer {
     { name: 'siren-voice', version: deps.version },
     { capabilities: { tools: {}, resources: {} } }
   );
-  registerVoicePlayerResource(server);
   registerSpeakTool(server, deps);
   registerTranscribeTool(server, deps);
   registerGetVoiceTool(server, deps);
