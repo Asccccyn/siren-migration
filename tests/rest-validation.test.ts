@@ -108,6 +108,10 @@ describe('REST 校验与鉴权', () => {
       expect(first.statusCode).toBe(200);
       expect(synthCount).toBe(1);
       expect(first.headers['x-siren-replayed']).toBe('false');
+      expect(first.rawPayload.subarray(0, 4).toString()).toBe('RIFF');
+      expect(first.rawPayload.subarray(8, 12).toString()).toBe('WAVE');
+      expect(first.headers['content-type']).toContain('audio/wav');
+      expect(first.headers['x-siren-format']).toBe('wav');
       const assetId = first.headers['x-siren-voice-asset-id'];
       expect(typeof assetId).toBe('string');
       // 生成即持久：资产已可按操作身份查回（响应丢失前就处于该状态）
@@ -122,6 +126,8 @@ describe('REST 校验与鉴权', () => {
       });
       expect(second.statusCode).toBe(200);
       expect(second.headers['x-siren-replayed']).toBe('true');
+      expect(second.headers['content-type']).toContain('audio/wav');
+      expect(second.headers['x-siren-format']).toBe('wav');
       expect(second.headers['x-siren-voice-asset-id']).toBe(assetId);
       expect(second.body).toEqual(first.body);
       expect(synthCount).toBe(1);

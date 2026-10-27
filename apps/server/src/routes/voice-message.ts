@@ -161,9 +161,9 @@ export function registerVoiceMessageRoutes(app: FastifyInstance, deps: VoiceMess
         const operationId = parsed.data.operation_id;
         const { audio, asset, replayed } = await voice.synthesizeWithOperation({ ...requestParams, operationId }, cancel.signal);
         await reply
-          .header('content-type', contentTypeFor(requestParams.format))
+          .header('content-type', contentTypeFor(asset.audioFormat))
           .header('x-siren-duration-ms', asset.durationMs)
-          .header('x-siren-format', requestParams.format)
+          .header('x-siren-format', asset.audioFormat)
           .header('x-siren-voice-profile', asset.voiceProfile)
           .header('x-siren-voice-asset-id', asset.id)
           .header('x-siren-replayed', String(replayed))
