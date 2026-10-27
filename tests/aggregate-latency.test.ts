@@ -132,7 +132,8 @@ describe('aggregate-turn-latency（R7 outcome 分母）', () => {
     // RE-17 后不计识别轮）
     const plan: Array<string | null> = ['completed', 'completed', 'completed', 'completed', 'interrupted', 'core_failed', 'asr_empty', 'asr_empty', 'asr_failed', null, 'interrupted'];
     plan.forEach((outcome, i) => insert.run(`t-${i}`, i + 1, outcome, 1_700_000_000_000 + i));
-    db.prepare("UPDATE call_turns SET assistant_text='被打断前已生成的正文' WHERE id='t-4'").run();
+    // JV-21：interrupted 两轴判据=first_content_audio_ms 阶段事实（不再按密文长度猜正文）
+    db.prepare("UPDATE call_turns SET assistant_text='被打断前已生成的正文', first_content_audio_ms=1234 WHERE id='t-4'").run();
     db.close();
     const result = await aggregate(['--db', path]);
     expect(result.sampled_rows).toBe(11);

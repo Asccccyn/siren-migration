@@ -111,8 +111,12 @@ const recognizedOutcomes = new Set(['completed', 'core_failed', 'tts_failed']);
 // RE-17（2026-10-24 返修）：recognized=真实进入回复链（Core 被调用或已有助手正文）——
 // interrupted 分两轴：有助手正文=回复链内被打断；无=接纳/识别阶段取消（不算识别完成，
 // 上轮反例：ENDING 未采纳即取消被算进识别轮，而 Core 调用为 0）
+// JV-21（联合审计 2026-10-26）：interrupted 的两轴判定改用可信阶段事实
+//（first_content_audio_ms 非空=首个正文音频已请求，即真实进入回复链）——
+// 加密装配下 assistant_text 为密文（空文本也非空），按长度猜正文会把
+// 未调用模型的取消轮计入 recognized 分母
 const replyRows = rows.filter((row) => recognizedOutcomes.has(row.outcome)
-  || (row.outcome === 'interrupted' && typeof row.assistant_text === 'string' && row.assistant_text.length > 0));
+  || (row.outcome === 'interrupted' && row.first_content_audio_ms !== null));
 const technicalFailures = rows.filter((row) => row.outcome === 'asr_failed' || row.outcome === 'asr_timeout' || row.outcome === 'core_failed' || row.outcome === 'tts_failed').length;
 // RE-17：无已知 outcome≠零故障——unknown 样本上故障率不可知，如实 null+覆盖率
 const knownRows = rows.filter((row) => row.outcome !== null && row.outcome !== undefined).length;
