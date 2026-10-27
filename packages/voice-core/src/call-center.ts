@@ -5,7 +5,7 @@
  * - 会话注册表保证 close 后不残留任务、同 call_id 不允许双连接
  */
 import { randomUUID } from 'node:crypto';
-import type { AsrProvider, RealtimeVoiceProvider, TtsProvider } from '@siren/contracts';
+import type { AsrProvider, CallTurnAudio, RealtimeVoiceProvider, TtsProvider } from '@siren/contracts';
 import type { CoreBridge } from '@siren/core-bridge';
 import type { CallSessionsRepository, CallTurnsRepository } from '@siren/storage';
 import type { Logger } from '@siren/telemetry';
@@ -30,11 +30,19 @@ export interface CallCenterDeps {
   /** 协议②（2026-10-24）：用户原声资产化（透传 CallSession） */
   userAudio?: {
     assetsRepo: import('@siren/storage').VoiceAssetsRepository;
-    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown> };
+    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown>; delete?(key: string): Promise<void> };
   };
   /** 元数据用：实际生效的 provider 名（写入 call_sessions） */
   asrName?: string;
   ttsName?: string;
+  /** F-04（跨仓预审 2026-10-25）：est 通话策略投影的生命周期回调——会话注册/
+   *  结束时通知宿主（POST/DELETE /v1/calls，幂等）。fire-and-forget：通知失败
+   *  不影响 Siren 自身会话生死（Siren 是通话正本，est 只是策略投影消费方）。
+   *  复用 core 桥同源配置（同 peer 同凭据），不新增第二套地址/密钥。 */
+  callLifecycle?: {
+    register(callId: string, conversationId: string | null): void;
+    end(callId: string, conversationId: string | null): void;
+  };
 }
 
 export interface CreateCallResult {
@@ -50,6 +58,8 @@ export interface CreateCallResult {
 export class CallCenter {
   private readonly tokens: CallTokenStore;
   private readonly sessions = new Map<string, CallSession>();
+  private readonly retiring = new Set<Promise<void>>();
+  private stopping = false;
   /** P1-1：会话装配的唯一 Realtime Provider 出口（当前为 cascade 组合） */
   readonly voice: RealtimeVoiceProvider;
 
@@ -73,6 +83,7 @@ export class CallCenter {
   }
 
   async createCall(params: { conversationId?: string; voiceProfileId?: string }): Promise<CreateCallResult> {
+    if (this.stopping) throw new Error('call_service_stopping');
     // S1011-025：全局并发通话上限——实时 ASR/TTS 是计费资源，超限拒绝新通话
     if (this.sessions.size >= this.deps.config.maxConcurrentCalls) {
       throw new Error('call_capacity_reached');
@@ -128,6 +139,7 @@ export class CallCenter {
     bufferedAmount: () => number;
     close: (code: number, reason: string) => void;
   }): CallSession | null {
+    if (this.stopping) return null;
     if (this.sessions.has(params.callId)) return null;
     // Tokens are reservations, not resource permits. Enforce capacity at the
     // synchronous registration point so pre-issued tokens cannot bypass it.
@@ -156,14 +168,44 @@ export class CallCenter {
       onDestroyed: (s) => {
         this.sessions.delete(s.callId);
         this.tokens.revokeByCall(s.callId);
+        this.deps.callLifecycle?.end(s.callId, s.conversationId);
+        const settled = s.settled();
+        this.retiring.add(settled);
+        void settled.then(() => this.retiring.delete(settled));
       }
     });
     this.sessions.set(params.callId, session);
+    this.deps.callLifecycle?.register(params.callId, params.reservation.conversationId);
     return session;
   }
 
   getSession(callId: string): CallSession | undefined {
     return this.sessions.get(callId);
+  }
+
+  /** JV-04（联合审计 2026-10-26）：会话事实查询——est 对账用（只读）。
+   *  Siren 是通话生死正本：db_status 来自 call_sessions 持久行（destroy/断线/
+   *  重启 endAllActive 都收敛为 ended），session_active 表示 WS 会话仍在。
+   *  只报事实，不替 est 判定"预约是否值得保留"。 */
+  describeCall(callId: string): { call_id: string; db_status: 'active' | 'ended' | 'unknown'; session_active: boolean; ended_at: number | null } | null {
+    const row = this.deps.sessionsRepo?.findById(callId);
+    return {
+      call_id: callId,
+      db_status: row ? (row.status === 'ended' || row.status === 'error' ? 'ended' : 'active') : 'unknown',
+      session_active: this.sessions.has(callId),
+      ended_at: row?.ended_at ?? null
+    };
+  }
+
+  /** R2-02（复审二）：按 call 交付留档音频清单（服务间只读；双方）。 */
+  listTurnAudio(callId: string): CallTurnAudio[] {
+    return this.deps.turnsRepo?.listAudioByCall(callId) ?? [];
+  }
+
+  async shutdown(): Promise<void> {
+    this.stopping = true;
+    this.destroyAll();
+    await Promise.all([...this.retiring]);
   }
 
   /** 服务关停：终止全部通话（规范第 47 节第 25 条） */

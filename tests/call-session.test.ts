@@ -206,7 +206,7 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
 
   it('F08：grace 采纳等待期间到达的最新 partial（不是 end 时刻的快照）', async () => {
     const harness = buildSessionHarness({
-      asr: new MockAsrProvider({ partials: ['你', '你好世界'], final: '迟到的 final。', finalDelayMs: 200 }),
+      asr: new MockAsrProvider({ partials: ['你', '你好世界。'], final: '迟到的 final。', finalDelayMs: 200 }),
       config: testConfig({ PARTIAL_GRACE_MS: '30' })
     });
     harness.session.handleMessage({ t: 'start' });
@@ -214,7 +214,7 @@ describe('CallSession（协议 / 打断 / 降级）', () => {
     harness.session.handleMessage({ t: 'end' }); // 剩余 partial 在 end() 内到达，落在 grace 窗口中
     await waitFor(() => harness.texts().some((m) => m.t === 'asr'));
     const asr = harness.texts().find((m) => m.t === 'asr') as { text?: string };
-    expect(asr?.text).toBe('你好世界'); // 旧实现的调用点快照只有 '你'
+    expect(asr?.text).toBe('迟到的 final。'); // 执行包修正：partial 不冒充原话，等最终稿
     await waitFor(() => harness.session.state === 'listening');
   });
 

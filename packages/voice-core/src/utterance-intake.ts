@@ -64,7 +64,11 @@ export async function adoptTranscript(
   if (outcome.kind === 'error') return { kind: 'error', error: outcome.error };
   if (outcome.kind === 'final') return { kind: 'final', text: outcome.result.text.trim() };
   const partial = options.getLatestPartial().trim();
-  if (partial) return { kind: 'grace', text: partial };
+  // GLM_VOICE_UNIFICATION 01§8/03§3（2026-10-26）边界修正：句号不是结束凭据——
+  // 有句号的 partial 不冒充完整原话（B02）；grace 到期一律继续等 end() 的
+  // 最终稿，端到端期限兜底（供应商真失败走可见 error/timeout，不伪装完整听取）。
+  // 话轮结束由现有 end/续说/打断路径判定（B01），不在本层用标点猜测。
+  void partial;
   // 空 partial：不当作最终答案，等 end()（内部有建连限时与终包限时）——
   // 建连挂起/火山静音由此变成可见的 error/空 final，而不是被空宽限静默吞掉
   const settled = await Promise.race([

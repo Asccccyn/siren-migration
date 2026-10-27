@@ -129,7 +129,9 @@ export function buildProviders(config: SirenConfig, logger?: Logger): ProviderBu
           fallback = makeBatch();
         }
         const realtime: TtsProvider = {
-          synthesize: (request) => fallback.synthesize(request),
+          // JV-12（联合审计 2026-10-26）：批量兜底同样透传 AbortSignal——
+          // 此前只转 request 丢掉 signal，流式零输出转 batch 后取消仍继续合成
+          synthesize: (request, signal) => fallback.synthesize(request, signal),
           synthesizeStream: (request, signal) => bidirectional.synthesizeStream(request, signal)
         };
         return { tts: realtime, name: 'volc' };

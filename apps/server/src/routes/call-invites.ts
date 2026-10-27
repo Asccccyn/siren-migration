@@ -85,9 +85,14 @@ export function registerCallInviteRoutes(app: FastifyInstance, deps: CallInviteR
   app.get('/v1/conversations/:conversation_id/invites', async (request, reply) => {
     const { conversation_id } = request.params as { conversation_id: string };
     const rows = deps.invites.recentFor(conversation_id, 10);
+    const pending = rows.find((r) => r.state === 'pending');
     await reply.code(200).send({
       conversation_id,
-      active: rows.find((r) => r.state === 'pending') ?? null,
+      // F-02（跨仓预审 2026-10-25）：active 与 recent 同一 DTO 形状（invite_id 键）——
+      // 此前 active 直出 DB 行（id 键），消费者读 invite_id 得 undefined，接/拒/取消全部 404。
+      active: pending
+        ? { invite_id: pending.id, conversation_id: pending.conversation_id, state: pending.state, expires_at: pending.expires_at, created_at: pending.created_at }
+        : null,
       recent: rows.filter((r) => r.state !== 'pending').map((r) => ({
         invite_id: r.id, state: r.state, expires_at: r.expires_at, created_at: r.created_at,
         updated_at: r.updated_at, ended_reason: r.ended_reason

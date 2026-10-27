@@ -28,6 +28,7 @@ export function assetModelView(asset: VoiceAssetWithUrl, cursor?: string): Recor
     direction: asset.direction,
     audio_format: asset.audioFormat,
     duration_ms: asset.durationMs,
+    ...(asset.completeness ? { completeness: asset.completeness } : {}),
     ...(asset.language !== null ? { language: asset.language } : {}),
     created_at: new Date(asset.createdAt).toISOString(),
     audio_url: asset.audioUrl

@@ -8,6 +8,8 @@ import { MIGRATION_001 } from './migrations/001-init.ts';
 import { addCallTurnLatencyColumns } from './migrations/002-turn-latency-columns.ts';
 import { addCallTurnOutcomeColumn } from './migrations/003-turn-outcome.ts';
 import { createCallInvites } from './migrations/004-call-invites.ts';
+import { addVoiceAssetCompleteness } from './migrations/005-voice-asset-completeness.ts';
+import { CALL_AUDIO_FACTS_SQL } from './migrations/006-call-audio-facts.ts';
 
 export type SqliteDatabase = Database.Database;
 
@@ -16,7 +18,9 @@ const MIGRATIONS: { version: number; sql?: string; run?: (db: SqliteDatabase) =>
   { version: 1, sql: MIGRATION_001 },
   { version: 2, run: addCallTurnLatencyColumns },
   { version: 3, run: addCallTurnOutcomeColumn },
-  { version: 4, run: createCallInvites }
+  { version: 4, run: createCallInvites },
+  { version: 5, run: addVoiceAssetCompleteness },
+  { version: 6, sql: CALL_AUDIO_FACTS_SQL }
 ];
 
 export function openDatabase(path: string): SqliteDatabase {

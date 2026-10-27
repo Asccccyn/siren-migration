@@ -14,6 +14,27 @@ export interface CallSessionRoutesDeps {
 }
 
 export function registerCallSessionRoutes(app: FastifyInstance, deps: CallSessionRoutesDeps): void {
+  /** R2-02（GLM_VOICE_UNIFICATION 复审二）：按 call 交付已留档音频资产清单
+   *  （服务间只读，est 据此把 assistant 回复音频绑定到对应消息）。最小合同：
+   *  v1 按真实 turn_id 分组；无音频轮次仍返回，发送/播放事实独立于资产完整性。
+   *  失败语义=404（call 不存在）；重放幂等只读。 */
+  app.get('/v1/calls/:callId/turn-audio', async (request, reply) => {
+    const { callId } = request.params as { callId: string };
+    const call = deps.callCenter.describeCall(callId);
+    if (!call || call.db_status === 'unknown') { await reply.code(404).send({ error: 'call_not_found' }); return; }
+    const rows = deps.callCenter.listTurnAudio(callId);
+    await reply.code(200).send({ schema_version: 1, call_id: callId, turns: rows });
+  });
+
+  /** JV-04（联合审计 2026-10-26）：会话事实查询（服务间只读）——est 启动/通知
+   *  失败后据正本对账 voice_calls 投影。幂等、无副作用。 */
+  app.get('/v1/calls/:callId', async (request, reply) => {
+    const { callId } = request.params as { callId: string };
+    const out = deps.callCenter.describeCall(callId);
+    if (!out || out.db_status === 'unknown') { await reply.code(404).send({ error: 'call_not_found' }); return; }
+    await reply.code(200).send(out);
+  });
+
   /** A11（2026-10-24）：模型提出挂断——est call_control(end) 服务间调用；立即回执
    *  accepted（不等整通结束，防 Siren↔est 互等死锁）；真正结束由 drain→linger 决定。 */
   app.post('/v1/calls/:callId/hangup-request', async (request, reply) => {

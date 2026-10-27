@@ -84,7 +84,7 @@ describe('SQLite 仓储', () => {
     // （C11 起含 002 可重入补列迁移，版本数 = 已应用迁移条数）
     const { migrate } = await import('@siren/storage');
     migrate(db);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 4 }); /* B5(1024)：004-call-invites 注册后迁移数=4（R7 探针 v==3 快照断言已被 A09 邀请表取代——语义另行断言 NULL 保留） */
+    expect(db.prepare('SELECT COUNT(*) AS n FROM _migrations').get()).toEqual({ n: 6 });
   });
 
   it('C11 迁移：旧库（001 后无新列）补列可重入，新列缺省 NULL', async () => {

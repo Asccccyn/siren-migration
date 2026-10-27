@@ -18,6 +18,7 @@ import type {
   VoiceProfile,
   VoiceStyle
 } from '@siren/contracts';
+import type { CallPlaybackEvidence } from '@siren/contracts';
 import { ProviderError, REALTIME_OUTPUT_SAMPLE_RATE } from '@siren/contracts';
 import { chunkPcm16, samplesForDuration } from '@siren/audio';
 import { type Logger } from '@siren/telemetry';
@@ -52,6 +53,7 @@ export interface ActiveTurn {
   /** 下行二进制帧序号（在每个 pcm 头中递增） */
   nextSequence: number;
   userText: string;
+  transcriptAdopted: boolean;
   /** Core 已送达的全部原始文本（S1011-021：独立于切句与播放进度，错误时保真） */
   receivedText: string;
   /** 本轮已上行音频字节（S1011-025 预算计量） */
@@ -60,6 +62,12 @@ export interface ActiveTurn {
   pcmChunks: Buffer[];
   /** 已落原声资产引用（siren:<asset_id>）——随 CoreTurnInput 上桥，est 取回绑消息供 oído */
   audioRef?: string;
+  userAudioSave?: Promise<string | null>;
+  replyAudio: Array<{ text: string; chunks: PcmChunk[]; complete: boolean }>;
+  replyTextComplete: boolean;
+  sentAudioMs: number;
+  fillerAudioMs: number;
+  playback: CallPlaybackEvidence;
   asr: PrebufferedAsrSession;
   /** 本轮收到的 ASR partial 数（1002 空转写排障：0=火山侧全聋） */
   asrPartials: number;
@@ -85,7 +93,7 @@ export type ReplyResult =
 /** 会话层提供给流水线的输出通道 */
 export interface ReplyPipelinePort {
   sendJson(message: ServerWsMessage, turn: ActiveTurn): void;
-  sendRaw(frame: Buffer, turn: ActiveTurn): void;
+  sendRaw(frame: Buffer, turn: ActiveTurn): boolean;
   /** 第一帧音频即将下发（会话层完成 thinking -> speaking 迁移） */
   onFirstAudio(turn: ActiveTurn): void;
 }
@@ -115,6 +123,7 @@ export class ReplyPipeline {
     const style: VoiceStyle = resolveStyle(this.deps.profile);
     const splitter = new SentenceSplitter();
     const sentenceQueue = new AsyncQueue<{ sentence: string; eager: EagerIterable<PcmChunk> }>();
+    const synthesizers: EagerIterable<PcmChunk>[] = [];
     // F07：失败路径的取消信号——pipeline 出错时除 user abort 外也要终止在途 TTS，
     // 否则已排队的句子继续在后台合成，浪费供应商配额
     const failureAbort = new AbortController();
@@ -130,13 +139,17 @@ export class ReplyPipeline {
           while (sentenceQueue.size >= 2 && !turn.aborted && !sentenceQueue.closed) {
             await sentenceQueue.waitForDrain(1);
           }
-          if (turn.aborted || sentenceQueue.closed) break;
-          const eager = new EagerIterable(() => this.synthSentenceToPcm(turn, sentence, style, ttsSignal));
+          if (turn.aborted || sentenceQueue.closed) throw new TurnAbortedError();
+          const segment = { text: sentence, chunks: [] as PcmChunk[], complete: false };
+          turn.replyAudio.push(segment);
+          const eager = new EagerIterable(() => this.synthSentenceToPcm(turn, segment, style, ttsSignal));
+          synthesizers.push(eager);
           // 真实预取（审计修复）：句子进入队列即开始 TTS，
           // 上一句播放期间下一句已在合成，而不是等消费者迭代才启动
           eager.start();
           sentenceQueue.push({ sentence, eager });
         }
+        if (!ttsSignal.aborted) turn.replyTextComplete = true;
       } catch (error) {
         if (!turn.aborted) sentenceQueue.fail(error);
       } finally {
@@ -162,10 +175,6 @@ export class ReplyPipeline {
       // 500ms 未落定即 core.cancel 真正终止上游，再等它退出
       sentenceQueue.close();
       failureAbort.abort();
-      if (error instanceof TurnAbortedError || turn.aborted) {
-        // 打断路径：interrupted / reply 由 CallSession.handleAbort 同步下发
-        return { status: 'aborted' };
-      }
       let producerDone = false;
       const joined = producer.catch(() => undefined).then(() => {
         producerDone = true;
@@ -175,8 +184,13 @@ export class ReplyPipeline {
         void this.deps.core.cancel(turn.turnId).catch(() => undefined);
         await joined;
       }
+      if (error instanceof TurnAbortedError || turn.aborted) return { status: 'aborted' };
       const isTts = error instanceof ProviderError && error.code === 'tts_failed';
       return { status: 'failed', kind: isTts ? 'tts' : 'core', error };
+    } finally {
+      // 取消后仍要收回预取任务；随后保存的 PCM 不会再被迟到生成修改。
+      failureAbort.abort();
+      await Promise.all(synthesizers.map(synthesizer => synthesizer.settled()));
     }
     return { status: 'ok' };
   }
@@ -208,11 +222,12 @@ export class ReplyPipeline {
    * 整句会重播句首，此时按 tts_failed 失败处理，保留已播出内容 */
   private async *synthSentenceToPcm(
     turn: ActiveTurn,
-    sentence: string,
+    segment: ActiveTurn['replyAudio'][number],
     style: VoiceStyle,
     signal: AbortSignal
   ): AsyncGenerator<PcmChunk> {
     if (signal.aborted) throw new TurnAbortedError();
+    const sentence = segment.text;
     const request = {
       text: sentence,
       profile: this.deps.profile,
@@ -224,11 +239,15 @@ export class ReplyPipeline {
     let emitted = false;
     try {
       for await (const chunk of this.deps.tts.synthesizeStream(request, signal)) {
-        if (turn.aborted) throw new TurnAbortedError();
+        if (turn.aborted || signal.aborted) throw new TurnAbortedError();
         turn.metrics.mark('tts_first_chunk');
         emitted = true;
-        yield { audio: chunk.audio, sampleRate: chunk.sampleRate };
+        const pcm = { audio: chunk.audio, sampleRate: chunk.sampleRate };
+        segment.chunks.push(pcm);
+        yield pcm;
       }
+      if (signal.aborted) throw new TurnAbortedError();
+      segment.complete = true;
       return;
     } catch (error) {
       // provider 被 abort 时上游抛错：翻译成本轮取消信号
@@ -255,9 +274,12 @@ export class ReplyPipeline {
     });
     turn.metrics.mark('tts_first_chunk');
     for (const frame of chunkPcm16(result.audio, samplesForDuration(result.sampleRate, 20))) {
-      if (turn.aborted) throw new TurnAbortedError();
-      yield { audio: frame, sampleRate: result.sampleRate };
+      if (turn.aborted || signal.aborted) throw new TurnAbortedError();
+      const pcm = { audio: frame, sampleRate: result.sampleRate };
+      segment.chunks.push(pcm);
+      yield pcm;
     }
+    segment.complete = true;
   }
 
   private maybePlayFiller(turn: ActiveTurn): void {
@@ -293,6 +315,10 @@ export class ReplyPipeline {
       rate: chunk.sampleRate,
       bytes: chunk.audio.length
     }, turn);
-    this.port.sendRaw(chunk.audio, turn);
+    if (this.port.sendRaw(chunk.audio, turn)) {
+      const durationMs = chunk.audio.length / 2 / chunk.sampleRate * 1000;
+      if (kind === 'content') turn.sentAudioMs += durationMs;
+      else turn.fillerAudioMs += durationMs;
+    }
   }
 }

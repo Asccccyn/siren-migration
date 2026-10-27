@@ -103,15 +103,14 @@ export class AsyncQueue<T> {
  */
 export class EagerIterable<T> implements AsyncIterable<T> {
   private readonly queue = new AsyncQueue<T>();
-  private started = false;
+  private work: Promise<void> | null = null;
 
   constructor(private readonly factory: () => AsyncIterable<T>) {}
 
   /** 幂等启动（首次调用后开始拉取） */
   start(): void {
-    if (this.started) return;
-    this.started = true;
-    void (async () => {
+    if (this.work) return;
+    this.work = (async () => {
       try {
         for await (const item of this.factory()) {
           this.queue.push(item);
@@ -121,6 +120,11 @@ export class EagerIterable<T> implements AsyncIterable<T> {
         this.queue.fail(error);
       }
     })();
+  }
+
+  settled(): Promise<void> {
+    this.start();
+    return this.work!;
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {

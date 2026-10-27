@@ -44,7 +44,7 @@ export interface CallSessionDeps {
   /** 2026-10-24 协议②：用户原声资产化（可选——未装配=该通话轮不带 audio_ref，不阻断通话） */
   userAudio?: {
     assetsRepo: import('@siren/storage').VoiceAssetsRepository;
-    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown> };
+    store: { put(key: string, bytes: Buffer, contentType: string): Promise<unknown>; delete?(key: string): Promise<void> };
   };
   send: (data: string, binary?: Buffer) => void;
   bufferedAmount: () => number;
@@ -57,6 +57,7 @@ export class CallSession {
   private readonly log: Logger;
   private readonly recorder: CallTurnRecorder;
   private readonly pipeline: ReplyPipeline;
+  private readonly pendingWork = new Set<Promise<unknown>>();
   private turnIndex = 0;
   private turn: ActiveTurn | null = null;
   private closing = false;
@@ -83,7 +84,9 @@ export class CallSession {
     this.stateMachine = new CallStateMachine((from, to, at) => {
       this.log.info('call_state', { from, to, at });
     });
-    this.recorder = new CallTurnRecorder(deps.turnsRepo, this.log);
+    this.recorder = new CallTurnRecorder(deps.turnsRepo, this.log, deps.userAudio ? {
+      ...deps.userAudio, callId: deps.callId, conversationId: deps.conversationId, profile: deps.profile,
+    } : undefined);
     this.pipeline = new ReplyPipeline(
       {
         config: deps.config,
@@ -100,7 +103,7 @@ export class CallSession {
           if (this.turn === turn && !turn.aborted) this.sendJson(message, turn);
         },
         sendRaw: (frame, turn) => {
-          if (this.turn === turn && !turn.aborted) this.sendRaw(frame);
+          return this.turn === turn && !turn.aborted ? this.sendRaw(frame) : false;
         },
         onFirstAudio: (turn) => {
           if (this.turn === turn && !turn.aborted) this.enterSpeaking();
@@ -143,7 +146,7 @@ export class CallSession {
         this.handleStart(message.input_id);
         break;
       case 'end':
-        if (this.matchesInput(message.input_id)) void this.handleEnd();
+        if (this.matchesInput(message.input_id)) this.own(this.handleEnd());
         break;
       case 'abort':
         if (this.matchesInput(message.input_id)) this.handleAbort(message.playback);
@@ -238,12 +241,13 @@ export class CallSession {
       this.clearPendingDrain('destroy');
       if (this.hangupTimer) { clearTimeout(this.hangupTimer); this.hangupTimer = null; }
       this.hangupRequest = null;
-      if (turn && !turn.written && (turn.userText || turn.fullText || this.lastPartialText)) {
+      if (turn && !turn.written) {
         // F10：销毁（断线/背压/关停）不丢当前轮——已识别/已产出内容的轮次幂等落库；
         // ending 阶段仅有 partial 时也保留（文字不丢），outcome 记 interrupted
         turn.userText = turn.userText || this.lastPartialText;
         this.writeTurn(turn, 'interrupted');
       }
+      if (turn) void this.ensureUserAudio(turn);
       this.stateMachine.forceEnded();
       this.deps.sessionsRepo?.markEnded(this.deps.callId, Date.now(), 'ended');
       this.log.info('call_ended', { reason });
@@ -384,6 +388,12 @@ export class CallSession {
       outputStreamId: newOutputStreamId(),
       nextSequence: 0,
       userText: '',
+      transcriptAdopted: false,
+      replyAudio: [],
+      replyTextComplete: false,
+      sentAudioMs: 0,
+      fillerAudioMs: 0,
+      playback: { basis: 'unknown' },
       receivedText: '',
       audioBytes: 0,
       pcmChunks: [],
@@ -446,27 +456,33 @@ export class CallSession {
     this.stateMachine.transition('ending');
     this.sendJson({ t: 'state', state: 'ending' });
 
-    const transcript = await this.adoptTranscript(turn);
-    if (transcript === null) return; // 失败已处理 / 已被 abort 接管
-    turn.metrics.mark('asr_final');
-    if (!transcript) {
-      // 空转写不再静默丢弃（实测故障模式：打断后续接轮拿到空 final，用户对黑箱说话）：
-      // 留 warn + fed_bytes/partials 供诊断，客户端给"没听清"提示
-      this.log.warn('asr_empty_transcript', {
-        turn_index: turn.index,
-        fed_bytes: turn.asr.fedBytes,
-        partials: turn.asrPartials
-      });
-      this.sendJson({ t: 'notice', code: 'empty_transcript', message: '没听清，请再说一遍' });
-      // R7（2026-10-23，她 D6 裁定）：空转写轮如实落库 outcome='asr_empty'（中性——
-      // 用户说了话但无文本，此前直接丢弃致失败率分母不可还原）；文本两列为 NULL
-      this.writeTurn(turn, 'asr_empty');
-      this.backToListening();
-      return;
+    try {
+      const transcript = await this.adoptTranscript(turn);
+      if (transcript === null) return; // 失败已处理 / 已被 abort 接管
+      turn.metrics.mark('asr_final');
+      if (!transcript) {
+        // 空转写不再静默丢弃（实测故障模式：打断后续接轮拿到空 final，用户对黑箱说话）：
+        // 留 warn + fed_bytes/partials 供诊断，客户端给"没听清"提示
+        this.log.warn('asr_empty_transcript', {
+          turn_index: turn.index,
+          fed_bytes: turn.asr.fedBytes,
+          partials: turn.asrPartials
+        });
+        this.sendJson({ t: 'notice', code: 'empty_transcript', message: '没听清，请再说一遍' });
+        // R7（2026-10-23，她 D6 裁定）：空转写轮如实落库 outcome='asr_empty'（中性——
+        // 用户说了话但无文本，此前直接丢弃致失败率分母不可还原）；文本两列为 NULL
+        this.writeTurn(turn, 'asr_empty');
+        this.backToListening();
+        return;
+      }
+      turn.userText = transcript;
+      turn.transcriptAdopted = true;
+      this.sendJson({ t: 'asr', text: transcript, language: this.deps.profile.language });
+      await this.runReplyPhase(turn);
+    } finally {
+      // 原声留存独立于 ASR 成败；没有采纳 final 时不会产生伪转写。
+      void this.ensureUserAudio(turn);
     }
-    turn.userText = transcript;
-    this.sendJson({ t: 'asr', text: transcript, language: this.deps.profile.language });
-    await this.runReplyPhase(turn);
   }
 
   /**
@@ -511,51 +527,21 @@ export class CallSession {
 
   private async runReplyPhase(turn: ActiveTurn): Promise<void> {
     if (turn.aborted || this.turn !== turn) return;
-    // 协议②（2026-10-24）：采纳后、派发 Core 前落本轮原声资产（PCM16/16k mono → WAV）。
-    // 失败不阻断通话（audio_ref 缺省=纯文本轮，如实降级）；写成功后随 CoreTurnInput 上桥。
-    const ua = this.deps.userAudio;
-    if (ua && turn.pcmChunks.length > 0 && turn.userText) {
-      try {
-        const wav = encodeWavPcm16Mono(turn.pcmChunks, this.deps.voice.inputSampleRate);
-        const assetId = randomUUID();
-        const messageId = `call-${this.deps.callId}-t${turn.index}`;
-        const objectKey = `voice/calls/${this.deps.callId}/${messageId}/${assetId}/audio.wav`;
-        await ua.store.put(objectKey, wav, 'audio/wav');
-        ua.assetsRepo.insert({
-          id: assetId,
-          conversationId: this.deps.conversationId,
-          messageId,
-          direction: 'user',
-          voiceProfile: this.deps.profile.id,
-          provider: 'call',
-          providerVoiceId: null,
-          audioFormat: 'wav',
-          sampleRate: this.deps.voice.inputSampleRate,
-          durationMs: Math.round((wav.length - 44) / 2 / this.deps.voice.inputSampleRate * 1000),
-          language: 'zh-CN',
-          emotion: null,
-          text: null,
-          ttsScript: null,
-          transcript: turn.userText,
-          objectKey,
-          checksum: null,
-          createdAt: Date.now()
-        });
-        turn.audioRef = `siren:${assetId}`;
-      } catch (err) {
-        this.log.warn('user_audio_asset_failed', { ...errorFields(err as Error), turn_index: turn.index });
-      }
-    }
+    await this.ensureUserAudio(turn);
+    // JV-01（联合审计 2026-10-26，P0）：原声落盘是外部 I/O——await 期间可能已
+    // 挂断（destroy→forceEnded）或被新输入打断（旧轮 aborted/换轮回 listening）。
+    // 落盘返回后按事实复核：被取消的旧轮不得再推进状态机（ended→thinking 非法
+    // 迁移会作为 unhandled rejection 使默认 Node 进程退出，同进程全部通话中断）。
+    // 已写入的原声留存策略归业务裁定 D-03，不借修崩溃擅删历史。
+    if (turn.aborted || this.turn !== turn || this.closed) return;
     this.stateMachine.transition('thinking');
     if (this.pendingInterruption === turn.interruptedTurn) this.pendingInterruption = undefined;
     this.sendJson({ t: 'state', state: 'thinking' });
 
     const result = await this.pipeline.run(turn);
 
-    if (result.status === 'aborted' || turn.aborted || this.turn !== turn || this.closed) {
-      // 打断路径：interrupted / reply 已由 handleAbort 同步下发
-      return;
-    }
+    this.own(this.recorder.archiveReply(turn));
+    if (result.status === 'aborted' || turn.aborted || this.turn !== turn || this.closed) return;
     if (result.status === 'failed') {
       // TTS / Core 失败：保留文字，明确降级（规范第 40 节）。
       // S1011-021：Core 中途失败时已收到的原始文本独立保留并下发（含未成句的半句），
@@ -625,6 +611,9 @@ export class CallSession {
 
   private handleAbort(playback?: ClientPlaybackProgress): void {
     const interrupted = this.turn;
+    if (interrupted && playback?.stream_id === interrupted.outputStreamId && interrupted.playback.basis !== 'client_drained') {
+      interrupted.playback = { basis: 'client_reported', played_ms: playback.played_ms };
+    }
     if (interrupted && (interrupted.userText || interrupted.receivedText)) {
       this.pendingInterruption = {
         turnId: interrupted.turnId,
@@ -642,6 +631,7 @@ export class CallSession {
       if (this.turn) {
         this.turn.aborted = true;
         this.writeTurn(this.turn, 'interrupted');
+        void this.ensureUserAudio(this.turn);
       }
       this.turn?.asr.abort();
       this.turn = null;
@@ -673,6 +663,7 @@ export class CallSession {
       }
       turn.metrics.setInterrupted();
       this.writeTurn(turn, 'interrupted');
+      void this.ensureUserAudio(turn);
       turn.metrics.markEnd();
       this.sendJson({ t: 'metrics', metrics: turn.metrics.compute() });
       this.log.info('turn_interrupted', {
@@ -748,6 +739,7 @@ export class CallSession {
       stream_id: streamId,
       playback_ms: Date.now() - pending.sentAt
     });
+    if (this.turn?.outputStreamId === streamId) this.turn.playback = { basis: 'client_drained' };
     pending.settle(true);
   }
 
@@ -765,8 +757,8 @@ export class CallSession {
     }
   }
 
-  private sendRaw(frame: Buffer): void {
-    if (this.closed || this.closing) return;
+  private sendRaw(frame: Buffer): boolean {
+    if (this.closed || this.closing) return false;
     if (this.deps.bufferedAmount() > this.deps.config.ws.maxBufferedBytes) {
       this.log.error('ws_backpressure_overflow', { buffered: this.deps.bufferedAmount() });
       // P0-6：背压超限也必须完整 teardown（abort / 落库 / 吊销 token / 移除注册），
@@ -775,9 +767,10 @@ export class CallSession {
         code: WS_CLOSE_CODES.BACKPRESSURE_OVERFLOW,
         reason: 'backpressure overflow'
       });
-      return;
+      return false;
     }
     this.deps.send('binary', frame);
+    return true;
   }
 
   private sendJson(message: ServerWsMessage, turn = this.turn): void {
@@ -790,27 +783,31 @@ export class CallSession {
     ));
   }
 
+  private ensureUserAudio(turn: ActiveTurn): Promise<string | null> {
+    if (!turn.userAudioSave) {
+      turn.userAudioSave = this.own(this.recorder.archiveUser(turn, this.deps.voice.inputSampleRate).then(id => {
+        if (id) turn.audioRef = 'siren:' + id;
+        return id;
+      }));
+    }
+    return turn.userAudioSave;
+  }
+
+  private own<T>(work: Promise<T>): Promise<T> {
+    this.pendingWork.add(work);
+    void work.then(
+      () => { this.pendingWork.delete(work); },
+      error => { this.pendingWork.delete(work); this.log.warn('call_work_failed', errorFields(error)); },
+    );
+    return work;
+  }
+
+  async settled(): Promise<void> {
+    // 关闭后不再接纳新输入；结束处理可能继续登记其音频保存任务。
+    while (this.pendingWork.size > 0) await Promise.allSettled([...this.pendingWork]);
+  }
+
   private writeTurn(turn: ActiveTurn, outcome: TurnOutcome): void {
     this.recorder.write(this.deps.callId, turn, outcome);
   }
-}
-
-/** 协议②（2026-10-24）：PCM16/mono 分片 → 单文件 WAV（44B 头 + 小端载荷）。 */
-function encodeWavPcm16Mono(chunks: Buffer[], sampleRate: number): Buffer {
-  const payload = Buffer.concat(chunks);
-  const header = Buffer.alloc(44);
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + payload.length, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20); // PCM
-  header.writeUInt16LE(1, 22); // mono
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
-  header.writeUInt16LE(2, 32); // block align
-  header.writeUInt16LE(16, 34); // bits
-  header.write('data', 36);
-  header.writeUInt32LE(payload.length, 40);
-  return Buffer.concat([header, payload]);
 }

@@ -48,16 +48,20 @@ describe('通话用户原声资产化（协议②离线合同）', () => {
       await waitFor(() => inputs.length >= 1);
       await waitFor(() => h.texts().some((x) => x.t === 'reply'));
       // ① 资产落库：user 方向、wav、transcript=采纳文本
-      const asset = ua.assetsRepo.findByMessageId('call-call-test-1-t1');
+      const asset = ua.assetsRepo.findByMessageId('call-call-test-1-t1-u');
+      if (!asset) console.error('ALLASSETS_FAIL', JSON.stringify({ tried: 'call-call-test-1-t1-u' }));
       expect(asset).toBeTruthy();
       expect(asset!.direction).toBe('user');
       expect(asset!.audioFormat).toBe('wav');
       expect(asset!.transcript).toBe('你好。');
       expect(asset!.durationMs).toBeGreaterThan(0);
-      // ② 对象存储：WAV 头+两片 PCM
-      expect(ua.putKeys.length).toBe(1);
+      // ② 对象存储：WAV 头+两片 PCM（P03：回复音频留档后同一存储有两笔——
+      // user 原声 audio.wav + assistant 回复 reply.wav）
+      expect(ua.putKeys.length).toBe(2);
       expect(ua.putKeys[0]!.contentType).toBe('audio/wav');
       expect(ua.putKeys[0]!.bytes).toBe(44 + pcmChunk().length * 2);
+      const replyPut = ua.putKeys.find((k) => k.key.endsWith('/reply.wav'));
+      expect(replyPut).toBeTruthy(); // P03：回复音频已留档（direction=assistant）
       // ③ 上桥引用
       expect(inputs[0]!.audioRef).toBe(`siren:${asset!.id}`);
       expect(inputs[0]!.text).toBe('你好。');

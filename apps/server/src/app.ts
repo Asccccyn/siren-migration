@@ -149,7 +149,35 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     asrName: providers.active.asr,
     ttsName: providers.active.realtimeTts,
     // 协议②（2026-10-24）：通话用户原声资产化（失败不阻断通话，audio_ref 缺省=纯文本轮）
-    userAudio: { assetsRepo, store: providers.store }
+    userAudio: { assetsRepo, store: providers.store },
+    // F-04（跨仓预审 2026-10-25）：S→E 通话终态同步——Siren 拥有通话生死（linger/
+    //  断线/背压 destroy 都收敛到 onDestroyed），est 的 voice_calls 策略投影由此收口，
+    //  不再依赖浏览器作为唯一结束通知。复用 core 桥同源地址/凭据；通知失败只记日志
+    //  （est 侧 owner 收口仍幂等兜底，Siren 自身状态不受影响）。
+    callLifecycle: config.coreBaseUrl
+      ? (() => {
+          const notify = (path: string, method: 'POST' | 'DELETE', body?: unknown, what: string = path): void => {
+            void fetch(`${config.coreBaseUrl.replace(/\/$/, '')}${path}`, {
+              method,
+              headers: {
+                ...(body ? { 'content-type': 'application/json' } : {}),
+                ...(config.coreApiToken ? { authorization: `Bearer ${config.coreApiToken}` } : {})
+              },
+              body: body ? JSON.stringify(body) : undefined,
+              signal: AbortSignal.timeout(5000)
+            }).then((res) => {
+              if (!res.ok) logger.warn('est_call_lifecycle_rejected', { what, status: res.status });
+            }).catch((err: Error) => logger.warn('est_call_lifecycle_unreachable', { what, error: err.message }));
+          };
+          return {
+            register: (callId, conversationId) => {
+              if (!conversationId) return; // est 立册需要 conversation_id；无上下文通话如实不通知
+              notify('/v1/calls', 'POST', { call_id: callId, conversation_id: conversationId }, 'register');
+            },
+            end: (callId) => notify(`/v1/calls/${encodeURIComponent(callId)}`, 'DELETE', undefined, 'end')
+          };
+        })()
+      : undefined
   });
 
   const app = Fastify({
@@ -199,7 +227,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
   const stopInviteSweeper = startInviteExpirySweeper(invites);
   app.addHook('onClose', async () => stopInviteSweeper());
   // 协议②（2026-10-24）：通话用户原声字节（est 服务间取回；只读）
-  registerVoiceAssetAudioRoute(app, { assetsRepo, store: providers.store instanceof LocalObjectStore ? providers.store : null });
+  // JV-13（联合审计 2026-10-26）：服务间 GET 依赖 ObjectStore.get 本身——
+  // 非 Local 实现（如 R2）同样可读；下方浏览器本地签名/Range 路由保留 Local 专属职责。
+  registerVoiceAssetAudioRoute(app, { assetsRepo, store: providers.store });
   registerAssetsRoute(app, {
     config,
     store: providers.store instanceof LocalObjectStore ? providers.store : null
@@ -260,10 +290,11 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<SirenApp>
     callCenter,
     providers,
     dispose: async () => {
-      callCenter.destroyAll();
+      const settled = callCenter.shutdown();
       try {
         await app.close();
       } finally {
+        await settled;
         providers.dispose?.();
         if (db.open) db.close();
       }

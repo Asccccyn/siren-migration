@@ -88,7 +88,7 @@ describe('R7-01 语义在迁移 004 后保持', () => {
     migrate(db); migrate(db);
     const row = db.prepare('SELECT outcome FROM call_turns WHERE id=?').get('old') as { outcome: string | null };
     expect(row.outcome).toBeNull();
-    expect((db.prepare('SELECT max(version) AS v FROM _migrations').get() as { v: number }).v).toBe(4);
+    expect((db.prepare('SELECT max(version) AS v FROM _migrations').get() as { v: number }).v).toBe(6);
     db.close();
   });
 });

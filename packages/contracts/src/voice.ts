@@ -175,10 +175,28 @@ export class ProviderError extends Error {
 
 export type VoiceDirection = 'user' | 'assistant';
 
+export type CallPlaybackEvidence =
+  | { basis: 'unknown' }
+  | { basis: 'client_drained' }
+  | { basis: 'client_reported'; played_ms: number };
+
+export interface CallTurnAudio {
+  turn_id: string;
+  turn_index: number;
+  outcome: string | null;
+  user_audio: { asset_id: string; duration_ms: number } | null;
+  reply_audio: { asset_id: string; duration_ms: number; completeness: 'complete' | 'partial' | null } | null;
+  sent_audio_ms: number | null;
+  filler_audio_ms: number | null;
+  playback: CallPlaybackEvidence;
+}
+
 export interface VoiceAssetRecord {
   id: string;
   conversationId: string | null;
   messageId: string | null;
+  callId?: string | null;
+  turnId?: string | null;
   direction: VoiceDirection;
   voiceProfile: string;
   provider: string;
@@ -193,6 +211,9 @@ export interface VoiceAssetRecord {
   transcript: string | null;
   objectKey: string;
   checksum: string | null;
+  /** GLM_VOICE_UNIFICATION RR-09：complete=完整话轮生成音频；partial=打断/失败轮
+   *  的已生成部分（如实标注，未播范围未知）。 */
+  completeness?: 'complete' | 'partial';
   createdAt: number;
 }
 

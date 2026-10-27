@@ -3,11 +3,12 @@
  *  落本地资产绑定语音消息供 oído 快证据/按需深听。不经签名 URL（那是浏览器面），
  *  只读，不修改资产。 */
 import type { FastifyInstance } from 'fastify';
-import type { VoiceAssetsRepository, LocalObjectStore } from '@siren/storage';
+import type { VoiceAssetsRepository, ObjectStore } from '@siren/storage';
 
 export interface VoiceAssetAudioDeps {
   assetsRepo: VoiceAssetsRepository;
-  store: LocalObjectStore | null;
+  /** JV-13：服务间取回只依赖 ObjectStore.get——任意实现（Local/R2/内存）可读 */
+  store: ObjectStore | null;
 }
 
 const CONTENT_TYPES: Record<string, string> = {
