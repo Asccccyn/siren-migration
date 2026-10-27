@@ -10,7 +10,6 @@ export class PrebufferedAsrSession implements AsrStream {
   private pendingBytes = 0;
   private session: AsrStream | null = null;
   private sessionError: unknown = null;
-  private readyWaiters: (() => void)[] = [];
   private aborted = false;
   private readyPromise: Promise<void> | null = null;
   /** 已喂入本会话的总 PCM 字节数（含 pre-buffer 部分）——空转写诊断用 */
@@ -54,7 +53,6 @@ export class PrebufferedAsrSession implements AsrStream {
         return;
       }
       this.flushPrebuffer();
-      for (const waiter of this.readyWaiters.splice(0)) waiter();
     })();
     return this.readyPromise;
   }

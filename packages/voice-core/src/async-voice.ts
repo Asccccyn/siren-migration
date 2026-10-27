@@ -40,16 +40,4 @@ export class AsyncVoicePipeline {
   }
 
   /** 对方回复语音化：text / tts_script 分离，绑定 message_id（幂等） */
-  async buildAssistantVoice(input: {
-    text: string;
-    ttsScript?: string;
-    conversationId?: string;
-    messageId?: string;
-    voiceProfileId?: string;
-    emotion?: Parameters<VoiceService['speak']>[0]['emotion'];
-    speed?: number;
-    language?: string;
-  }): Promise<VoiceAssetWithUrl> {
-    return this.voice.speak(input);
-  }
 }

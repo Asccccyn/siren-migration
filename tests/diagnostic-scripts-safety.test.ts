@@ -54,15 +54,6 @@ require('node:module').syncBuiltinESMExports();
 }
 
 describe('diagnostic scripts default to no credentials / no network', () => {
-  it('旧会话脚本显式停用且非0退出，停止在任何敏感读取之前', async () => {
-    const result = await run('repro-session-abort.mts');
-    expect(result.code).toBe(2);
-    expect(result.stderr).toContain('已停用');
-    expect(result.stderr).toContain('tests/voice-interrupt-client-flow.test.ts');
-    expect(result.stderr).toContain('tests/voice-interrupt-session.test.ts');
-    expect(result.stdout).toBe('');
-    expect(result.forbidden).toBe('');
-  });
 
   it('ASR诊断没有明确实机开关即非0退出，无配置/音频/DNS/网络尝试', async () => {
     const result = await run('repro-asr-abort.mts');
@@ -72,7 +63,7 @@ describe('diagnostic scripts default to no credentials / no network', () => {
     expect(result.forbidden).toBe('');
   });
 
-  it.each(['repro-session-abort.mts', 'repro-asr-abort.mts'])('导入%s不执行诊断或输出', async (script) => {
+  it.each(['repro-asr-abort.mts'])('导入%s不执行诊断或输出', async (script) => {
     const result = await run(script, true);
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');

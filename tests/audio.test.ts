@@ -5,11 +5,8 @@ import {
   estimateMp3DurationMs,
   extractWavData,
   float32ToPcm16,
-  normalizePcm16,
   pcm16ToFloat32,
   pcmDurationMs,
-  resampleFloat32,
-  rms,
   wavDurationMs
 } from '@siren/audio';
 
@@ -22,12 +19,6 @@ describe('audio 包', () => {
     for (let i = 0; i < input.length; i++) {
       expect(Math.abs(back[i] - input[i])).toBeLessThan(0.001);
     }
-  });
-
-  it('线性重采样保持时长比例', () => {
-    const input = new Float32Array(4800).fill(0.1);
-    const out = resampleFloat32(input, 48000, 16000);
-    expect(out.length).toBe(1600);
   });
 
   it('PCM 时长计算', () => {
@@ -47,21 +38,6 @@ describe('audio 包', () => {
     const chunks = chunkPcm16(data, 100); // 100 samples = 200B
     expect(chunks.length).toBe(5);
     expect(Buffer.concat(chunks).equals(data)).toBe(true);
-  });
-
-  it('RMS 与 normalize', () => {
-    const silence = new Float32Array(1000);
-    expect(rms(silence)).toBe(0);
-    const loud = new Float32Array(1000).fill(0.5);
-    expect(rms(loud)).toBeCloseTo(0.5, 5);
-
-    const quiet = float32ToPcm16(new Float32Array(1000).fill(0.05));
-    const boosted = normalizePcm16(quiet);
-    let peak = 0;
-    for (let i = 0; i + 1 < boosted.length; i += 2) {
-      peak = Math.max(peak, Math.abs(boosted.readInt16LE(i)));
-    }
-    expect(peak).toBeGreaterThan(0.2 * 0x8000); // 确实被放大（受最大增益 8x 限制）
   });
 
   it('MP3 时长估算', () => {

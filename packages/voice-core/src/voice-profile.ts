@@ -82,9 +82,6 @@ export class VoiceProfileRegistry {
     return profile.voiceId || this.fallbackVoiceIds[profile.provider] || '';
   }
 
-  withResolvedVoiceIds(): VoiceProfile[] {
-    return this.list().map((profile) => ({ ...profile, voiceId: this.resolveVoiceId(profile) }));
-  }
 }
 
 export function validateProfile(raw: unknown): VoiceProfile {

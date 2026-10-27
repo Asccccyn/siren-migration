@@ -16,9 +16,6 @@ export class LatencyTracker {
     if (!this.marks.has(mark)) this.marks.set(mark, at);
   }
 
-  markOnce(mark: LatencyMark, at: number = performance.now()): void {
-    this.mark(mark, at);
-  }
 
   markEnd(at: number = performance.now()): void {
     this.mark('turn_end', at);
