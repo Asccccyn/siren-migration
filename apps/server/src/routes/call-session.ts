@@ -16,14 +16,15 @@ export interface CallSessionRoutesDeps {
 export function registerCallSessionRoutes(app: FastifyInstance, deps: CallSessionRoutesDeps): void {
   /** R2-02（GLM_VOICE_UNIFICATION 复审二）：按 call 交付已留档音频资产清单
    *  （服务间只读，est 据此把 assistant 回复音频绑定到对应消息）。最小合同：
-   *  v1 按真实 turn_id 分组；无音频轮次仍返回，发送/播放事实独立于资产完整性。
+   *  v1 按真实 turn_id 分组；audio_finalized 表示通话及媒体收尾均已结束，
+   *  此前空音频只是尚未留档。发送/播放事实独立于资产完整性。
    *  失败语义=404（call 不存在）；重放幂等只读。 */
   app.get('/v1/calls/:callId/turn-audio', async (request, reply) => {
     const { callId } = request.params as { callId: string };
     const call = deps.callCenter.describeCall(callId);
     if (!call || call.db_status === 'unknown') { await reply.code(404).send({ error: 'call_not_found' }); return; }
     const rows = deps.callCenter.listTurnAudio(callId);
-    await reply.code(200).send({ schema_version: 1, call_id: callId, turns: rows });
+    await reply.code(200).send({ schema_version: 1, call_id: callId, audio_finalized: call.audio_finalized, turns: rows });
   });
 
   /** JV-04（联合审计 2026-10-26）：会话事实查询（服务间只读）——est 启动/通知

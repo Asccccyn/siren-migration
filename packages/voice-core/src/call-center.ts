@@ -58,7 +58,7 @@ export interface CreateCallResult {
 export class CallCenter {
   private readonly tokens: CallTokenStore;
   private readonly sessions = new Map<string, CallSession>();
-  private readonly retiring = new Set<Promise<void>>();
+  private readonly retiring = new Map<string, Promise<void>>();
   private stopping = false;
   /** P1-1：会话装配的唯一 Realtime Provider 出口（当前为 cascade 组合） */
   readonly voice: RealtimeVoiceProvider;
@@ -168,10 +168,10 @@ export class CallCenter {
       onDestroyed: (s) => {
         this.sessions.delete(s.callId);
         this.tokens.revokeByCall(s.callId);
-        this.deps.callLifecycle?.end(s.callId, s.conversationId);
         const settled = s.settled();
-        this.retiring.add(settled);
-        void settled.then(() => this.retiring.delete(settled));
+        this.retiring.set(s.callId, settled);
+        void settled.then(() => this.retiring.delete(s.callId));
+        this.deps.callLifecycle?.end(s.callId, s.conversationId);
       }
     });
     this.sessions.set(params.callId, session);
@@ -187,12 +187,16 @@ export class CallCenter {
    *  Siren 是通话生死正本：db_status 来自 call_sessions 持久行（destroy/断线/
    *  重启 endAllActive 都收敛为 ended），session_active 表示 WS 会话仍在。
    *  只报事实，不替 est 判定"预约是否值得保留"。 */
-  describeCall(callId: string): { call_id: string; db_status: 'active' | 'ended' | 'unknown'; session_active: boolean; ended_at: number | null } | null {
+  describeCall(callId: string): { call_id: string; db_status: 'active' | 'ended' | 'unknown'; session_active: boolean; audio_finalized: boolean; ended_at: number | null } | null {
     const row = this.deps.sessionsRepo?.findById(callId);
+    const ended = row?.status === 'ended' || row?.status === 'error';
+    const sessionActive = this.sessions.has(callId);
     return {
       call_id: callId,
-      db_status: row ? (row.status === 'ended' || row.status === 'error' ? 'ended' : 'active') : 'unknown',
-      session_active: this.sessions.has(callId),
+      db_status: row ? (ended ? 'ended' : 'active') : 'unknown',
+      session_active: sessionActive,
+      // WS 关闭会先记 ended；取消回收和音频保存仍由现有 settled 工作持有。
+      audio_finalized: ended && !sessionActive && !this.retiring.has(callId),
       ended_at: row?.ended_at ?? null
     };
   }
@@ -205,7 +209,7 @@ export class CallCenter {
   async shutdown(): Promise<void> {
     this.stopping = true;
     this.destroyAll();
-    await Promise.all([...this.retiring]);
+    await Promise.all(this.retiring.values());
   }
 
   /** 服务关停：终止全部通话（规范第 47 节第 25 条） */
