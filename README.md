@@ -1,6 +1,6 @@
 # Siren v1.1.1（1012 根因返修 + 可语音打断实现）
 
-- 2026-10-27（工作树修复，**未部署**）：通话音频清单增加 `audio_finalized`，由现有会话与按 call_id 关联的收尾任务推导；WS 关闭后，取消回收及实际音频保存完成前保持 false，不新增持久状态或迁移。完整/部分/无音频收尾、既有生命周期回归及 est 联合反例通过，类型检查和服务构建通过。
+- 2026-10-27（**已部署并重启**，代码 `a258592`，发布目录 `~/Projects/siren-releases/voice-reply-finalization-20261027`）：音频清单增加 `audio_finalized`，由现有会话与按 call_id 关联的收尾任务推导；取消回收及音频保存完成前保持 false，无新增迁移。同批 est `36d14a8` 已上线；完整/部分/无音频收尾、生命周期回归、四个真实 HTTP/WS 隔离场景、类型检查和服务构建通过。沿用原生产命令、配置及 `~/Projects/siren/data`，health 200、库 v6。回退备份：`/Users/owner/Backups/pre-voice-reply-finalization-20261027-201518`；未调用真实 ASR/TTS 验收。
 
 - 2026-10-27（**已部署并启动**，代码 `6505648`，发布目录 `~/Projects/siren-releases/voice-backend-20261027`）：operation_id 合成/重放响应使用实际资产格式，继承取消贯穿、先持久后交付与同操作恢复。REST/MCP 15 项及类型检查通过；按现有构建脚本生成服务与客户端，数据库 v6。当前用既有 `node apps/server/dist/index.js` 命令以 nohup 运行在 8790，生产模式、健康 200；Core 已由误指向 oído:8791 修正为 est:18787，既有令牌的真实入口鉴权通过（空输入 422，零模型派发）。数据仍在 `~/Projects/siren/data`，日志 `~/Library/Logs/siren/voice-backend-20261027.log`；回退资料 `~/Backups/pre-voice-backend-20261027-160943`。真实 ASR/TTS 与设备效果未复验。
 
